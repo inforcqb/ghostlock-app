@@ -50,6 +50,7 @@ extern const struct kernel_offsets *active_offsets;
 #undef FAKE_TASK_PI_WAITERS_OFF
 #undef FAKE_TASK_PI_TOP_TASK_OFF
 #undef FAKE_TASK_PI_BLOCKED_ON_OFF
+#undef FAKE_TASK_USAGE_OFF
 #undef TASK_PID_OFF
 #undef TASK_TGID_OFF
 #undef TASK_ATOMIC_FLAGS_OFF
@@ -66,6 +67,7 @@ extern const struct kernel_offsets *active_offsets;
 #define FAKE_TASK_PI_WAITERS_OFF     _RSO(task_pi_waiters, 0xA00)
 #define FAKE_TASK_PI_TOP_TASK_OFF    _RSO(task_pi_top_task, 0xA10)
 #define FAKE_TASK_PI_BLOCKED_ON_OFF  _RSO(task_pi_blocked_on, 0xA18)
+#define FAKE_TASK_USAGE_OFF          _RSO(task_usage, 0x40)
 #define TASK_PID_OFF             _RSO(task_pid, 0x708)
 #define TASK_TGID_OFF            _RSO(task_tgid, 0x70C)
 #define TASK_ATOMIC_FLAGS_OFF    _RSO(task_atomic_flags, 0x6C8)
