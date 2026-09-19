@@ -108,6 +108,8 @@ static char g_external_release[192];
 /* Entries carry a phys load address only when measured; otherwise MTK uses
  * the DRAM base, xring its constant, qcom its GKI version. */
 static void publish_active_offsets(void) {
+  /* Resolve this boot's image base before any address is built from it. */
+  resolve_runtime_text_base();
   g_init_cred_image = INIT_CRED;
   enum soc_family soc = detect_soc();
   const char *soc_name =
