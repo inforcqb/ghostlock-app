@@ -210,6 +210,7 @@ static const struct {
   {"task_comm", offsetof(struct kernel_offsets, task_comm)},
   {"task_tasks", offsetof(struct kernel_offsets, task_tasks)},
   {"task_seccomp", offsetof(struct kernel_offsets, task_seccomp)},
+  {"task_usage", offsetof(struct kernel_offsets, task_usage)},
 };
 
 /* Fill `out` from one JSON object [obj, end).  Fields absent from the JSON
