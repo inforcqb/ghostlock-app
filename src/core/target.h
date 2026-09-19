@@ -1,10 +1,19 @@
 #ifndef TARGET_H
 #define TARGET_H
 
+#include <stdint.h>
+
 #define BUILD_VARIANT_LABEL "ghostlock_oplus"
 
 /* Kernel address layout. */
-#define KIMAGE_TEXT_BASE 0xffffffc080000000ULL
+/* KIMAGE_TEXT_BASE is the running kernel image base. It is a variable rather
+ * than a constant because arm64 KASLR slides the image per boot: the value is
+ * resolved at startup by resolve_runtime_text_base() (GHOSTLOCK_TEXT_BASE
+ * override, then /proc/kallsyms). DEFAULT is used only when the running image
+ * cannot be observed, which is the case for builds whose base never slides. */
+#define KIMAGE_TEXT_BASE_DEFAULT 0xffffffc080000000ULL
+extern uint64_t g_kimage_text_base;
+#define KIMAGE_TEXT_BASE g_kimage_text_base
 #define MTK_VADDR_BASE 0xffffffc000000000ULL
 #define P0_PAGE_OFFSET 0xffffff8000000000ULL
 #define P0_PHYS_OFFSET 0x80000000ULL
