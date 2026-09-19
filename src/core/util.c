@@ -191,8 +191,63 @@ uint64_t p0_kernel_phys_load = P0_KERNEL_PHYS_LOAD;
 
 uint64_t g_direct_map_end = DIRECT_MAP_END;
 
+/* Running kernel image base; see target.h. Defaults to the build-time anchor
+ * so a kernel that never slides keeps the previous behaviour. */
+uint64_t g_kimage_text_base = KIMAGE_TEXT_BASE_DEFAULT;
+
 /* Selected entry's init_cred image address. */
 uintptr_t g_init_cred_image;
+
+static int parse_hex_u64(const char *s, uint64_t *out) {
+  if (!s || !*s) return 0;
+  uint64_t v = 0;
+  int digits = 0;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+  for (; *s; s++) {
+    int d;
+    if (*s >= '0' && *s <= '9') d = *s - '0';
+    else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+    else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+    else return 0;
+    v = (v << 4) | (uint64_t)d;
+    digits++;
+    if (digits > 16) return 0;
+  }
+  if (!digits) return 0;
+  *out = v;
+  return 1;
+}
+
+/* Resolve the running image base. arm64 KASLR slides it per boot, and every
+ * address in this program is built as KIMAGE_TEXT_BASE + OFF, so the value
+ * must be this boot's. GHOSTLOCK_TEXT_BASE wins; otherwise try the kernel's
+ * own symbol list, which is readable as root and on builds with
+ * kptr_restrict=0. Failing that the default is kept. */
+void resolve_runtime_text_base(void) {
+  uint64_t v = 0;
+  const char *env = getenv("GHOSTLOCK_TEXT_BASE");
+  if (parse_hex_u64(env, &v) && v) {
+    g_kimage_text_base = v;
+    pr_info("text base from env: %016llx\n", (unsigned long long)v);
+    return;
+  }
+  FILE *f = fopen("/proc/kallsyms", "r");
+  if (f) {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      char *sp = strrchr(line, ' ');
+      if (!sp) continue;
+      char *name = sp + 1;
+      size_t n = strlen(name);
+      while (n && (name[n - 1] == '\n' || name[n - 1] == '\r')) name[--n] = 0;
+      if (strcmp(name, "_text") != 0) continue;
+      if (parse_hex_u64(line, &v) && v) g_kimage_text_base = v;
+      break;
+    }
+    fclose(f);
+  }
+  pr_info("text base = %016llx\n", (unsigned long long)g_kimage_text_base);
+}
 
 void init_p0_profile(void) {
   pr_info("p0 kernel_phys_load=%016llx delta=%016llx\n",
