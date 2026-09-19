@@ -19,13 +19,17 @@ struct kernel_offsets {
   uint32_t task_pi_lock, task_pi_waiters, task_pi_top_task, task_pi_blocked_on;
   uint32_t task_pid, task_tgid, task_atomic_flags;
   uint32_t task_real_cred, task_cred, task_comm, task_tasks, task_seccomp;
+  /* task_struct->usage (refcount_t / atomic_t), read by get_task_struct() on
+   * the fabricated task: 0x38 where the 5.15 field order applies, 0x40 on the
+   * 6.x layouts. */
+  uint32_t task_usage;
 
   /* rt_mutex_waiter layout: 0 = 6.6 rb_node, 1 = 6.1 compact tree_entry */
   uint8_t compact_waiter;
   /* mm_struct SLUB stride; 0 uses target.h default (6.6 GKI 0x500).
    * android14-6.1 uses 0x400 (BTF reports 0x3c0). */
   uint32_t mm_struct_sz;
-  uint32_t _pad[3];
+  uint32_t _pad[2];
 };
 
 #define OFFSETS_ENTRY(uname, ...) { .uname_r = uname, __VA_ARGS__ }
@@ -57,6 +61,7 @@ struct kernel_offsets {
 
 static const struct kernel_offsets known_offsets[] = {
 /* Add new kernels by creating src/kernels/<uname-release>/offsets.h */
+#include "5.15.180-android13-8-o-01176-g6333b0dbc8ed/offsets.h"
 #include "6.1.115-android14-11-ga2521ca27699-ab13294383/offsets.h"
 #include "6.1.118-android14-11-ga3b9c44908dd-ab13320413/offsets.h"
 #include "6.1.118-android14-11-gca0ef6d17716-ab13624819/offsets.h"
