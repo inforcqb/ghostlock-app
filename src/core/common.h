@@ -161,6 +161,7 @@ void log_startup_context(void);
 void init_cpu_config(void);
 void disable_rseq_for_thread(void);
 void init_p0_profile(void);
+void resolve_runtime_text_base(void);
 extern uint64_t p0_kernel_phys_load;
 /* Direct map end, from a rooted run's iomem dump or the target.h default. */
 extern uint64_t g_direct_map_end;
