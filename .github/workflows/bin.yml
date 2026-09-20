@@ -1,0 +1,58 @@
+name: Bin
+
+# Fast path used while calibrating: build *only* the native ghostlock binary.
+# Same toolchain/cache as build.yml, but no JDK/gradle/APK and no Rust extractor
+# jobs, so a build is ~1-2 min instead of ~10.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - mcast-msfilter-calib
+    paths-ignore:
+      - "**.md"
+
+env:
+  ONDK_VERSION: "r30.1"
+
+jobs:
+  bin:
+    name: Build ghostlock binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Cache ONDK
+        id: ondk-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ondk
+          key: ondk-${{ env.ONDK_VERSION }}-linux
+
+      - name: Download ONDK
+        if: steps.ondk-cache.outputs.cache-hit != 'true'
+        run: |
+          url="https://github.com/topjohnwu/ondk/releases/download/${ONDK_VERSION}/ondk-${ONDK_VERSION}-linux.tar.xz"
+          mkdir -p "${{ runner.temp }}/ondk"
+          curl -fL "$url" -o /tmp/ondk.tar.xz
+          tar -C "${{ runner.temp }}/ondk" --strip-components=1 -xf /tmp/ondk.tar.xz
+
+      - name: Build Ghostlock binary
+        run: |
+          export ANDROID_NDK_HOME="${{ runner.temp }}/ondk"
+          export NDK_ROOT="$ANDROID_NDK_HOME"
+          make ghostlock
+
+      - name: Strip Ghostlock binary
+        run: |
+          "${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all ghostlock || true
+
+      - name: Upload Ghostlock binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostlock
+          path: ghostlock
+          archive: false
