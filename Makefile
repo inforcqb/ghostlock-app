@@ -25,6 +25,7 @@ CXX_SRCS := \
   src/core/memory/address_space.cpp \
   src/core/memory/heap_context.cpp \
   src/core/pi_race.cpp \
+  src/core/pipe_daemon.cpp \
   src/core/routes/route_controller.cpp \
   src/core/routes/route_threads.cpp \
   src/core/routes/tcp_zerocopy_route.cpp \
