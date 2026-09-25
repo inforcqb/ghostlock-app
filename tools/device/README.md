@@ -27,6 +27,7 @@ Modes:
 | mode | behaviour |
 |---|---|
 | default | starts the exploit with `setsid … > w1.log 2>&1 &`, **echoes new log lines to the screen** once a second, prints `enforce=…` when `Write 1 complete` appears (~11 s), **exit 0**. The exploit keeps running; the log is also kept in `w1.log`. |
+| `--quiet` (`-q`) | same, but the log stays off the screen — it only goes to `w1.log`; the final result line is still printed. |
 | `--foreground` | `exec ./ghostlock …` — blocks here, log straight on the console (the exploit parks). |
 | `--status` | print `getenforce`, the `ghostlock` process and the last log lines; run nothing. |
 
