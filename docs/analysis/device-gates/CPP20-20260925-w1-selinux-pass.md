@@ -68,3 +68,19 @@ GHOSTLOCK_MCAST_SOCKET=tcp6 ./ghostlock --profile /data/local/tmp/gl-0925-2136/p
   them: fresh `gl-<stamp>` directory, `GHOSTLOCK_HOME` pointed at it, artifacts
   pushed with `md5sum` compared host-vs-device (`95bae9…` binary, `93b170…` profile,
   `8b0ed6…` mcast profile).
+
+## Postscript — the landing did not survive, and W2 must not be attempted here
+
+Right after this run the handset was restarted by the platform: it came back as
+`up 0 min` with `getenforce` → **Enforcing** and no `ghostlock` process left.  One
+run with `GHOSTLOCK_W2_ONLY=1` (cred write) had been started and was stopped
+mid-flight; the operator reports that a security module on the phone reacted to the
+activity.  No further writes were attempted on the device, and none should be
+without an explicit decision:
+
+* the kernel-side effect of W1 is **not persistent** — a reboot restores Enforcing;
+* W1 alone leaves the phone alive (both runs here survived; only the PI livelock);
+  treat W2 and beyond on this handset as something that gets noticed;
+* the staged directory `/data/local/tmp/gl-0925-2136/` (binary, GLK1 profiles,
+  `run*.log`) stays on the device unless it is removed.
+
