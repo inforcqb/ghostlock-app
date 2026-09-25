@@ -10,7 +10,10 @@
  * ghostlock::victim, ghostlock::race and ghostlock::stages.
  */
 
+#include <fcntl.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -112,6 +115,24 @@ int main(int argc, char **argv) {
                 pr_success("parking after W1: forged PI state kept alive "
                            "(pid=%d); do NOT exit/kill this process\n",
                            (int) getpid());
+                /* This process must survive until an out-of-process cleaner has
+                 * erased the forged PI links and killed us -- an exit before
+                 * that walks the forged tree and wedges the machine.  A stray
+                 * SIGTERM (process-group cleanup) or lmkd picking us would be
+                 * indistinguishable from that exit, so harden the park:
+                 *   1. no parent-death signal (a dying shell must not kill us),
+                 *   2. lmkd skips us (the victim child does the same),
+                 *   3. every catchable signal is ignored; only SIGKILL can end
+                 *      this process, and only after cleanup. */
+                prctl(PR_SET_PDEATHSIG, 0);
+                const int oom = open("/proc/self/oom_score_adj", O_WRONLY);
+                if (oom >= 0) {
+                    (void) !write(oom, "-1000", 5);
+                    close(oom);
+                }
+                for (int s = 1; s < NSIG; s++) {
+                    if (s != SIGKILL && s != SIGSTOP) (void) signal(s, SIG_IGN);
+                }
                 for (;;) pause();
             }
             return 0;
