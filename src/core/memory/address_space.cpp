@@ -109,6 +109,26 @@ uintptr_t resolved_addresses_data_alias(const ResolvedAddresses *addresses,
     return result ? result->value() : 0;
 }
 
+/* Sandbox override for the physical base of RAM.  The PJA110 has RAM at
+ * 0x80000000 and the kernel image at physical 0xa8000000; QEMU's '-M virt' has
+ * RAM at 0x40000000 and loads the Image at 0x40080000.  Everything that turns a
+ * kernel image address into its direct-map alias goes through here, so this is
+ * the one knob a guest run needs.  0 keeps the compiled-in constant. */
+uintptr_t g_p0_phys_offset_override;
+
+uintptr_t p0_phys_offset(void) {
+    const char *env = getenv("GHOSTLOCK_PHYS_OFFSET");
+    static uintptr_t cached;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        cached = g_p0_phys_offset_override;
+        if (!cached && env && *env) cached = (uintptr_t) strtoull(env, nullptr, 0);
+        if (!cached) cached = P0_PHYS_OFFSET;
+    }
+    return cached;
+}
+
 std::optional<target::DirectMapAddress>
 resolved_addresses_data_alias_checked(
     const ResolvedAddresses &addresses,
@@ -117,9 +137,9 @@ resolved_addresses_data_alias_checked(
     if (image < KIMAGE_TEXT_BASE) return std::nullopt;
     const uintptr_t offset = image - KIMAGE_TEXT_BASE;
     const auto physical = addresses.kernel_phys_load.checked_add(offset);
-    if (!physical || physical->value() < P0_PHYS_OFFSET) return std::nullopt;
+    if (!physical || physical->value() < p0_phys_offset()) return std::nullopt;
     const uintptr_t direct =
-        (physical->value() - P0_PHYS_OFFSET) | P0_PAGE_OFFSET;
+        (physical->value() - p0_phys_offset()) | P0_PAGE_OFFSET;
     if (direct < P0_PAGE_OFFSET) return std::nullopt;
     return target::DirectMapAddress(direct);
 }

