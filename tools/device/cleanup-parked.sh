@@ -61,11 +61,12 @@ if [ -z "$T" ] && [ -z "${GL_ONE:-}" ] && [ -d "$GL_DIR/parked.d" ]; then
         t=$(sed -n 's/^task=//p' "$f" | head -1)
         i=$(sed -n 's/^init_cred=//p' "$f" | head -1)
         p=$(sed -n 's/^pid=//p' "$f" | head -1)
+        c=$(sed -n 's/^cmd=//p' "$f" | head -1)
         echo "=== parked receipt $f"
         if [ "$APPLY" = 1 ]; then
-            GL_ONE=1 sh "$0" --apply "$t" "$i" "$p" || failed=1
+            GL_ONE=1 GL_CMD="$c" sh "$0" --apply "$t" "$i" "$p" || failed=1
         else
-            GL_ONE=1 sh "$0" "$t" "$i" "$p" || failed=1
+            GL_ONE=1 GL_CMD="$c" sh "$0" "$t" "$i" "$p" || failed=1
         fi
     done
     if [ "$found" != 1 ]; then
@@ -302,6 +303,28 @@ case "$IC0" in 04000000000000000000000000000000*) ;; *) ok=0 ;; esac
 
 if [ "$ok" = 1 ]; then
     echo "RESULT: clean -- the park state is gone, the process may die now."
+    # Privileged follow-ups (notably /data/adb/ksud late-load, which installs
+    # kernelsu.ko for persistent root) cannot run from here: this client keeps
+    # the app-zygote bounding set (0x8000c0), so CAP_SYS_MODULE is unavailable.
+    # The parked process has it and main.cpp polls for <home>/parked.d/<pid>.cmd,
+    # so hand the command over and wait for <pid>.done before killing it -- the
+    # child it forks execs, i.e. it runs on a real cred and outlives us.
+    if [ -n "${GL_CMD:-}" ] && [ -n "$PID" ] && [ -n "${GL_DIR:-}" ]; then
+        rm -f "$GL_DIR/parked.d/$PID.done"
+        printf '%s\n' "$GL_CMD" > "$GL_DIR/parked.d/$PID.cmd"
+        echo "handed to parked pid=$PID: $GL_CMD"
+        k=0
+        while [ "$k" -lt 60 ] && [ ! -f "$GL_DIR/parked.d/$PID.done" ]; do
+            sleep 1
+            k=$((k + 1))
+        done
+        if [ -f "$GL_DIR/parked.d/$PID.done" ]; then
+            echo "parked process reports done (see its log)"
+        else
+            echo "WARNING: no .done after 60s -- the command may still be running"
+            echo "         (e.g. it restarted adbd); check $GL_LOG before killing"
+        fi
+    fi
     if [ -n "$PID" ]; then
         if kill -9 "$PID" 2>/dev/null; then
             echo "killed parked pid=$PID"
