@@ -61,27 +61,36 @@ if [ "$MODE" = "foreground" ]; then
 fi
 
 rm -f "$LOG"
-# setsid: the parked process must survive both this shell exiting and an adb
-# disconnect, so it is put in its own session.
+# The exploit writes to a *file*, not a pipe: if the terminal (or the adb session)
+# disappears mid-run, a pipe would give the exploit EPIPE/SIGPIPE, and this process
+# must never die on its own.  The screen mirror is done here by tailing the file,
+# so the log is visible live AND lands in $LOG for the record.
 setsid ./ghostlock --profile "$DIR/profile.bin" >"$LOG" 2>&1 &
 PID=$!
-echo "W1: started pid=$PID (logging to $LOG)"
+echo "W1: started pid=$PID -- log echoed below (also kept in $LOG)"
 
+seen=0
 i=0
-while [ $i -lt 90 ]; do                # 90 * 2s = 3 min, the store takes ~11s
+while [ $i -lt 90 ]; do                # 90 * 1s, the store takes ~11s
+    total=$(wc -l < "$LOG" 2>/dev/null)
+    [ -z "$total" ] && total=0
+    if [ "$total" -gt "$seen" ]; then
+        tail -n +$((seen + 1)) "$LOG"
+        seen=$total
+    fi
     if grep -q "Write 1 complete" "$LOG" 2>/dev/null; then
         echo "W1: LANDED -- enforce=$(getenforce) ($(cat /sys/fs/selinux/enforce 2>/dev/null))"
         echo "W1: parked process is pid=$PID; do NOT kill it (a reboot is the clean exit)"
         exit 0
     fi
-    if ! kill -0 "$PID" 2>/dev/null; then
+    if [ "$i" -gt 5 ] && ! kill -0 "$PID" 2>/dev/null; then
         echo "W1: process exited WITHOUT landing -- last log lines:"
         tail -6 "$LOG"
         exit 1
     fi
-    sleep 2
+    sleep 1
     i=$((i + 1))
 done
 
-echo "W1: still running after 3 min (pid=$PID); see $LOG"
+echo "W1: still running after 90s (pid=$PID); see $LOG"
 exit 2

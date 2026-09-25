@@ -26,9 +26,13 @@ Modes:
 
 | mode | behaviour |
 |---|---|
-| default | `setsid ./ghostlock … &`, poll `w1.log` for `Write 1 complete` (the store takes ~11 s), print `enforce=…`, **exit 0**. The exploit keeps running. |
-| `--foreground` | `exec ./ghostlock …` — blocks here, as before (the exploit parks). |
+| default | starts the exploit with `setsid … > w1.log 2>&1 &`, **echoes new log lines to the screen** once a second, prints `enforce=…` when `Write 1 complete` appears (~11 s), **exit 0**. The exploit keeps running; the log is also kept in `w1.log`. |
+| `--foreground` | `exec ./ghostlock …` — blocks here, log straight on the console (the exploit parks). |
 | `--status` | print `getenforce`, the `ghostlock` process and the last log lines; run nothing. |
+
+The exploit's output goes to a *file*, not a pipe, and the screen mirror is a `tail`
+of that file: if the terminal or the adb session goes away mid-run, a pipe would hand
+the exploit EPIPE/SIGPIPE, and this process must never die on its own.
 
 The script returning is safe — it is the *parked exploit process* that must stay
 alive (`setsid` keeps it across the shell exiting and an adb disconnect).  Killing
