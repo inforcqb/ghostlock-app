@@ -55,9 +55,16 @@ PID=${1:-}
 [ -r "$CLEANER" ] || { echo "cleanup-w1: $CLEANER not found"; exit 2; }
 
 # ---------------------------------------------------------------- locate -----
+# w1.log survives reboots, so its "parking after W1 ... (pid=N)" line can name a
+# process from an earlier boot: accept it only while it is still alive, otherwise
+# fall back to scanning ps.
+LOGPID=""
 if [ -z "$PID" ] && [ -r "$GL_LOG" ]; then
-    PID=$(grep -a 'parking after W1' "$GL_LOG" | tail -1 |
-          sed -n 's/.*(pid=\([0-9][0-9]*\)).*/\1/p')
+    LOGPID=$(grep -a 'parking after W1' "$GL_LOG" | tail -1 |
+             sed -n 's/.*(pid=\([0-9][0-9]*\)).*/\1/p')
+    if [ -n "$LOGPID" ] && [ -d "/proc/$LOGPID" ]; then
+        PID=$LOGPID
+    fi
 fi
 if [ -z "$PID" ]; then
     PID=$(ps -A -o PID,UID,NAME 2>/dev/null |
@@ -65,13 +72,14 @@ if [ -z "$PID" ]; then
 fi
 if [ -z "$PID" ]; then
     echo "cleanup-w1: no parked W1 process found"
-    echo "            (looked for 'parking after W1' in $GL_LOG and for a"
-    echo "             ghostlock process on uid 2000)"
+    echo "            (scanned ps for a ghostlock process on the shell uid 2000)"
+    [ -n "$LOGPID" ] && echo "            note: $GL_LOG names pid $LOGPID, which is gone --" &&
+        echo "                  stale log from an earlier boot, nothing to clean"
     exit 2
 fi
 if [ ! -d "/proc/$PID" ]; then
-    echo "cleanup-w1: pid $PID is gone; if it died without a cleanup, a reboot is"
-    echo "            the clean way out (the forged state died with it)."
+    echo "cleanup-w1: pid $PID is gone; the forged state died with it."
+    echo "            A reboot is the clean way out if that exit wedged anything."
     exit 2
 fi
 
