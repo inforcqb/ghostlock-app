@@ -203,4 +203,16 @@
     <string name="fallback_label">Fallback route</string>
     <string name="fallback_none">None</string>
     <string name="field_fallback_to">fallback_to</string>
+    <string name="action_root_chain">One-click root</string>
+    <string name="action_root_chain_running">Rooting…</string>
+    <string name="root_chain_steps_title">Root chain</string>
+    <string name="root_chain_step_preflight">Preflight: channel and files</string>
+    <string name="root_chain_step_w1">W1: SELinux to permissive</string>
+    <string name="root_chain_step_magica_root">Magica: uid-0 channel</string>
+    <string name="root_chain_step_open_adb_gate">Open the adbd gate (adbd/usbd domains)</string>
+    <string name="root_chain_step_adb_connect">adb client connects to 127.0.0.1:5555</string>
+    <string name="root_chain_step_remove_guard">rmmod oplus_security_guard</string>
+    <string name="root_chain_step_ksu_late_load">ksud late-load</string>
+    <string name="root_chain_step_verify">Verify KernelSU</string>
+    <string name="root_chain_step_generic">Chain step</string>
 </resources>

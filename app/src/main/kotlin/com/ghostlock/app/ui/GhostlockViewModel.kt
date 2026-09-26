@@ -4,6 +4,9 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
+import com.ghostlock.app.chain.ChainProgress
+import com.ghostlock.app.chain.ChainStep
+import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LogTone
 import com.ghostlock.app.domain.model.OffsetCandidate
@@ -22,6 +25,7 @@ import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.PublishOffsetsUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
+import com.ghostlock.app.domain.usecase.RunRootChainUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -67,6 +71,7 @@ class GhostlockViewModel(
     private val publishOffsetsUseCase = PublishOffsetsUseCase(repository)
     private val readDocumentUseCase = ReadDocumentUseCase(repository)
     private val runExploitUseCase = RunExploitUseCase(repository)
+    private val runRootChainUseCase = RunRootChainUseCase(repository)
     private val formatLog = FormatLogUseCase()
     private val profileController get() = repository.profileController()
 
@@ -533,6 +538,9 @@ class GhostlockViewModel(
 
     fun onRun() = runExploit()
 
+    /** One-click root: drives the frozen chain, which is already implemented in `chain/`. */
+    fun onRunRootChain() = runRootChain()
+
     /** Explains why the run button is greyed out. */
     fun onProfileInvalid() {
         val state = state.value
@@ -588,6 +596,98 @@ class GhostlockViewModel(
                 send(GhostlockEffect.KeepScreenAwake(false))
             }
         }
+    }
+
+    /**
+     * Mirror of [runExploit] for the frozen root chain: same guards, same operation
+     * lifecycle, same header log lines. The chain itself (`W1 -> Magica -> adbd gate ->
+     * rmmod guard -> ksud late-load`) lives in `chain/RootChain.kt` and reports its
+     * steps through [onChainProgress]; its commands must stay verbatim, see
+     * `docs/analysis/root-chain-integration.md`.
+     */
+    private fun runRootChain() {
+        val snapshot = kernelSnapshot ?: return
+        if (!snapshot.kernelSupported) {
+            if (beginOperation()) {
+                appendLog("result: root chain unsupported by this kernel")
+                endOperation()
+            }
+            return
+        }
+        if (snapshot.shizukuEnabled && snapshot.shizukuStatus != ShizukuStatus.READY) {
+            onStatusClick()
+            return
+        }
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        if (!beginOperation()) return
+        /* A new run resets the step list, so no row of the previous run survives. */
+        mutableState.update { it.copy(rootChainSteps = initialRootChainSteps()) }
+        send(GhostlockEffect.KeepScreenAwake(true))
+        appendLog("==== start one-click root chain ====")
+        appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
+        appendLog("chain: W1 -> Magica uid-0 channel -> adbd gate -> rmmod guard -> ksud late-load")
+        appendLog("commands are verbatim: docs/analysis/root-chain-integration.md")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val ok = runRootChainUseCase(pair, ::appendLog, ::onChainProgress)
+                appendLog(if (ok) "result: root chain completed" else "result: root chain failed")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                appendLog("root chain failed: ${error.message}")
+                appendLog("result: root chain failed")
+            } finally {
+                endOperation()
+                send(GhostlockEffect.KeepScreenAwake(false))
+            }
+        }
+    }
+
+    /**
+     * Index-based upsert: [ChainProgress.index] is the 1-based [ChainStep] ordinal, so the
+     * row is replaced in place instead of appended and one step never gets two rows.
+     * The list is seeded by [initialRootChainSteps]; if it is not (for example when the
+     * process state was restored), it is re-seeded from the enum before the update.
+     */
+    private fun onChainProgress(progress: ChainProgress) {
+        val index = progress.index - 1
+        if (index < 0) return
+        val entry = RootChainStepUi(
+            labelRes = chainStepLabelRes(progress.step),
+            detail = progress.detail,
+            state = when (progress.state) {
+                StepState.RUNNING -> RootChainStepState.RUNNING
+                StepState.OK -> RootChainStepState.OK
+                StepState.FAILED -> RootChainStepState.FAILED
+            },
+        )
+        mutableState.update { state ->
+            val steps = if (state.rootChainSteps.size == ChainStep.entries.size) {
+                state.rootChainSteps.toMutableList()
+            } else {
+                initialRootChainSteps().toMutableList()
+            }
+            if (index >= steps.size) return@update state
+            val previous = steps[index]
+            /* An OK event without an outcome keeps the detail of its RUNNING event. */
+            steps[index] = entry.copy(detail = entry.detail.ifBlank { previous.detail })
+            state.copy(rootChainSteps = steps)
+        }
+    }
+
+    private fun initialRootChainSteps(): List<RootChainStepUi> =
+        ChainStep.entries.map { step -> RootChainStepUi(labelRes = chainStepLabelRes(step)) }
+
+    private fun chainStepLabelRes(step: ChainStep): Int = when (step) {
+        ChainStep.PREFLIGHT -> R.string.root_chain_step_preflight
+        ChainStep.W1 -> R.string.root_chain_step_w1
+        ChainStep.MAGICA_ROOT -> R.string.root_chain_step_magica_root
+        ChainStep.OPEN_ADB_GATE -> R.string.root_chain_step_open_adb_gate
+        ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
+        ChainStep.REMOVE_GUARD -> R.string.root_chain_step_remove_guard
+        ChainStep.KSU_LATE_LOAD -> R.string.root_chain_step_ksu_late_load
+        ChainStep.VERIFY -> R.string.root_chain_step_verify
+        else -> R.string.root_chain_step_generic
     }
 
     fun onCloseExecutionSheet() {

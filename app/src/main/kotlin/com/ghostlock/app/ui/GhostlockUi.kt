@@ -144,14 +144,30 @@ data class GhostlockUiState(
     val builtinTemplates: List<String> = emptyList(),
     /** Builtin releases sorted by similarity to the device kernel. */
     val builtinProfiles: List<String> = emptyList(),
+    /**
+     * One-click root chain steps, seeded from `ChainStep.entries` when a run starts
+     * and then updated in place; empty means no chain run happened in this session.
+     */
+    val rootChainSteps: List<RootChainStepUi> = emptyList(),
 )
 
 enum class DialogType { NONE, LIST, INPUT, CONFIRM }
 
 data class GhostlockLogLine(val text: String, val color: Int)
 
+/** One row of the one-click root chain: step label, latest detail and current state. */
+data class RootChainStepUi(
+    /** String resource id; the UI resolves it so both locales work. */
+    val labelRes: Int,
+    val detail: String = "",
+    val state: RootChainStepState = RootChainStepState.PENDING,
+)
+
+enum class RootChainStepState { PENDING, RUNNING, OK, FAILED }
+
 interface GhostlockActions {
     fun onRun()
+    fun onRunRootChain()
     fun onProfileInvalid()
     fun onStatusClick()
     fun onCloseExecutionSheet()
@@ -414,15 +430,122 @@ private fun GhostlockExecutionSheet(
             }
         },
         content = {
-            LogPanel(
-                lines = state.logLines,
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 240.dp, max = 520.dp)
                     .navigationBarsPadding(),
-            )
+            ) {
+                if (state.rootChainSteps.isNotEmpty()) {
+                    RootChainStepPanel(
+                        steps = state.rootChainSteps,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp),
+                    )
+                }
+                LogPanel(
+                    lines = state.logLines,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 240.dp, max = 520.dp),
+                )
+            }
         },
     )
+}
+
+/** Chain progress card: one row per step, shown only while a chain run is known. */
+@Composable
+private fun RootChainStepPanel(
+    steps: List<RootChainStepUi>,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier,
+        insideMargin = PaddingValues(16.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.root_chain_steps_title),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Medium,
+                color = MiuixTheme.colorScheme.onSurface,
+            )
+            for (step in steps) {
+                RootChainStepRow(step = step)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RootChainStepRow(step: RootChainStepUi) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RootChainStepIndicator(state = step.state)
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = stringResource(step.labelRes),
+                fontSize = 14.sp,
+                color = MiuixTheme.colorScheme.onSurface,
+            )
+            if (step.detail.isNotBlank()) {
+                Text(
+                    text = step.detail,
+                    modifier = Modifier.padding(top = 2.dp),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RootChainStepIndicator(state: RootChainStepState) {
+    val color = rootChainStateColor(state)
+    when (state) {
+        RootChainStepState.OK -> Icon(
+            imageVector = Icons.Rounded.CheckCircleOutline,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(18.dp),
+        )
+
+        RootChainStepState.FAILED -> Icon(
+            imageVector = Icons.Rounded.RemoveCircleOutline,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(18.dp),
+        )
+
+        RootChainStepState.RUNNING, RootChainStepState.PENDING -> Box(
+            modifier = Modifier.size(18.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(color),
+            )
+        }
+    }
+}
+
+/** Same palette as the log panel, so the card reads as part of the same run. */
+private fun rootChainStateColor(state: RootChainStepState): Color = when (state) {
+    RootChainStepState.PENDING -> Color(0xFF9CA3AF)
+    RootChainStepState.RUNNING -> Color(0xFF60A5FA)
+    RootChainStepState.OK -> Color(0xFF5FD68A)
+    RootChainStepState.FAILED -> Color(0xFFFF6B6B)
 }
 
 @Composable
@@ -573,15 +696,9 @@ private fun PortraitContent(
             )
         }
         item(key = "run") {
-            RunButton(
-                running = state.running,
-                supported = state.kernelSupported &&
-                    (!state.shizukuEnabled ||
-                        state.shizukuStatus == ShizukuStatus.READY),
-                profileValid = state.profileInvalidPaths.isEmpty(),
-                labelRes = R.string.action_run,
-                onClick = actions::onRun,
-                onBlockedClick = actions::onProfileInvalid,
+            RunActions(
+                state = state,
+                actions = actions,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -617,15 +734,9 @@ private fun LandscapeContent(
                 )
             }
             item(key = "run") {
-                RunButton(
-                    running = state.running,
-                    supported = state.kernelSupported &&
-                        (!state.shizukuEnabled ||
-                            state.shizukuStatus == ShizukuStatus.READY),
-                    profileValid = state.profileInvalidPaths.isEmpty(),
-                    labelRes = R.string.action_run,
-                    onClick = actions::onRun,
-                    onBlockedClick = actions::onProfileInvalid,
+                RunActions(
+                    state = state,
+                    actions = actions,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -910,6 +1021,47 @@ internal fun AdvancedAction(
     )
 }
 
+/**
+ * The two run entries, side by side: the regular exploit run and the one-click
+ * root chain. Both share the same gating (`supported`, `profileValid`, `running`),
+ * and a greyed-out button still explains itself through [GhostlockActions.onProfileInvalid].
+ */
+@Composable
+private fun RunActions(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+    modifier: Modifier = Modifier,
+) {
+    val supported = state.kernelSupported &&
+        (!state.shizukuEnabled || state.shizukuStatus == ShizukuStatus.READY)
+    val profileValid = state.profileInvalidPaths.isEmpty()
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RunButton(
+            running = state.running,
+            supported = supported,
+            profileValid = profileValid,
+            labelRes = R.string.action_run,
+            onClick = actions::onRun,
+            onBlockedClick = actions::onProfileInvalid,
+            modifier = Modifier.weight(1f),
+        )
+        RunButton(
+            running = state.running,
+            supported = supported,
+            profileValid = profileValid,
+            labelRes = R.string.action_root_chain,
+            runningLabelRes = R.string.action_root_chain_running,
+            onClick = actions::onRunRootChain,
+            onBlockedClick = actions::onProfileInvalid,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
 @Composable
 private fun RunButton(
     running: Boolean,
@@ -919,10 +1071,11 @@ private fun RunButton(
     onClick: () -> Unit,
     onBlockedClick: () -> Unit,
     modifier: Modifier = Modifier,
+    runningLabelRes: Int = R.string.action_running,
 ) {
     Box(modifier = modifier) {
         TextButton(
-            text = stringResource(if (running) R.string.action_running else labelRes),
+            text = stringResource(if (running) runningLabelRes else labelRes),
             enabled = supported && profileValid && !running,
             colors = ButtonDefaults.textButtonColorsPrimary(),
             onClick = onClick,

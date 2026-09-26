@@ -203,4 +203,16 @@
     <string name="fallback_label">回退路由</string>
     <string name="fallback_none">无</string>
     <string name="field_fallback_to">回退目标</string>
+    <string name="action_root_chain">一键 root</string>
+    <string name="action_root_chain_running">一键 root 执行中…</string>
+    <string name="root_chain_steps_title">root 链路</string>
+    <string name="root_chain_step_preflight">预检：通道与文件</string>
+    <string name="root_chain_step_w1">W1：SELinux 转宽容</string>
+    <string name="root_chain_step_magica_root">Magica：uid-0 通道</string>
+    <string name="root_chain_step_open_adb_gate">打开 adbd 门（借 adbd/usbd 域）</string>
+    <string name="root_chain_step_adb_connect">adb 客户端连 127.0.0.1:5555</string>
+    <string name="root_chain_step_remove_guard">rmmod oplus_security_guard</string>
+    <string name="root_chain_step_ksu_late_load">ksud late-load</string>
+    <string name="root_chain_step_verify">校验 KernelSU</string>
+    <string name="root_chain_step_generic">链路步骤</string>
 </resources>
