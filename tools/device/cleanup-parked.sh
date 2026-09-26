@@ -78,8 +78,24 @@ if [ -z "$T" ] && [ -z "${GL_ONE:-}" ] && [ -z "${PID:-}" ] && [ -d "$GL_DIR/par
     exit 0
 fi
 
+# kread_min may not be loaded yet: the parked process's GHOSTLOCK_LOAD_KO can
+# have failed (bad vermagic/CRC/refused signature), or this is the fallback run
+# from an ordinary root shell after KernelSU is up.  Loading it needs
+# CAP_SYS_MODULE, so only a full root shell can do it -- try, and print dmesg so
+# the reason (vermagic / disagrees about version / EPERM) is visible.
+GL_KO=${GL_KO:-/sdcard/kread_min.ko}
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
-    echo "kread_min is not loaded: /proc/kread and /proc/kwrite must exist"
+    echo "kread_min not loaded; trying insmod $GL_KO"
+    if [ -f "$GL_KO" ]; then
+        insmod "$GL_KO" 2>&1 || true
+        dmesg 2>/dev/null | tail -3
+    else
+        echo "  $GL_KO not found"
+    fi
+fi
+if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
+    echo "kread_min unavailable: /proc/kread and /proc/kwrite must exist."
+    echo "Run this from a full root shell (CAP_SYS_MODULE), or fix GHOSTLOCK_LOAD_KO first."
     exit 2
 fi
 
