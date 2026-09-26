@@ -21,13 +21,13 @@ APPLY=""
 miss=0
 for f in "$DIR/ghostlock" "$DIR/profile.bin" "$DIR/w1.sh" "$RS" \
          "$DIR/rshell.sock" "$DIR/rshell.token" "$DIR/cleanup-parked.sh" \
-         /sdcard/kread_min.ko; do
+         $DIR/kread_min.ko; do
     [ -e "$f" ] || { echo "MISSING: $f"; miss=1; }
 done
 [ "$miss" = 1 ] && exit 2
 
 echo "== versions"
-ls -l "$DIR/ghostlock" "$DIR/cleanup-parked.sh" /sdcard/kread_min.ko
+ls -l "$DIR/ghostlock" "$DIR/cleanup-parked.sh" $DIR/kread_min.ko
 grep -qa 'parked.d' "$DIR/ghostlock" ||
     { echo "ghostlock is OLD (no parked.d marker) -- copy /sdcard/gl-w1c-self/ghostlock first"; exit 2; }
 grep -qa 'find_task_by_pid' "$DIR/cleanup-parked.sh" ||
