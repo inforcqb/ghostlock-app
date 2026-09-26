@@ -20,7 +20,8 @@ KO=/data/local/tmp/gl-w1/kread_min.ko
 # modules feed the userspace anti-root reboot, so silence them before loading
 # KernelSU; unload guard first, then harden, then the kevent transport (their
 # refcounts are 0/0/1-used-by-harden).
-PARK_CMD="/system/bin/rmmod oplus_security_guard; /system/bin/rmmod oplus_secure_harden; /system/bin/rmmod oplus_security_keventupload; /data/adb/ksud late-load"
+PRE_CMD="/system/bin/rmmod oplus_security_guard; /system/bin/rmmod oplus_secure_harden; /system/bin/rmmod oplus_security_keventupload"
+PARK_CMD="/data/adb/ksud late-load"
 
 cd "$DIR" || exit 1
 export GHOSTLOCK_HOME="$DIR"
@@ -28,12 +29,15 @@ export GHOSTLOCK_MCAST_SOCKET=tcp6
 export GHOSTLOCK_SELF_ROOT=1          # target self (perf pid=0), not adbd
 export GHOSTLOCK_W1C_ONLY=1           # stop right after the cred write + repair
 export GHOSTLOCK_PARK_AFTER_W1=1      # park: an exit here walks the forged PI tree
+export GHOSTLOCK_PRE_CMD="$PRE_CMD"   # rmmod the OPPO modules FIRST (insmod after)
 export GHOSTLOCK_LOAD_KO="$KO"        # finit_module from *this* process
 export GHOSTLOCK_PARK_CMD="$PARK_CMD" # run after cleanup, before the process dies
 export GHOSTLOCK_FINISH=1            # the parked process runs cleanup-parked.sh --apply itself
                                      # (one cleanup implementation; it kills us only after verify)
 
-echo "W1c: uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) ko=$KO cmd=$PARK_CMD"
+echo "W1c: uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)"
+echo "W1c: pre=$PRE_CMD"
+echo "W1c: ko=$KO park=$PARK_CMD"
 [ -f "$KO" ] || echo "W1c: WARNING $KO missing -- LOAD_KO will fail"
 
 rm -f "$LOG"
