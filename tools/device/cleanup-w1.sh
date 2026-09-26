@@ -127,10 +127,24 @@ echo "cmdline: $(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null)"
 
 if [ -r "$GL_LOG" ]; then
     echo "== markers in $GL_LOG"
-    grep -aE 'startup context|W1: SELinux target|mcast nonresident: page=|private scratch repaired|parking after W1' "$GL_LOG" | tail -5
-    PAGE=$(grep -a 'mcast nonresident: page=0x' "$GL_LOG" | tail -1 |
-           sed -n 's/.*page=0x\([0-9a-f][0-9a-f]*\).*/\1/p')
-    [ -n "$PAGE" ] && echo "== payload page (the forged PI links must point in here): 0x$PAGE"
+    grep -aE 'startup context|W1: SELinux target|private scratch repaired|parking after W1' "$GL_LOG" | tail -5
+    # A W1 run touches two payload pages: the route page (whose forged objects
+    # this task's PI fields point at) and the W1b scratch page that repairs the
+    # route page's own scratch word.  The route page is the FIRST one in the log;
+    # taking the last one (previous behaviour) pointed at the scratch page and
+    # would have made the cross-check below misleading.
+    PAGES=$(grep -a 'mcast nonresident: page=0x' "$GL_LOG" |
+            sed -n 's/.*page=0x\([0-9a-f][0-9a-f]*\).*/\1/p')
+    if [ -n "$PAGES" ]; then
+        echo "== payload pages (1 = route page: the forged PI objects live here;"
+        echo "   any later one is a W1b scratch page):"
+        n=0
+        for pg in $PAGES; do
+            n=$((n + 1))
+            echo "   [$n] 0x$pg"
+        done
+        PAGE=$(echo "$PAGES" | head -1)
+    fi
 fi
 
 # ----------------------------------------------------------------- read ------
