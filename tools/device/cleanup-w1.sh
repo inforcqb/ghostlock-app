@@ -55,26 +55,64 @@ PID=${1:-}
 [ -r "$CLEANER" ] || { echo "cleanup-w1: $CLEANER not found"; exit 2; }
 
 # ---------------------------------------------------------------- locate -----
-# w1.log survives reboots, so its "parking after W1 ... (pid=N)" line can name a
-# process from an earlier boot: accept it only while it is still alive, otherwise
-# fall back to scanning ps.
+# PID numbers are recycled: w1.log survives reboots, so its "(pid=N)" line can
+# name a process that has long exited while N now belongs to something else
+# (seen on hardware: pid 13777 had become thermal-engine-v2, uid 0, 164 threads).
+# Existence of /proc/<pid> is therefore NOT evidence -- every candidate has to
+# pass an identity check, because the cleaner writes zeros into that task's PI
+# fields and a wrong task means corrupting an unrelated kernel process.
+ident_ok() {   # ident_ok <pid>
+    [ -r "/proc/$1/comm" ] || return 1
+    [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "ghostlock" ]
+}
+
 LOGPID=""
 if [ -z "$PID" ] && [ -r "$GL_LOG" ]; then
     LOGPID=$(grep -a 'parking after W1' "$GL_LOG" | tail -1 |
              sed -n 's/.*(pid=\([0-9][0-9]*\)).*/\1/p')
-    if [ -n "$LOGPID" ] && [ -d "/proc/$LOGPID" ]; then
+    if [ -n "$LOGPID" ] && ident_ok "$LOGPID"; then
         PID=$LOGPID
     fi
 fi
 if [ -z "$PID" ]; then
-    PID=$(ps -A -o PID,UID,NAME 2>/dev/null |
-          awk '$2 == 2000 && $3 == "ghostlock" { print $1 }' | head -1)
+    # Identity, not uid: a W1 park launched from a plain adb shell runs on the
+    # shell uid, one launched from a root shell (runcon u:r:shell:s0) runs on 0,
+    # and the W1c park runs inside the Magica channel -- comm is the only
+    # invariant.  With more than one candidate we refuse and ask for a pid
+    # rather than guess.
+    CAND=$(ps -A -o PID,UID,STAT,NAME 2>/dev/null | awk '$4 == "ghostlock" { print $1 }')
+    NCAND=$(echo "$CAND" | grep -c . 2>/dev/null)
+    [ -z "$CAND" ] && NCAND=0
+    if [ "$NCAND" = 1 ]; then
+        PID=$CAND
+    elif [ "$NCAND" -gt 1 ]; then
+        echo "cleanup-w1: $NCAND ghostlock processes are running -- pick one:"
+        for p in $CAND; do
+            echo "  pid=$p uid=$(sed -n 's/^Uid:\t\([0-9]*\).*/\1/p' "/proc/$p/status" 2>/dev/null) \
+cap=$(sed -n 's/^CapEff:\t//p' "/proc/$p/status" 2>/dev/null) \
+state=$(sed -n 's/^State:\t//p' "/proc/$p/status" 2>/dev/null)"
+        done
+        echo "  (the W1 park is the one that did not replace its credentials; the"
+        echo "   W1c park is uid 0 with CapEff 000001ffffffffff)"
+        echo "  re-run: sh $0 ${APPLY:-} <pid>"
+        exit 3
+    fi
 fi
 if [ -z "$PID" ]; then
-    echo "cleanup-w1: no parked W1 process found"
-    echo "            (scanned ps for a ghostlock process on the shell uid 2000)"
-    [ -n "$LOGPID" ] && echo "            note: $GL_LOG names pid $LOGPID, which is gone --" &&
-        echo "                  stale log from an earlier boot, nothing to clean"
+    echo "cleanup-w1: no parked W1 process found (no live process with comm=ghostlock)"
+    if [ -n "$LOGPID" ]; then
+        if [ -r "/proc/$LOGPID/comm" ]; then
+            echo "            note: $GL_LOG names pid $LOGPID, but that pid is now"
+            echo "                  \"$(cat "/proc/$LOGPID/comm" 2>/dev/null)\" -- pid reuse, stale log"
+        else
+            echo "            note: $GL_LOG names pid $LOGPID, which has exited -- stale log"
+        fi
+    fi
+    exit 2
+fi
+if ! ident_ok "$PID"; then
+    echo "cleanup-w1: REFUSING -- pid $PID is not a ghostlock process (comm=\"$(cat "/proc/$PID/comm" 2>/dev/null)\")."
+    echo "            Writing PI fields into the wrong task would corrupt it."
     exit 2
 fi
 if [ ! -d "/proc/$PID" ]; then
