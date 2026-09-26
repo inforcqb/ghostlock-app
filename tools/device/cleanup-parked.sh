@@ -85,7 +85,10 @@ fi
 # the reason (vermagic / disagrees about version / EPERM) is visible.
 GL_KO=${GL_KO:-/data/local/tmp/gl-w1/kread_min.ko}
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
-    echo "kread_min not loaded; trying insmod $GL_KO"
+    echo "kread_min not loaded; unloading the OPPO modules first, then insmod $GL_KO"
+    for m in oplus_security_guard oplus_secure_harden oplus_security_keventupload; do
+        rmmod "$m" 2>/dev/null
+    done
     if [ -f "$GL_KO" ]; then
         insmod "$GL_KO" 2>&1 || true
         dmesg 2>/dev/null | tail -3
