@@ -24,6 +24,9 @@ dependencyResolutionManagement {
             }
         }
         mavenCentral()
+        // `org.lsposed.libcxx:libcxx` (the libc++ used by the ported Magica JNI build,
+        // which compiles with APP_STL := none + prefab) is published on JitPack.
+        maven("https://jitpack.io")
     }
 }
 
