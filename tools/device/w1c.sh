@@ -13,7 +13,7 @@
 # Everything is baked in here; nothing has to be passed on the command line.
 DIR=/data/local/tmp/gl-w1
 LOG="$DIR/w1c.log"
-KO=/sdcard/kread_min.ko
+KO=/data/local/tmp/gl-w1/kread_min.ko
 # PARK_CMD is a whole shell command line: it runs via `sh -c` in a fork+exec
 # child of the parked process, i.e. on a *real* cred with full caps, which is the
 # only place that can unload modules or talk to ksud.  Order matters: the OPPO
