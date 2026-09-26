@@ -10,13 +10,19 @@
         <package android:name="com.resukisu.resukisu" />
         <package android:name="com.kowx712.supermanager" />
     </queries>
+    <!-- android:zygotePreloadName is part of the ported Magica chain: AppZygote
+         loads libmagica2.so in the APP ZYGOTE, which installs the capset hook of
+         libandroid_runtime.so there so that every isolated process forked from the
+         zygote inherits it.  The load must happen in the zygote, not in the
+         service -- see com.ghostlock.app.root.AppZygote. -->
     <application
         android:name=".GhostlockApplication"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.GhostLock">
+        android:theme="@style/Theme.GhostLock"
+        android:zygotePreloadName="com.ghostlock.app.root.AppZygote">
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -27,6 +33,16 @@
         <service
             android:name=".shizuku.GhostlockUserService"
             android:exported="false"
+            tools:ignore="Instantiatable" />
+        <!-- Ported MagicaService: an isolated uid-0 process, forked from the app
+             zygote.  Bind it with Context.bindIsolatedService(); it exposes
+             IRootShellService (control) and the AF_UNIX root shell under
+             /data/local/tmp/gl-w1 (command plane, used by RootChannel). -->
+        <service
+            android:name=".root.RootShellService"
+            android:exported="false"
+            android:isolatedProcess="true"
+            android:useAppZygote="true"
             tools:ignore="Instantiatable" />
         <activity
             android:name=".ui.MainActivity"

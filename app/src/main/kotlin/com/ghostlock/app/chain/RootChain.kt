@@ -264,7 +264,7 @@ class RootChain(
 
         // step 9: the goal, part two ---------------------------------------------
         ok = step(ChainStep.KSU_LATE_LOAD, ChainSpec.KSUD_LATE_LOAD) {
-            val out = adb.exec(ChainSpec.KSUD_LATE_LOAD, timeoutMs = 120_000L)
+            val out = adb.exec(ChainSpec.KSUD_LATE_LOAD, timeoutMs = 120_000)
             if (out.isNotBlank()) onLog("[*] ksud: ${out.trim()}")
             // NOTE: ksud late-load reloads the SELinux policy, so `getenforce` going back
             // to Enforcing here is expected behaviour, not a failure.

@@ -100,6 +100,43 @@ tasks.register<Copy>("prepareGhostlockJniLibs") {
     }
 }
 
+/* ---- ported Magica root-shell JNI library (libmagica2.so) -----------------
+ * Built by the root Makefile target `magica2jni` instead of AGP's
+ * externalNativeBuild, for the same reason the app's own native binary is: CI
+ * resolves the NDK itself (ONDK through ONDK_HOME / ANDROID_NDK_HOME / ndk.dir),
+ * and ndk-build would additionally pull prefab plus the
+ * org.lsposed.libcxx:libcxx dependency.  The sources are arm64-v8a only, like the
+ * rest of the app.
+ *
+ * The .so is copied into a *generated* jniLibs directory rather than into
+ * app/src/main/jniLibs: that keeps build output out of the source tree (nothing
+ * to gitignore, nothing that can be committed by accident). app/build.gradle.kts
+ * registers the directory as an extra jniLibs source dir and makes preBuild depend
+ * on this task. */
+tasks.register<Exec>("buildMagica2Jni") {
+    description = "buildMagica2Jni"
+    workingDir(rootDir)
+    commandLine("make", "magica2jni")
+    val ndk = resolveNdkDir()
+    environment("ANDROID_NDK_HOME", ndk)
+    environment("NDK_ROOT", ndk)
+    inputs.files(
+        fileTree("app/src/main/jni") {
+            include("**/*.c", "**/*.cc", "**/*.cpp", "**/*.h", "**/*.hpp")
+        },
+        file("Makefile"),
+    )
+    outputs.file(file(".build/jni/libmagica2.so"))
+}
+
+tasks.register<Copy>("prepareMagica2JniLibs") {
+    description = "prepareMagica2JniLibs"
+    dependsOn("buildMagica2Jni")
+    mustRunAfter("buildGhostlockNative")
+    from(".build/jni/libmagica2.so")
+    into("app/build/generated/magica2JniLibs/arm64-v8a")
+}
+
 tasks.register<Exec>("buildGhostlockExtract") {
     description = "buildGhostlockExtract"
     val tools = extractNdkTools()

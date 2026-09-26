@@ -24,6 +24,12 @@ val gitVersionCode = runCatching {
 
 val buildInfoSrc = layout.buildDirectory.dir("generated/source/buildInfo")
 
+/* Ported Magica: libmagica2.so is produced by the root project's Makefile
+ * (`make magica2jni` -> .build/jni/libmagica2.so) and copied here by the root task
+ * prepareMagica2JniLibs, exactly like the app's own native binary.  It lives in a
+ * generated directory so no build output can end up in the source tree. */
+val magica2JniLibs = layout.buildDirectory.dir("generated/magica2JniLibs")
+
 val generateBuildInfo = tasks.register("generateBuildInfo") {
     description = "generateBuildInfo"
     val outputDirectory = buildInfoSrc
@@ -73,6 +79,10 @@ android {
     sourceSets {
         named("main") {
             kotlin.directories.add(buildInfoSrc.get().asFile.absolutePath)
+            // arm64-v8a/libmagica2.so, the ported Magica JNI library (see the root
+            // build.gradle.kts task buildMagica2Jni).  Added to the default
+            // src/main/jniLibs, it is not a replacement for it.
+            jniLibs.srcDir(magica2JniLibs.get().asFile.absolutePath)
         }
     }
     val properties = Properties()
@@ -150,6 +160,7 @@ kotlin {
 tasks.named("preBuild") {
     dependsOn(rootProject.tasks.named("prepareGhostlockJniLibs"))
     dependsOn(rootProject.tasks.named("prepareGhostlockExtractJniLibs"))
+    dependsOn(rootProject.tasks.named("prepareMagica2JniLibs"))
     dependsOn(generateBuildInfo)
 }
 

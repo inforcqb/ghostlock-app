@@ -17,6 +17,10 @@ else
   NDK_CXX := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/aarch64-linux-android$(API)-clang++
 endif
 
+# Used only by the JNI library target below, to check that the .so does not end up
+# depending on libc++_shared.so (which the APK does not ship).
+LLVM_READELF := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/llvm-readelf
+
 C_SRCS :=
 
 CXX_SRCS := \
@@ -84,6 +88,79 @@ $(NATIVE_BUILD_DIR)/%.o: %.c $(HDRS)
 $(NATIVE_BUILD_DIR)/%.o: %.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NDK_CXX) $(CXXFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# libmagica2.so -- the ported Magica root-shell JNI library (app/src/main/jni).
+#
+# Build wiring: option (b) of the port brief.  This target produces the shared
+# library with the same NDK clang++ that already builds the app's own binary, and
+# the root Gradle task `prepareMagica2JniLibs` copies `.build/jni/libmagica2.so`
+# into app/build/generated/magica2JniLibs/arm64-v8a/, which app/build.gradle.kts
+# registers as an extra jniLibs source directory.  AGP's externalNativeBuild is
+# deliberately NOT used: CI's NDK is ONDK (NDK_ROOT/ANDROID_NDK_HOME), which AGP
+# cannot resolve, and ndk-build here would additionally pull prefab plus the
+# org.lsposed.libcxx:libcxx dependency.
+#
+# NOTE: the executable LDFLAGS above (-fPIE -pie) must NOT be reused here -- this
+# is a shared library, so it is -fPIC/-shared.  -static-libstdc++ IS reused and is
+# load-bearing: it makes the driver link libc++_static instead of libc++, so the
+# .so does not end up needing libc++_shared.so, which the APK does not ship
+# (upstream reached the same place with prefab's `cxx` and APP_STL := none).
+# ---------------------------------------------------------------------------
+JNI_DIR := app/src/main/jni
+JNI_BUILD_DIR := .build/jni
+JNI_SRCS := \
+  magica.cpp \
+  lsplt/elf_util.cc \
+  lsplt/lsplt.cc \
+  system_properties/context_node.cpp \
+  system_properties/contexts_serialized.cpp \
+  system_properties/contexts_split.cpp \
+  system_properties/prop_area.cpp \
+  system_properties/prop_info.cpp \
+  system_properties/property_info_parser.cpp \
+  system_properties/system_properties.cpp \
+  system_properties/system_property_api.cpp \
+  system_properties/system_property_set.cpp
+JNI_OBJS := $(addprefix $(JNI_BUILD_DIR)/,$(patsubst %.cpp,%.o,$(patsubst %.cc,%.o,$(JNI_SRCS))))
+JNI_HDRS := $(wildcard $(JNI_DIR)/*.h $(JNI_DIR)/*.hpp $(JNI_DIR)/*/*.h $(JNI_DIR)/*/*.hpp)
+
+# -fvisibility=hidden / -fvisibility-inlines-hidden are functional, not cosmetic:
+# they keep the vendored resetprop (and the statically linked libc++) inside the
+# shared object instead of exporting -- or being interposed by -- libc's own
+# __system_property_* (same flags as upstream's Application.mk).
+JNI_CFLAGS := -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -std=c++23 -pthread \
+  -I$(JNI_DIR) \
+  -I$(JNI_DIR)/lsplt/include \
+  -I$(JNI_DIR)/system_properties/include
+
+JNI_LDFLAGS := -shared -static-libstdc++ -Wl,-soname,libmagica2.so \
+  -Wl,-exclude-libs,ALL -Wl,--gc-sections
+
+.PHONY: magica2jni
+magica2jni: $(JNI_BUILD_DIR)/libmagica2.so
+
+$(JNI_BUILD_DIR)/libmagica2.so: $(JNI_OBJS) Makefile
+	@echo "Using NDK C++ compiler/linker: $(NDK_CXX)"
+	$(NDK_CXX) $(JNI_OBJS) $(JNI_LDFLAGS) -llog -o $@
+	@if [ -x "$(LLVM_READELF)" ]; then \
+		if "$(LLVM_READELF)" -d $@ 2>/dev/null | grep -q libc++_shared; then \
+			echo "WARNING: $@ needs libc++_shared.so, which the APK does not ship"; \
+			"$(LLVM_READELF)" -d $@ | grep NEEDED; \
+		else \
+			echo "OK: $@ needs no libc++_shared.so"; \
+		fi; \
+	fi
+
+$(JNI_BUILD_DIR)/%.o: $(JNI_DIR)/%.cpp $(JNI_HDRS)
+	@mkdir -p $(dir $@)
+	$(NDK_CXX) $(JNI_CFLAGS) -c $< -o $@
+
+$(JNI_BUILD_DIR)/%.o: $(JNI_DIR)/%.cc $(JNI_HDRS)
+	@mkdir -p $(dir $@)
+	$(NDK_CXX) $(JNI_CFLAGS) -c $< -o $@
 
 .PHONY: cpp-link-probe-test target-constants-test native-resource-test native-host-tests lint-tidy
 cpp-link-probe-test: $(HOST_BUILD_DIR)/cpp_link_probe_test
@@ -215,4 +292,4 @@ product: ghostlock
 
 clean:
 	rm -f ghostlock
-	rm -rf .build/native .build/host
+	rm -rf .build/native .build/host .build/jni
