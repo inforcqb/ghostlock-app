@@ -14,7 +14,13 @@
 DIR=/data/local/tmp/gl-w1
 LOG="$DIR/w1c.log"
 KO=/sdcard/kread_min.ko
-PARK_CMD="/data/adb/ksud late-load"
+# PARK_CMD is a whole shell command line: it runs via `sh -c` in a fork+exec
+# child of the parked process, i.e. on a *real* cred with full caps, which is the
+# only place that can unload modules or talk to ksud.  Order matters: the OPPO
+# modules feed the userspace anti-root reboot, so silence them before loading
+# KernelSU; unload guard first, then harden, then the kevent transport (their
+# refcounts are 0/0/1-used-by-harden).
+PARK_CMD="/system/bin/rmmod oplus_security_guard; /system/bin/rmmod oplus_secure_harden; /system/bin/rmmod oplus_security_keventupload; /data/adb/ksud late-load"
 
 cd "$DIR" || exit 1
 export GHOSTLOCK_HOME="$DIR"
