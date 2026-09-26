@@ -94,8 +94,11 @@ Magica 内部自己做的事（`ro.debuggable`、`service.adb.root`、adbd patch
 ## 5. 分支/仓库状态
 
 * **主线**：本文件描述的链。**不使用 W1c。**
-* **备用线**：分支 `w1c-cred-copy` —— 伪造 cred 补丁（`GHOSTLOCK_CRED_FROM_COPY`，
-  二进制内字符串自动探测默认启用）+ `tools/device/{w1c.sh, cleanup-w1.sh, adbd-recover.sh}`。
-  只有在"Magica / KSU 那条走不通"时才回来用它；**对当前链它是多余的**。
-* **未做**：app 内一键集成（Shizuku 跑 W1 + 搬 Magica + app 内 adb 客户端）。用户决定
-  "能跑就先不动"；真要做时，命令集严格按 §1。
+* **W1c 已移除**（2026-09-26）：伪造 cred 补丁（`GHOSTLOCK_CRED_FROM_COPY` 以及
+  `payload_builder` / `util.cpp` / `target*.h` 的改动）、`exploit_stages.cpp` 里的 W1c 阶段、
+  还有 `tools/device/{w1c.sh, w1c-adbd.sh, w1c-self.sh}` 全部删除；那套分析只留在 git 历史里。
+  `gl-chain.sh` 相应收敛成"只跑 W1"的驱动。
+* **保留的设备侧工具**：`w1.sh`（W1）、`adbd-recover.sh`（USB gadget/`UDC` 空时救 adbd）、
+  `cleanup-w1.sh` + `cleanup-parked.sh`（W1 park 的安全网；链本身不做收尾）。
+* **进行中**：app 内一键集成（Shizuku 跑 W1 + 搬 Magica + app 内 adb 客户端）。
+  设计见 `docs/analysis/root-chain-integration.md`；命令集严格按 §1。

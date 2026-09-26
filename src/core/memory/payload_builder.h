@@ -73,21 +73,6 @@ PayloadWriteLayout payload_write_layout(
         uintptr_t default_fops, uintptr_t credential_fops,
         uintptr_t init_cred_alias);
 
-/* GHOSTLOCK_CRED_FROM_COPY=1 installs the credential template that already lives
- * in the payload page (built by fill_profile_cred_copy) instead of the global
- * init_cred.  The word that gets stored doubles as the forged rb-tree child
- * pointer, so the walk also writes 8 bytes *into the object it points at*:
- * with `value == &init_cred` that is init_cred.usage, i.e. the identity of PID 1
- * (init_task.cred == &init_cred) and of every later prepare_kernel_cred(NULL)
- * copy.  Pointing `value` at our own page confines that collateral store to the
- * page instead, which removes the init_cred repair route (and its keepers)
- * entirely: two routes, no global damage.
- *
- * Opt-in until it has been proven on hardware: the copy is only as correct as
- * the profile's four reference pointers, and a wrong `security`/`user_ns` there
- * makes every SELinux-checked syscall return -EINVAL (no panic, but useless). */
-bool credential_install_from_copy() noexcept;
-
 /* Encode the route-neutral compact waiter write arm. Value writes always use
  * {pc=value,right=0,left=target}; leaf writes use {pc=target-8,0,0}. */
 void build_compact_waiter_payload(
