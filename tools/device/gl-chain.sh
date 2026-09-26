@@ -43,9 +43,9 @@ grep -qa 'parking after W1' "$DIR/w1.log" 2>/dev/null ||
     { echo "WARNING: $DIR/w1.log has no 'parking after W1' line"; }
 
 echo "== 2) self cred write + kread_min + ksud command, via rshell (uid 0)"
-sh "$RS" "cd $DIR && GHOSTLOCK_HOME=$DIR GHOSTLOCK_MCAST_SOCKET=tcp6 GHOSTLOCK_SELF_ROOT=1 GHOSTLOCK_W1C_ONLY=1 GHOSTLOCK_PARK_AFTER_W1=1 GHOSTLOCK_LOAD_KO=/sdcard/kread_min.ko GHOSTLOCK_PARK_CMD=\"/data/adb/ksud late-load\" ./ghostlock --profile ./profile.bin"
-echo "-- w1c-self.log tail"
-tail -8 "$DIR/w1c-self.log" 2>/dev/null
+sh "$RS" "sh $DIR/w1c.sh"
+echo "-- w1c.log tail"
+tail -8 "$DIR/w1c.log" 2>/dev/null
 
 echo "== 3) cleanup"
 pids=$(pidof ghostlock 2>/dev/null)
