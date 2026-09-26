@@ -1,7 +1,17 @@
 package com.ghostlock.app.domain.usecase
 
+import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.repository.GhostlockRepository
+
+/** The frozen root chain -- see `docs/analysis/root-chain-integration.md`. */
+class RunRootChainUseCase(private val repository: GhostlockRepository) {
+    suspend operator fun invoke(
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+        onProgress: (ChainProgress) -> Unit,
+    ): Boolean = repository.runRootChain(pair, onLog, onProgress)
+}
 
 class LoadKernelSnapshotUseCase(private val repository: GhostlockRepository) {
     suspend operator fun invoke() = repository.snapshot()

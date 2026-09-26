@@ -108,6 +108,115 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         }, "ghostlock-shizuku-runner").start()
     }
 
+    /**
+     * W1 only -- the SELinux flip, i.e. exactly what `tools/device/w1.sh` does: the same ELF,
+     * the same environment knobs (`GHOSTLOCK_W1_ONLY` + `GHOSTLOCK_PARK_AFTER_W1`), started from
+     * this shell-uid (uid 2000, `Seccomp: 0`) context.
+     *
+     * `GHOSTLOCK_PARK_AFTER_W1` is not optional: the process must stay alive afterwards because
+     * the kernel's exit-time PI/futex cleanup walks the forged state. The chain therefore leaves
+     * the park in place (the verified chain does no cleanup; a reboot removes it).
+     */
+    override fun runW1Only(
+        profileBlob: ByteArray,
+        debugDir: String?,
+        callback: IGhostlockCallback,
+    ) {
+        if (!running.compareAndSet(false, true)) {
+            callback.onLog("error: another GhostLock process is already running")
+            callback.onComplete(1)
+            return
+        }
+        Thread({
+            val exitCode = runCatching {
+                require(Process.myUid() == Process.SHELL_UID) {
+                    "Shizuku UserService uid=${Process.myUid()}, expected ${Process.SHELL_UID}"
+                }
+                val status = File("/proc/self/status").readText()
+                require(Regex("(?m)^Seccomp:\\s*0$").containsMatchIn(status)) {
+                    "Shizuku UserService is still seccomp-filtered"
+                }
+                require(profileBlob.size >= 12) { "profile blob is too short" }
+
+                val binary = File(context.applicationInfo.nativeLibraryDir, "libghostlock.so")
+                require(binary.isFile) { "missing GhostLock binary: ${binary.absolutePath}" }
+                val workDir = File("/data/local/tmp/ghostlock-app").apply {
+                    require(isDirectory || mkdirs()) { "cannot create $absolutePath" }
+                }
+                callback.onLog("Shizuku ready: uid=${Process.myUid()} Seccomp=0 (W1 only)")
+
+                val nativeLog = File(workDir, ".ghostlock_w1.log")
+                val activeProfile = File(workDir, "active-profile.bin").apply {
+                    writeBytes(profileBlob)
+                    setReadable(false, false)
+                    setWritable(false, false)
+                    setReadable(true, true)
+                    setWritable(true, true)
+                }
+                ProcessBuilder(binary.absolutePath, "--profile", activeProfile.absolutePath)
+                    .directory(workDir)
+                    .redirectErrorStream(true)
+                    .redirectOutput(nativeLog)
+                    .apply {
+                        environment()["GHOSTLOCK_HOME"] = workDir.absolutePath
+                        environment()["TMPDIR"] = workDir.absolutePath
+                        environment()["HOME"] = workDir.absolutePath
+                        environment()["GHOSTLOCK_W1_ONLY"] = "1"
+                        environment()["GHOSTLOCK_PARK_AFTER_W1"] = "1"
+                        if (BuildConfig.DEBUG) environment()["GHOSTLOCK_VERBOSE_DEBUG"] = "1"
+                        if (!debugDir.isNullOrEmpty()) environment()["GHOSTLOCK_DEBUG_DIR"] = debugDir
+                    }
+                    .start()
+                    .let { process ->
+                        val tailer = Thread({
+                            relayLog(nativeLog, callback)
+                        }, "ghostlock-shizuku-w1-tailer").apply {
+                            isDaemon = true
+                            start()
+                        }
+                        val code = process.waitFor()
+                        Thread.sleep(200)
+                        tailer.interrupt()
+                        tailer.join(1000)
+                        code
+                    }
+            }.getOrElse { error ->
+                runCatching { callback.onLog("error: ${error.message}") }
+                1
+            }
+            running.set(false)
+            runCatching { callback.onComplete(exitCode) }
+        }, "ghostlock-shizuku-w1").start()
+    }
+
+    /**
+     * Run one shell command as the shell user (uid 2000) and relay its output.
+     *
+     * The root chain needs this for the steps that must not run as the app: `am hang
+     * --allow-restart`, launching the root service, and the state checks between steps. Reads
+     * the child's combined output line by line; only short commands are expected here (the
+     * pipe-backpressure warning in [runExploit] is about the exploit process inside the PI race
+     * window, not about these).
+     */
+    override fun execShell(command: String, callback: IGhostlockCallback) {
+        Thread({
+            val exitCode = runCatching {
+                callback.onLog("\$ $command")
+                val process = ProcessBuilder("/system/bin/sh", "-c", command)
+                    .redirectErrorStream(true)
+                    .start()
+                process.inputStream.bufferedReader().forEachLine { line ->
+                    runCatching { callback.onLog(line) }
+                }
+                process.waitFor()
+            }.getOrElse { error ->
+                runCatching { callback.onLog("error: ${error.message}") }
+                1
+            }
+            runCatching { callback.onComplete(exitCode) }
+        }, "ghostlock-shizuku-shell").start()
+    }
+
     /** Forward complete native log lines without ever blocking the native
      * process; the file is the transport, binder is only the display path. */
     private fun relayLog(logFile: File, callback: IGhostlockCallback) {

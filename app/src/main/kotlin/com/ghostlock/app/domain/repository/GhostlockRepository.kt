@@ -56,6 +56,20 @@ interface GhostlockRepository {
     suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int
 
     /**
+     * Run the frozen root chain: W1 (Shizuku user service, shell uid) -> the root service's uid-0
+     * shell channel -> opening the adbd gate -> adb over loopback -> `rmmod oplus_security_guard`
+     * -> `/data/adb/ksud late-load`.
+     *
+     * Commands are verbatim from `docs/analysis/current-chain-20260926.md` §1; the design and the
+     * rejected shortcuts live in `docs/analysis/root-chain-integration.md`.
+     */
+    suspend fun runRootChain(
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+        onProgress: (com.ghostlock.app.chain.ChainProgress) -> Unit,
+    ): Boolean
+
+    /**
      * Start-up hint: the previous in-process run failed at the W3 seccomp
      * bypass stage, which Shizuku (shell uid, no seccomp) can skip.
      */

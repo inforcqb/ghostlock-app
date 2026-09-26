@@ -1,6 +1,10 @@
 package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
+import com.ghostlock.app.adb.AdbClient
+import com.ghostlock.app.chain.ChainProgress
+import com.ghostlock.app.chain.RootChain
+import com.ghostlock.app.root.RootChannel
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
@@ -421,6 +425,58 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 else -> shizukuRunner.run(pair, safeModeEnabled, profileBlob, debugDir, archivedLog)
             }
         }.also { code -> recordLastRun(code, shizuku = true) }
+    }
+
+    /**
+     * Run the frozen root chain -- see `docs/analysis/root-chain-integration.md`.
+     *
+     * Order, identities and commands are exactly the verified ones:
+     *   W1 (Shizuku user service, uid 2000) -> the root service's uid-0 shell channel ->
+     *   `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555` and
+     *   `runcon u:r:usbd:s0 setprop ctl.restart adbd` (domain borrows work only while SELinux is
+     *   permissive, which is why they sit between W1 and `ksud late-load`) -> adb over loopback
+     *   to the root adbd (uid 0, `CapEff 0x1ffffffffff`) -> `rmmod oplus_security_guard` ->
+     *   `/data/adb/ksud late-load`.
+     *
+     * The commands come from `docs/analysis/current-chain-20260926.md` §1 and must stay verbatim
+     * (that document's §3 blacklists the "simplified" variants). Nothing here cleans up: the
+     * verified chain leaves the adb gate open and the W1 park in place.
+     */
+    override suspend fun runRootChain(
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+        onProgress: (ChainProgress) -> Unit,
+    ): Boolean {
+        val release = System.getProperty("os.version", "").orEmpty()
+        val config = profileController.load(release, pair)
+        val profileBlob = profileController.nativeDocument(config)
+        if (!config.hasProfile || profileBlob == null) {
+            onLog("error: profile is unavailable for $release")
+            return false
+        }
+        if (config.invalidPaths.isNotEmpty()) {
+            onLog(
+                "error: profile has ${config.invalidPaths.size} invalid field(s): " +
+                    config.invalidPaths.take(6).joinToString(),
+            )
+            return false
+        }
+        val channel = RootChannel()
+        val adb = AdbClient()
+        val chain = RootChain(
+            shell = { command, _ -> shizukuRunner.execShell(command, onLog) },
+            w1 = { log -> shizukuRunner.runW1Only(profileBlob, null, log) },
+            channel = channel,
+            adb = adb,
+            onLog = onLog,
+            onProgress = onProgress,
+        )
+        return try {
+            chain.run()
+        } finally {
+            adb.close()
+            channel.close()
+        }
     }
 
     private suspend fun recordLastRun(code: Int, shizuku: Boolean) = withContext(Dispatchers.IO) {
