@@ -52,7 +52,7 @@ PID=${3:-}
 # park state per process -- the W1 process and the self-root process are two
 # independent parks, each with its own payload page and its own PI fields.
 # GL_ONE stops the recursion.
-if [ -z "$T" ] && [ -z "${GL_ONE:-}" ] && [ -d "$GL_DIR/parked.d" ]; then
+if [ -z "$T" ] && [ -z "${GL_ONE:-}" ] && [ -z "${PID:-}" ] && [ -d "$GL_DIR/parked.d" ]; then
     found=0
     failed=0
     for f in "$GL_DIR"/parked.d/*; do
@@ -192,6 +192,25 @@ find_parked_task() {
     return 1
 }
 
+# task_struct by pid: compare the pid int at task+0x5d8.  Pids are unique, so a
+# parked process is identifiable even when it left no receipt (older build).
+find_task_by_pid() {
+    head=$(addoff "$1" 0x4d0)
+    p=$(kr "$head" 8)
+    i=0
+    while [ -n "$p" ] && [ "$p" != "$head" ] && [ "$i" -lt 8192 ]; do
+        t=$(suboff "$p" 0x4d0)
+        v=$(kr "$(addoff "$t" 0x5d8)" 8)
+        if [ "${v#????????}" = "$(printf '%08x' "$2")" ]; then
+            echo "$t"
+            return 0
+        fi
+        p=$(kr "$p" 8)
+        i=$((i + 1))
+    done
+    return 1
+}
+
 if [ -z "$T" ] || [ -z "$IC" ]; then
     KPTR_SAVE=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)
     if [ -n "$KPTR_SAVE" ] && [ "$KPTR_SAVE" != 0 ]; then
@@ -202,7 +221,12 @@ if [ -z "$T" ] || [ -z "$IC" ]; then
     it=$(sym init_task)
     [ -n "$IC" ] || IC=$(sym init_cred)
     if [ -z "$T" ] && [ -n "$it" ]; then
-        T=$(find_parked_task "$it")
+        if [ -n "$PID" ]; then
+            T=$(find_task_by_pid "$it" "$PID")
+            [ -n "$T" ] || echo "pid $PID not found in init_task.tasks"
+        else
+            T=$(find_parked_task "$it")
+        fi
     fi
 fi
 if [ -z "$T" ] || [ -z "$IC" ]; then
