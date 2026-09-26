@@ -116,6 +116,26 @@ int main(int argc, char **argv) {
                 pr_success("parking after W1: forged PI state kept alive "
                            "(pid=%d); do NOT exit/kill this process\n",
                            (int) getpid());
+                /* GHOSTLOCK_FINISH: run the *single* cleanup implementation from
+                 * here.  This process is root with full caps, so the script can
+                 * even insmod kread_min when GHOSTLOCK_LOAD_KO failed, and it
+                 * cleans every parked ghostlock (including the earlier uid-2000
+                 * W1 process) -- then it kill -9s this process only after every
+                 * field reads back clean.  That is what makes the exit safe: the
+                 * kernel never gets to walk a forged PI tree.  If the script
+                 * returns without killing us, stay parked. */
+                const char *fin = getenv("GHOSTLOCK_FINISH");
+                if (fin && *fin) {
+                    const char *sc = getenv("GHOSTLOCK_FINISH_SH");
+                    const char *script = (sc && *sc) ? sc
+                            : "/data/local/tmp/gl-w1/cleanup-parked.sh";
+                    char cmd[640];
+                    (void) snprintf(cmd, sizeof cmd, "/system/bin/sh %s --apply", script);
+                    pr_info("FINISH: %s\n", cmd);
+                    const int rc = system(cmd);
+                    pr_warning("FINISH: script returned rc=%d without cleaning us; "
+                               "staying parked -- inspect its output\n", rc);
+                }
                 /* This process must survive until an out-of-process cleaner has
                  * erased the forged PI links and killed us -- an exit before
                  * that walks the forged tree and wedges the machine.  A stray
