@@ -137,6 +137,25 @@ steps = [
 
 > 若将来发现 `ro.adb.secure` 无法保持为 0，再退回"随 app 生成一对密钥 + 首次授权一次"。
 
+### 3.7 实现状态（2026-09-26，与上面设计稿的差异以此为准）
+
+* **adb 客户端**：已按上面实现为 `app/src/main/kotlin/com/ghostlock/app/adb/AdbClient.kt`
+  （CNXN/AUTH/OPEN/WRTE/CLSE，`AUTH` 出现即报"门没开"，不自己写 RSA）。
+* **uid-0 通道客户端**：`app/src/main/kotlin/com/ghostlock/app/root/RootChannel.kt`
+  （token 首行 + 命令 + 半关闭；服务端是 pty `sh -i`，没有长度框架，所以只用于短命令）。
+* **链与命令**：`app/src/main/kotlin/com/ghostlock/app/chain/RootChain.kt`（§2 的命令逐字固化）。
+* **控制面 AIDL 实际叫 `IRootShellService`**（不是本文 3.3 里的 `IRootService`）：
+  `boolean ensureRoot()=1; boolean startChannel()=2; boolean adbRoot()=3; void destroy()=16777114;`
+  服务是 `com.ghostlock.app.root.RootShellService`（`isolatedProcess` + `useAppZygote`），
+  **只能用 `Context.bindIsolatedService(intent, BIND_AUTO_CREATE, "<instance>", executor, conn)` 起**。
+* **构建方案是 (b)**：`make magica2jni` → `.build/jni/libmagica2.so` → 根 Gradle 任务
+  `prepareMagica2JniLibs` → `app/build/generated/magica2JniLibs/arm64-v8a/`，`jniLibs.srcDir` 注册。
+  不用 AGP `externalNativeBuild`/prefab/libcxx（CI 的 NDK 是 ONDK，AGP 解析不了）；
+  `-static-libstdc++` 保证不需要 `libc++_shared.so`。
+* **设备一次性前置**：`/data/local/tmp/gl-w1` 必须存在且可写
+  （`adb shell mkdir -p /data/local/tmp/gl-w1 && chmod 777 /data/local/tmp/gl-w1`）——
+  无 cap 的 isolated uid 0 不能自己创建/改这个目录，native 侧现在会明确报错而不是假装通道已起。
+
 ### 3.6 命令白名单 / 黑名单
 
 **白名单（app 必须逐字复用）**：§2 表中第 1、2、4、5、6、8、9 步的命令。
