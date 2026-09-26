@@ -30,6 +30,8 @@ export GHOSTLOCK_W1C_ONLY=1           # stop right after the cred write + repair
 export GHOSTLOCK_PARK_AFTER_W1=1      # park: an exit here walks the forged PI tree
 export GHOSTLOCK_LOAD_KO="$KO"        # finit_module from *this* process
 export GHOSTLOCK_PARK_CMD="$PARK_CMD" # run after cleanup, before the process dies
+export GHOSTLOCK_FINISH=1            # the parked process runs cleanup-parked.sh --apply itself
+                                     # (one cleanup implementation; it kills us only after verify)
 
 echo "W1c: uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) ko=$KO cmd=$PARK_CMD"
 [ -f "$KO" ] || echo "W1c: WARNING $KO missing -- LOAD_KO will fail"
