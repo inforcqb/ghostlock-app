@@ -83,7 +83,7 @@ fi
 # from an ordinary root shell after KernelSU is up.  Loading it needs
 # CAP_SYS_MODULE, so only a full root shell can do it -- try, and print dmesg so
 # the reason (vermagic / disagrees about version / EPERM) is visible.
-GL_KO=${GL_KO:-/sdcard/kread_min.ko}
+GL_KO=${GL_KO:-/data/local/tmp/gl-w1/kread_min.ko}
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
     echo "kread_min not loaded; trying insmod $GL_KO"
     if [ -f "$GL_KO" ]; then
