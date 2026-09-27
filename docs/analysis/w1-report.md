@@ -191,6 +191,39 @@ A = target & ~3                                     # rbtree parent/colour 吃�
 * 现状：我们走 shift 0。要用 −4 必须先做 H4 的解耦（当前引擎里"写入字"与 walk 指针是同一个字），
   **本迭代不实施**。
 
+### 3.4 "臂"（leaf / one-child）与它自带的 −8
+
+引擎里的 "arm" 指 **rbtree 擦除的形状**，由伪造 waiter 的 `tree_entry` 三个字段决定
+（`src/core/routes/multicast_waiter_route.cpp:367-400`）：
+
+| `tree_entry` 字段 | **默认形状（我们用的）** | leaf 形状（`GHOSTLOCK_LEAF_STORE=1`） |
+|---|---|---|
+| `+0x00 __rb_parent_color` | `(target - 8) & ~3` | `value`（要写的字） |
+| `+0x08 rb_right` | `value`（**必须非 0**） | `0` |
+| `+0x10 rb_left` | `0`（`cbz x9` → Case 1） | `target` |
+
+默认形状的落点与两个 shift：
+
+```
+parent = (target - 8) & ~3            # 低 2 位是颜色位 ⇒ 先减 8 再对齐
+主写    *(parent + 8) = value         # 落点 = target & ~3（只 4 字节对齐的目标才恰好等于 target）
+附带写  *(value)      = parent|color  # 默认形状独有；传下去的就是 parent ⇒ shift = -8
+```
+
+* **默认臂的 shift = −8**，两处来源：
+  1. **主写坐标**：`parent = (target − 8) & ~3`、主写落在 `parent + 8` ⇒ `target = S−7` 会掉到
+     `S−8`（`(S−15)&~3 + 8 = S−8`）——这正是 §3.3 "−7 不可达" 的机制；
+  2. **附带写内容**：`rb_right = value ≠ 0` ⇒ 擦除时 child(=value) 被
+     `rb_set_parent_color(child, parent, BLACK)` 认父 ⇒ `*(value) = (target − 8) | color`。
+     实测证据：W2/cred 那次把 `init_cred+0` 写成 `target−8` 的高半字 `0xffffff8a`
+     （`src/core/session/exploit_stages.cpp:55-57`）。
+* **leaf 形状**：没有附带写，但 2026-09-23 实测**在本机根本不落**（enforcing 保持 `01`、
+  请求的字没到）⇒ 不能当替代；有命中记录的只有默认臂。
+* **TCP zerocopy 路线**：同类附带写是**地址偏 +8**：`*(value + 8) = target`
+  （Case 2，`__rb_change_child(node, target, value & ~3, root)`，`exploit_stages.cpp:58-61`）。
+* 与 §3.3 的分工：§3.3 算的是"W1 **目标**相对 `selinux_state` 的位移"（调用方决定，与臂无关，
+  只有 0 或 −4）；本节算的是"**臂自带的 −8** 从哪来"。两者不要混。
+
 ## 4. 隐患清单（**全部不处理**）
 
 每条给：机制 / 证据 / 影响 / 为什么不处理。
