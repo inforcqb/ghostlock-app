@@ -62,6 +62,95 @@ selinux_state.initialized; taking another`）。resident 分支不喷页，改�
 `resident word 0xffffff80035a2000 -> 0xffffff80035b2000 (byte 2 made odd)`，见
 `memory/2026-09-23.md:353`）。
 
+### 3.1 依赖视图（谁产出字节，谁依赖哪个字节）
+
+读法：左半是"要给足什么才能写出这个字"，右半是"哪些字节真的有人依赖"。要点是
+**只有 `+0` 与 `+2` 有依赖方**，`+1`/`+3..+7` 是无人依赖的残值。
+
+```mermaid
+flowchart LR
+  subgraph IN["输入 / 前提"]
+    direction TB
+    I1["Shizuku user service<br/>uid 2000 + Seccomp 0"]
+    I2["env: GHOSTLOCK_W1_ONLY=1<br/>GHOSTLOCK_PARK_AFTER_W1=1"]
+    I3["profile.bin<br/>off_selinux_enforcing / route=3 / mcast 参数"]
+    I4["GHOSTLOCK_5X_RESIDENT 未设<br/>⇒ multicast_resident_enabled = false"]
+    I5["喷出页 page_base<br/>页规则：byte2 必须为奇"]
+  end
+
+  W["W1 写入：8 字节整字<br/>*(alias(S) + 0) = page_base + 0x100"]
+
+  subgraph OUT["落字节 +0..+7"]
+    direction TB
+    O0["+0 enforcing = 00"]
+    O1["+1 checkreqprot = 01"]
+    O2["+2 initialized = 奇"]
+    O3["+3..+7 policycap[0..4]<br/>= 页地址字节"]
+  end
+
+  V["判据 check_selinux_off()<br/>/sys/fs/selinux/enforce == '0'"]
+
+  subgraph DEP["依赖方"]
+    direction TB
+    D1["步骤 5/6：runcon adbd / usbd<br/>（唯一硬依赖）"]
+    D2["所有 SID 查询<br/>（隐式硬依赖）"]
+    D3["ksud late-load 之后回 Enforcing"]
+    D4["无人依赖：残值<br/>事后用 kread 回填"]
+  end
+
+  P["park 进程驻留<br/>（不可 kill：退出即楔死）"]
+
+  I1 --> W
+  I2 --> W
+  I3 --> W
+  I4 --> W
+  I5 --> W
+  W --> O0
+  W --> O1
+  W --> O2
+  W --> O3
+  O0 --> V
+  V --> D1
+  O0 --> D3
+  O2 --> D2
+  O1 --> D4
+  O3 --> D4
+  W -.->|"写成功但进程不能退出"| P
+  P -.->|"整机存活才有后续步骤"| D1
+```
+
+### 3.2 逻辑视图（W1 的判定与分支）
+
+读法：这是我们这条链（非 resident）实际走的路径；右列是 resident 才有的分支，
+以及"保险失效"的那条灾难分支（H1）。注意 `enforce` **不可读**时按 enforcing 处理并照跑 W1。
+
+```mermaid
+flowchart TD
+  S["W1 入口（uid 2000 / Seccomp 0）"] --> Q0{"check_selinux_off()<br/>enforce 可读且为 0 ?"}
+  Q0 -->|"是：已经 permissive"| X0["SELinux already permissive<br/>跳过 W1"]
+  Q0 -->|"否：enforcing，或 enforce 不可读<br/>（不可读按 enforcing 处理）"| Q1{"multicast_resident_enabled ?<br/>（只有 GHOSTLOCK_5X_RESIDENT 打开）"}
+  Q1 -->|"否：我们这条链"| P1["prepare_good_kernel_page()<br/>抽页，layout.right = page_base + 0x100"]
+  Q1 -->|"是：resident"| P2["空零页 alias 派生写入字"]
+  P1 --> C1{"payload_write_layout_accepts_page()<br/>byte2 为奇 ?"}
+  C1 -->|"否"| R1["page … even byte over initialized<br/>taking another（丢弃，重新抽页）"]
+  R1 --> P1
+  C1 -->|"是"| W
+  P2 --> C2{"byte2 为奇 ?"}
+  C2 -->|"否"| R2["地址按 +0x10000 步进（最多 8 次）"]
+  R2 --> C2
+  C2 -->|"是"| W["8 字节整字写<br/>*(alias(S) + 0) = 写入字"]
+  W --> C3{"写后 check_selinux_off()<br/>enforce == 0 ?"}
+  C3 -->|"否"| F["Write 1 failed<br/>停 resident 路线 → StageResult::Failed"]
+  C3 -->|"是"| RP{"resident ?"}
+  RP -->|"否：我们这条链"| R3["W1b: private scratch repair<br/>quarantine → repair → release<br/>（修 scratch 页的 poison，不碰 selinux_state）"]
+  RP -->|"是"| R4["W1 policycap repair<br/>在 S+4 再写一个字（& ~0x1fffff）"]
+  R3 --> Z{"GHOSTLOCK_W1_ONLY ?"}
+  R4 --> Z
+  Z -->|"是"| Z1["W1-only diagnostic complete<br/>→ park 驻留，进程不退出"]
+  Z -->|"否"| Z2["继续 W1c / W2 / W3<br/>（echo 0 &gt; checkreqprot 的 fixup 在这一段里）"]
+  W -.->|"byte2 偶数的灾难分支（H1）"| BAD["permissive but smashed<br/>没有 [+] SELinux permissive<br/>→ 楔死，本节流程救不回"]
+```
+
 ## 4. 隐患清单（**全部不处理**）
 
 每条给：机制 / 证据 / 影响 / 为什么不处理。
