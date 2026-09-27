@@ -61,6 +61,13 @@ Build = run `36298541927`），**APK 打包自检也已通过**：下载 artifac
 
 * 目标只有两件事：`rmmod oplus_security_guard` + `/data/adb/ksud late-load`；**不做收尾**
   （门开着、park 留着，靠重启还原）——这是用户明确要求的。
+  * 但要区分"**链内不做收尾**"与"**跑完之后关闸**"：用户要求利用期间允许开放 5555，
+    跑完必须关掉。最干净的做法是 **host 侧 `adb usb`** —— adbd 自己切回 USB-only，
+    `service.adb.tcp.port` 变 `0`、5555 监听消失（2026-09-27 实测：
+    `restarting in USB mode` → 重新 `adb connect 192.168.0.113:5555` 得 `10061 目标计算机积极拒绝`，
+    USB `4dfb5f3f` 保持在线）。它比"写属性 + 借 usbd 域 `ctl.restart adbd`"简单，
+    且**在 Enforcing 下同样有效**（adbd 自己改自己的监听模式，不需要那两条域授权）。
+    收尾后 host 侧如需清理条目：`adb disconnect <ip>:5555`。
 * 命令必须**逐字**复用（§1 白名单）；"简化写法"（`ksud resetprop service.adb.tcp.port`、
   legacy 域触发 `ctl.*`、省掉 `am hang`、重排）一律禁止。
 * 第 5/6 步的借域（`runcon u:r:adbd:s0` / `runcon u:r:usbd:s0`）**只在 Permissive 下成立**，
