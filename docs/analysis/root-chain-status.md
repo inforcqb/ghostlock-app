@@ -1,4 +1,4 @@
-# 交接状态：root 链 app 集成（2026-09-26 收工）
+# 交接状态：root 链 app 集成（2026-09-27：CI 双绿 + 打包自检通过）
 
 > 明天从这里继续。本文只讲"现在到哪了 / 下一步做什么"，链的原理见
 > `docs/analysis/root-chain-integration.md`，设备侧的冻结命令见
@@ -7,8 +7,11 @@
 ## 1. 一句话状态
 
 **链本身已端到端跑通**（2026-09-26 一次 boot 内完成，见下）；**app 集成代码已全部落地并推送**
-到分支 `w1c-cred-copy`；**GitHub CI 还在收尾**：首轮 APK 编译抓到 1 个编译错（已修），
-需要在明天的第一件事里重跑一次确认绿。
+到分支 `w1c-cred-copy`；**CI 已全绿**（`Bin` 与 `Build` 均在 `35dc055` 上 success，
+Build = run `36298541927`），**APK 打包自检也已通过**：下载 artifact 后确认
+`lib/arm64-v8a/` 下正好含 `libghostlock.so`、`libmagica2.so`、`libextract.so`，且**没有**
+`libc++_shared.so`（native 日志同步打印 `OK: .build/jni/libmagica2.so needs no libc++_shared.so`）。
+**只剩真机首跑**（§3）与两个已知 TODO（lsplt 许可、Magica 提权前提）。
 
 ## 2. 已完成（按提交）
 
@@ -20,22 +23,29 @@
 | `6796333` | UI：一键 root 按钮（与原来那个共用一行、均分宽度）+ 执行面板里的步骤卡片 + VM 状态与 `onRunRootChain()`；中英 strings 各 +12 |
 | `a479f45` | `settings.gradle.kts` 加 JitPack（**当前用不到**，只为将来切方案 (a) 时预留，注释里写明了） |
 | `13bd423` | **Magica 端口**：`app/src/main/jni/**`（`magica.cpp` + vendored `system_properties`/`lsplt`）、`root/RootShellService.kt`、`root/AppZygote.kt`、`IRootShellService.aidl`、manifest（zygotePreload + isolated service）、Makefile `magica2jni`、根/app Gradle 接线、R8 keep、`THIRD_PARTY_NOTICES.md`；顺手修掉 `AdbClient.exec` 的 `Long/Int` 编译错 |
+| `3b7680f` | **native 编译修复**：`app/src/main/jni/bionic_compat.h` 补 `__BIONIC_ALIGN`（bionic 私有宏，NDK 公共头没有），Makefile `JNI_CFLAGS` 加 `-include`；vendored 文件保持原样 |
+| `35dc055` | **manifest 修复**：`<!-- … service -- see … -->` 里的连续连字符是非法 XML，导致 `processReleaseMainManifest` 解析失败（AGP 不给 SAX 细节）；顺带全仓 11 个 XML 良构性普查通过 |
 
 设备侧仍然可用的工具（未改）：`w1.sh`、`gl-chain.sh`（现在只跑 W1）、`adbd-recover.sh`、
 `cleanup-w1.sh` + `cleanup-parked.sh`（W1 park 的安全网，链本身不做收尾）。
 
-## 3. 明天第一步（按顺序）
+## 3. 下一步（按顺序）
 
-1. **重跑 CI 确认绿**（上一轮 `Build` 失败在 `RootChain.kt:267` 的 `Long/Int`，已修未验）：
+1. ~~重跑 CI 确认绿~~ **已完成** ✅（`35dc055`：`Bin` success，`Build` success = run `36298541927`）：
    ```
    gh workflow run bin.yml   --repo inforcqb/ghostlock-app --ref w1c-cred-copy   # 编 native
    gh workflow run build.yml --repo inforcqb/ghostlock-app --ref w1c-cred-copy   # 编 APK
    ```
-   看两个点：① `compileReleaseKotlin` 是否还有 `e: file://…` 报错（尤其 Miuix/Compose 调用签名，
-       见 §5）；② native 日志里 `make magica2jni` 的 `libc++_shared.so` 检查行是否为 `OK:`。
-2. **确认 APK 里两个 .so 都在**（构建产物的自检，防"编过了但没打进包"）：
-   `unzip -l GhostLock-release.apk | grep 'lib/arm64-v8a/lib'` → 必须有
-   `libghostlock.so`、`libmagica2.so`、`libextract.so`。
+   两个看过的点：① `compileReleaseKotlin` 已无 `e: file://…`（只剩若干 warning）；② native 日志里
+   `make magica2jni` 的检查行是 `OK: .build/jni/libmagica2.so needs no libc++_shared.so` ✅。
+2. ~~确认 APK 里三个 .so 都在~~ **已完成** ✅（防"编过了但没打进包"）：
+   ```
+   gh run download 36298541927 --repo inforcqb/ghostlock-app -n GhostLock-release.apk -D .build/ci-apk
+   ```
+   注意两点：artifact 名**带扩展名** `GhostLock-release.apk`（upload-artifact v7 + `archive: false`）；
+   `gh run download` 会把 APK 自身当 zip 解开，所以直接看到的就是**包内结构**——
+   `lib/arm64-v8a/{libextract.so 1686.7 KB, libghostlock.so 250.2 KB, libmagica2.so 105.4 KB}`，
+   且 `libc++_shared.so` 不在包内 ✅。
 3. **真机首跑（app 内一键）**，前置：
    ```
    adb shell mkdir -p /data/local/tmp/gl-w1 && adb shell chmod 777 /data/local/tmp/gl-w1
@@ -47,7 +57,7 @@
    `0x1ffffffffff`。
 4. 真机验证完再回到 §5 的 TODO。
 
-## 4. 链路关键事实（明天别忘了）
+## 4. 链路关键事实（别忘）
 
 * 目标只有两件事：`rmmod oplus_security_guard` + `/data/adb/ksud late-load`；**不做收尾**
   （门开着、park 留着，靠重启还原）——这是用户明确要求的。
@@ -58,11 +68,14 @@
 * W1 的 park 进程不能 kill；W1 偶发 panic 的规律仍未查明（已搁置）。
 * isolated service 没有 IP socket、uid 0 但没有 cap：所以通道是 AF_UNIX、且
   `/data/local/tmp/gl-w1` 必须由设备侧预先建好并 chmod 777。
+* 构建侧（今天新增）：vendored `system_properties` 依赖 bionic 私有宏，靠
+  `app/src/main/jni/bionic_compat.h` + `JNI_CFLAGS` 的 `-include` 兜住；**改 vendored 文件前先想
+  shim**。XML 里注释**不能含连续连字符**，Gradle 不报细节，所以**推 CI 前先本地 parse**。
 
 ## 5. 已知风险 / TODO（按优先级）
 
-1. **CI 未绿**：`compileReleaseKotlin` 里 Miuix/Compose 调用签名是本轮最可能的下一个报错点
-   （UI 子任务无法在本地类型检查，只能靠 CI）。
+1. **真机首跑未做**：app 内一键链只在 CI 层面验证过（编译 + 打包），设备行为待验；
+   Magica 段若 `root()` 失败，先看 `logcat -s GhostlockRoot`。
 2. **lsplt 许可证未决**：`app/src/main/jni/lsplt/**`（除 `syscall.hpp`）没有许可头，
    upstream 是 LSPosed 项目 → 要么落实许可，要么自己写一个只替换 `capset` 的 PLT/GOT patcher。
    记录在 `THIRD_PARTY_NOTICES.md` 与 `magica.cpp` 头注释里。
@@ -73,10 +86,13 @@
    `System.loadLibrary("magica2")` ↔ `libmagica2.so` 必须一致；改动任一处都要同步。
 5. `Makefile`/`app/build.gradle.kts` 的 jniLibs 生成链路是"预构建产物"模式：
    `app/src/main/jniLibs` 在 gitignore 里，clone 后必须先跑一次 Gradle（CI 里由 `preBuild` 保证）。
+6. **本地无 SDK/NDK**：Kotlin/UI 的类型错误只能靠 CI 发现；但**能本地做的静态校验一定要做**
+   （XML 良构性、Kotlin 签名与 import 人工核对、C 宏用宿主 g++ 探针）。
 
-## 6. 设备与仓库现状（收工时刻）
+## 6. 设备与仓库现状
 
 * 设备：SELinux **Enforcing**、`oplus_security_guard` 已卸（另一次手跑留下的）、`kernelsu` 在、
   Magica 进程在、无 ghostlock 存活（W1 的 park 早已消失）；adb 走 USB `4dfb5f3f`。
   下一次真机验证前建议**重启一次**，用干净状态跑（guard 会随之回来，正好验第 8 步）。
-* 仓库：分支 `w1c-cred-copy` 已推送；工作树干净；`main` 未合并（等 CI 绿 + 真机验证后再议）。
+* 仓库：分支 `w1c-cred-copy` 已推送，远端 = 本地 = `35dc055`；工作树干净；
+  `Bin`/`Build` 双绿、APK 打包自检通过；`main` 未合并（等真机验证后再议）。
