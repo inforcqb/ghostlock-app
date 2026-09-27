@@ -224,6 +224,75 @@ parent = (target - 8) & ~3            # 低 2 位是颜色位 ⇒ 先减 8 再�
 * 与 §3.3 的分工：§3.3 算的是"W1 **目标**相对 `selinux_state` 的位移"（调用方决定，与臂无关，
   只有 0 或 −4）；本节算的是"**臂自带的 −8** 从哪来"。两者不要混。
 
+### 3.5 pselect 臂的 `waiter_shift`：定义、算法、我们设备的状态
+
+* **定义与消费**：profile 字段 `route.select_stack.waiter_shift`
+  （`SelectStackLayout.waiter_shift`，`src/core/profile.h:163-166,247`，源字段
+  `pselect_waiter_shift` `profile.h:63`）。落点规则：
+  `global_word = waiter_shift + waiter_word`（`src/core/routes/route_operations.cpp:571`）→
+  `set_idx = global_word / words_per_set`、`word_idx = global_word % words_per_set`（`:540-541`）
+  → 分别落进 in/out/ex 三个 fd_set。单位是 **64-bit word**；
+  `PSELECT_ROUTE_NFDS = 320`（`src/core/routes/select_stack_route.h:14-16`）⇒ 每集合 5 字，
+  三集合共 15 字 = 120 B，正好落在 `core_sys_select` 的 256 B 栈缓冲里（这条臂的原理）。
+* **算法**（`tools/extract_rs/src/derive.rs:340-400`）：
+
+  ```
+  futex_sum    = Σ(链上每一帧的 sub sp, sp, #imm)        # 从 syscall wrapper 到 futex_wait_requeue_pi
+  waiter_local = futex_wait_requeue_pi 帧内 rt_mutex_waiter 局部量的 sp 偏移
+  futex_waiter = -futex_sum + waiter_local
+  shift        = (futex_waiter - core_sys_select 的 stack_fds 第 0 字偏移) / 8
+  约束：必须非负 qword；> 3 警告「最大可行 shift 是 3」；> 16 直接报错
+  ```
+* **我们设备（`5.15.180-android13-8-o-01176-g6333b0dbc8ed`）没有权威值**：
+  * 表里填 **0 且标注"未实测"**：`.scratch/orig-c/device-support/<release>/offsets.json:5`、
+    `verify_ghostlock.py:277`、`ANALYSIS_ZH.md:136-138,202,211`；
+  * 编译期默认 **`PSELECT_WAITER_WORD_SHIFT = -2`**（`src/core/target.h:78`）；
+  * **2026-09-27 本机实跑提取器**（对 `.scratch/forensics/live-boot_a.img`）：
+    ```
+    warning: pselect_waiter_shift derivation failed:
+             __arm64_sys_futex calls neither do_futex nor futex_wait_requeue_pi
+    warning: using heuristic pselect_waiter_shift=-2 (6.12=0, 6.6=-2);
+             unreliable for kernels with a non-inlined do_pselect middle layer
+    ```
+    原因：**5.15 的 `SYSCALL_DEFINE6` 多一层 `__se_sys_futex`**（pselect 侧同理
+    `__se_sys_pselect6`），推导器只认 `__arm64_sys_futex → do_futex` 的直接调用 ⇒
+    链识别失败、`futex_sum` 拿不到 ⇒ 退回启发式。
+  * 出货 profile（`app/src/main/assets/kernel_profiles/5.15.180-….conf`）里**只有
+    `multicast_waiter`**、`fallback.to = "none"` ⇒ 本机链根本不走 pselect。
+* **参考实现**（`workspace/CyberMeowfia/…/exploit/src`）：通用 `SLIDE_PSELECT_WORD_SHIFT 0`、
+  6.1 的 `comet-*` 目标机为 `1`（与上游表一致）；它用 fd_sets（320 fd），
+  inforcqb 项目用 sigset_t 喷射（在 OPPO 上 sigset_t 只有 8 B）。
+* **实算结果（2026-09-27，用 `workspace/boot/vmlinux.relative.elf` + capstone 反汇编）**：
+  本机 `LTO_FULL`，`do_futex` 被**内联**进 `__arm64_sys_futex`（`futex_wait_requeue_pi` 的两个
+  `bl` 调用者之一是 `0xffffffc0080fa2f8`，落在 `__arm64_sys_futex` 内部；独立的 `do_futex`
+  只被 `0xffffffc0089e3be0` / `0xffffffc008b0c1d8` 调用）。逐项数值：
+
+  | 项 | 值 | 来源（反汇编） |
+  |---|---|---|
+  | `__arm64_sys_futex` 帧 | `0x60 + 0x460 = 0x4C0` | `stp x29,x30,[sp,#-0x60]!` + `sub sp,sp,#0x460` |
+  | `futex_wait_requeue_pi` 帧 | `0x1B0` | `sub sp,sp,#0x1B0` |
+  | `waiter_local`（rt_mutex_waiter 局部量） | `0x98` | `add x27,sp,#0x98` + `add x9,x27,#0x18`(pi_tree) + `str w8,[sp,#0xD8]`(= waiter+0x40 = wake_state) |
+  | `__arm64_sys_pselect6` 帧 | `0xA0` | `sub sp,sp,#0xA0` |
+  | `core_sys_select` 帧 | `0x1C0` | `sub sp,sp,#0x1C0` |
+  | stack_fds 缓冲区偏移 | `0x50` | `cmp x23,#0x2b`(阈值 43 ⇒ 320 fd 走栈路径) → `add x22,sp,#0x50` → `cmp x22,x8`(同一立即数对) |
+
+  ```
+  futex_waiter  = -(0x4C0 + 0x1B0) + 0x98  = -0x5D8  ( -1496 B )
+  pselect_word0 = -(0xA0 + 0x1C0) + 0x50   = -0x210  (  -528 B )
+  delta         = -0x3C8 = -968 B  ⇒  delta / 8 = -121 word   （负值）
+  ```
+  ⇒ 推导器的判据 `delta < 0 → "pselect/futex overlap is not a non-negative qword: -968"`
+  直接命中：**fd_set 栈缓冲（−528 B 起、共 120 B）够不到 −1496 B 处的死 waiter，差 ~968 B
+  （121 个 qword）**，也就是 pselect 这条臂在 5.15 + LTO_FULL 上**对不齐**。
+  用户记忆中的 **−120** 与此只差 1 个 word（同样口径差异：`__arm64_sys_futex` 的
+  `stp … [sp,#-0x60]!` 是否计入帧、或 buffer 取 `0x50`/`0x48`）——**两者都是负数，结论一致**：
+  "算出来是负数"才是重点，不是某个可用 shift。
+* 对照：我们换用的 MCAST/`getsockopt` 载体深度实测在 `0x7C8`–`0x7E8`（≈2 KB），
+  正好覆盖死 waiter ⇒ 能落地；这也解释了为什么本机必须走 MCAST 而不是 pselect。
+* 提取器在那次实跑里失败的直接原因也清楚了：它的逐符号反汇编窗口够不到
+  `__arm64_sys_futex` 内部 `+0x24040` 处的内联调用点，于是报
+  "calls neither do_futex nor futex_wait_requeue_pi"。
+
 ## 4. 隐患清单（**全部不处理**）
 
 每条给：机制 / 证据 / 影响 / 为什么不处理。
