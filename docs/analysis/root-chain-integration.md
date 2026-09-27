@@ -52,8 +52,13 @@
 
 不变量：
 
-* 第 1 步的 **park 进程不能 kill**（退出时内核走伪造 PI 状态会 wedge）；实践上 `am hang` 与
-  `ksud late-load` 之后它常常已经不在了，机器没事（2026-09-26 两次都如此）。
+* 第 1 步的 **park 进程不能被 kill，但 `am hang --allow-restart` 可以安全带走它**：
+  kill/退出会走伪造 PI 状态 ⇒ wedge；`am hang --allow-restart` 让 watchdog 重启
+  system_server，框架连带 re-fork zygote，park 作为 app 进程被一起清理而**整机存活**
+  （2026-09-26 两次实测 + 2026-09-27 用户复现）。
+  ⇒ 这就是"释放 W1 而不重启整机"的官方手段（预期输出
+  `cmd: Failure calling service activity: Broken pipe`，约 1 分钟后 `ps -A | grep ghostlock` 为空）。
+  但它**只释放 park**：不恢复 guard/SELinux，也不关 5555（后者用 `adb usb`）。
 * 第 8 步每个 boot 都要重做（guard 开机必回）。
 * **整链不做收尾**（用户决定）：门开着（`*:5555`）、park 留着；`service.adb.tcp.port` 与
   `resetprop` 改的 `ro.*` 都**不持久**，重启自然还原。

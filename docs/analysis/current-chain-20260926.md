@@ -77,8 +77,14 @@ Magica 内部自己做的事（`ro.debuggable`、`service.adb.root`、adbd patch
 
 * **guard 三件套每次开机都会回来**（`oplus_security_guard` refcount 0 / `oplus_secure_harden`
   1 used-by guard / `oplus_security_keventupload` 2）：所以第 8 步每个 boot 都要重做。
-* **第 1 步的 park 进程不能 kill**（内核 exit 时走伪造 PI 状态会 wedge）；但实测 `am hang`
-  与 `ksud late-load` 之后它常常已经不在了，机器没事（两次都如此）。
+* **第 1 步的 park 进程不能被 kill，但 `am hang --allow-restart` 可以安全带走它**：
+  kill/正常退出时内核会走伪造的 PI 状态 ⇒ wedge；而 `am hang --allow-restart` 让
+  watchdog 重启 system_server，框架连带 re-fork zygote，park 作为 app 进程被一起清理，
+  **整机存活**（2026-09-26 实测两次 + 2026-09-27 用户复现）。
+  ⇒ 想在中途释放 W1、或跑完后不想重启整机，用这一条即可（预期输出
+  `cmd: Failure calling service activity: Broken pipe`，等约 1 分钟生效，
+  然后 `ps -A | grep ghostlock` 为空）。**注意它只是释放 park**：不恢复 guard/SELinux
+  （仍是 Enforcing、guard 仍卸着），也不关 5555（那要 `adb usb`）。
 * **W1 偶发 panic**：规律未查明，暂搁置。
 * **pid 复用**：不要用旧日志里的 pid 认进程（`w1.log` 里的 `13777` 已变成
   `thermal-engine-v2`）。相关工具（`cleanup-w1.sh`）已按 `comm` 做身份校验。
