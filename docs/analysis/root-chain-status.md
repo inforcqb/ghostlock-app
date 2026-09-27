@@ -68,6 +68,11 @@ Build = run `36298541927`），**APK 打包自检也已通过**：下载 artifac
     USB `4dfb5f3f` 保持在线）。它比"写属性 + 借 usbd 域 `ctl.restart adbd`"简单，
     且**在 Enforcing 下同样有效**（adbd 自己改自己的监听模式，不需要那两条域授权）。
     收尾后 host 侧如需清理条目：`adb disconnect <ip>:5555`。
+  * **判据陷阱（2026-09-27 实测）**：不要只看 `getprop service.adb.tcp.port`——属性被清成 `0`
+    或空之后，**已经在跑的 adbd 仍会继续监听 5555**（当时实测到"属性为空、但
+    `192.168.0.113:5555` 仍显示 `device`"的状态）。真正的判据是**重连被拒**
+    （`cannot connect … 10061`，即无人监听），或者从设备侧看监听表。
+    `adb usb` 会重启 adbd，所以属性与监听才会一起复位。
 * 命令必须**逐字**复用（§1 白名单）；"简化写法"（`ksud resetprop service.adb.tcp.port`、
   legacy 域触发 `ctl.*`、省掉 `am hang`、重排）一律禁止。
 * 第 5/6 步的借域（`runcon u:r:adbd:s0` / `runcon u:r:usbd:s0`）**只在 Permissive 下成立**，
