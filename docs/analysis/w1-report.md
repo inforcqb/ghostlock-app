@@ -468,5 +468,17 @@ parent = (target - 8) & ~3            # 低 2 位是颜色位 ⇒ 先减 8 再�
 * **⚠️ 修正记录（教训）**：本节初版曾据"稳定 rodata 串位移 +0x8…+0x8fe"推断数据段漂移、
   并要求重推偏移——**该推断是错的**：那些串在 `.rodata`，与 profile 使用的 `.data/.bss` 符号无必然
   关系；判据必须是"目标符号同偏移窗口逐字节相同"这种直接证据。
-* **仍需在真机上做一次的**：刷完后跑一次确认 `kernel_phys_load=` 与 alias/落点日志
-  （`W1: SELinux target=…`）。guard/harden 三模块在 vendor 分区，本镜像看不到。
+* **真机闭环（2026-09-27，新内核已刷上设备）**：`sh /data/local/tmp/gl-w1/w1.sh` 先被
+  **release 校验**拒绝——`exploit_ops.cpp:123-127` 是精确 `strcmp`，没有开关，
+  日志为 `profile release mismatch: expected 5.15.180-android13-8-o-01179-g408877dae2c9,
+  got 5.15.180-android13-8-o-01176-g6333b0dbc8ed`。修法：新旧 release 串**等长（各 42 字节）**，
+  直接在 `profile.bin` 里原地改写该字段（偏移 12，实际改动 12 字节），device 侧再跑：
+  * W1 落地在 **`0xffffff802b3f9990`** —— 与旧内核**同一个 alias** ✓（等价于把"偏移不变"的判定
+    在真机上闭环）；
+  * 落字节 `00 81 b3 95 89 ff ff ff | 01 00 00 01 01 00 00 00`（byte0=00 → permissive ✓，
+    byte2=0xb3 奇数 → `initialized` 保住 ✓，其余 = 页地址副产物，与 H2/H3 一致）；
+  * 随后 `rmmod oplus_security_guard` → `kread_min.ko` 回填 `+1..+10` 成
+    `00 01 01 01 01 00 00 01 00 00`（enforcing 不动）→ `/data/adb/ksud late-load` 全部完成 ✓；
+  * `ksud late-load` 后 `getenforce` 回 **Enforcing**（enforce=1）是**预期**，不是失败。
+  ⇒ **"现 profile 整体沿用"的结论在硬件上得到确认**；唯一需要改的就是 profile 里的 release 串
+  （app 侧已加 `kernel_profiles/5.15.180-android13-8-o-01179-g408877dae2c9.conf` + `index.conf` 条目）。
