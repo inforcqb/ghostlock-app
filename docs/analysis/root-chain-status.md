@@ -71,6 +71,9 @@ Build = run `36298541927`），**APK 打包自检也已通过**：下载 artifac
 * 构建侧（今天新增）：vendored `system_properties` 依赖 bionic 私有宏，靠
   `app/src/main/jni/bionic_compat.h` + `JNI_CFLAGS` 的 `-include` 兜住；**改 vendored 文件前先想
   shim**。XML 里注释**不能含连续连字符**，Gradle 不报细节，所以**推 CI 前先本地 parse**。
+* **W1 的写入形态与隐患明细见 `docs/analysis/w1-report.md`**（逐字节副产物、H1–H9 隐患、
+  日志判读方法；按用户指示**只记录、不处理**）。结论一句话：链只依赖
+  `enforcing == 0x00` 且 `initialized != 0x00`，其余字节写脏不影响提权，正常值事后手动 kread 回填。
 
 ## 5. 已知风险 / TODO（按优先级）
 
