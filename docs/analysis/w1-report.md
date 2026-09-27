@@ -442,21 +442,31 @@ parent = (target - 8) & ~3            # 低 2 位是颜色位 ⇒ 先减 8 再�
   且逐指令一致：`mrs x20, sp_el0` → `add x22, x20, #0x884`（current->pi_lock）→ … →
   `str xzr, [x20, #0x8b0]`（清 **current** 的 `pi_blocked_on`，即 CVE-2026-43499 本体）。
   提取器独立同判：`CVE-2026-43499 primitive present`。
-* **结论 2 —— 现 profile 不能直接用**：镜像布局动过。稳定 rodata 串在新镜像里位移
-  `+0x8`（`initcall`）、`+0x40`（`rt_mutex`）、`+0x136`（`sysfs: cannot create duplicate filename`）、
-  `+0x24a`（`Unable to handle kernel`）、`+0x8fe`（`Kernel panic - not syncing`）；
-  `remove_waiter` 本体前移 `0x68` 并多出 8 字节序言（`paciasp; str x30,[x18],#8`）。
-  ⇒ 数据段（`.data/.bss`）随之位移 ⇒ profile 里的 `off_selinux_enforcing`
-  （= `54499728` = `0x33F9990`，alias `0xffffff802b3f9990`）**必须在新镜像上重推**；
-  W1 写的是 `selinux_state + 0` 的精确地址，差几十字节就是写到别处。
-* **仍然成立的部分**（字节级模板对比：新旧同偏移、同字节）：`__arm64_sys_futex` 序言、
-  `do_futex` 序言、`futex_wait_requeue_pi` 序言与局部量构造块、`core_sys_select` 序言与
-  "缓冲 + 阈值"块 ⇒ futex/pselect 的**几何与结构偏移未变**；`task_struct.pi_lock = 0x884`、
-  `pi_blocked_on = 0x8b0` 在两个镜像的代码里一致，与 profile 的 `2180 / 2224` 吻合。
-* **工具缺口**：提取器在新镜像上以
-  `error: kernel missing required offsets: missing required values: struct_slab_cache` 退出
-  （`--allow-missing` 无效）⇒ 自动推偏移这条链当前是断的。要么修 CI 里的提取器（Rust 工具链在 CI），
-  要么走手工流程（`magiskboot` 解包 + kallsyms 恢复 + capstone——本地已跑通一次）。
-* **仍待复核（不在本节处理）**：`selinux_state` 字节布局（byte0/1/2）与 MCAST 实测几何
-  （waiter 深度 `0x7C8`、tcp6 落点 `0x7E8`）需在新镜像/真机上再核；
-  guard/harden 三个模块在 vendor 分区，本镜像看不到。
+* **结论 2（**修正版**）—— 现 profile 可以直接沿用**：逐字段的字节级判定如下。
+  * 内核符号偏移（用户 2026-09-27 判定 + 本机复核，"同偏移窗口逐字节相同"）：
+    `off_selinux_enforcing = 0x33f9990`、`off_init_task = 0x3286400`、
+    `off_root_task_group = 0x33d3580`、`init_cred = 0x323f3e8`、`init_user_ns = 0x3313150`
+    —— 全部不变；`init_cred` 窗口内有 7 字节差，是它指向的静态对象地址变了，偏移本身不变。
+  * `task_struct.*`：编码这些偏移的指令字在新镜像里**同址同字节**存在
+    （`add x20,x0,#0x884`(pi_lock)@0xb1403c、`add x21,x0,#0x9a0`(pi_state_list)@0xb14040、
+    `add x0,x20,#0x9b8`(futex_exit_mutex)@0x9ddeb0、`ldr x0,[x0,#1936]`(real_cred)@0xa21ef4、
+    `ldr x20,[x19,#1944]`(cred)@0xa21f1c）⇒ 沿用。
+  * `kernel_phys_load`：镜像里没有这个字段，它是**设备/引导级常量 `0xa8000000`**；要复核就在
+    新真机上跑一次看日志里 `kernel_phys_load=` 一行（`exploit_ops.cpp:83-85`）。
+  * `kernelsnitch.mm_struct_sz`：两镜像的 `kmem_cache_create_usercopy("mm_struct", 0x3e8, 0, …)`
+    **都在同址**（新 `0x02da98a8`：`add x0,x0,#0x431`；旧同址：`#0xdc9`；两边 `mov w1, #0x3e8`），
+    `useroffset 0x168 / usersize 0x170 / mm_cachep @+0xbc0` 也一致 ⇒ `sizeof(mm_struct)` 未变
+    ⇒ stride 仍 `0x400` ⇒ **`mm_struct_sz = 1024` 沿用**。
+  * **mcast 几何**：载体路径（net/ipv4 区）**整段整体搬迁 −0x6c，函数体与栈帧逐一不变**：
+    `ip_mc_msfilter / ip_mc_msfget / ip_mc_gsfget / ip_getsockopt / ip_setsockopt` 0x100 字节
+    **差异 0**；`do_ip_getsockopt`/`tcp_setsockopt` 1、`udp_getsockopt`/`tcp_getsockopt` 3、
+    `sock_common_getsockopt` 4、`__sys_getsockopt`/`__sys_setsockopt` 5——差异全是同一类**数据引用
+    立即数位移**（例：`add x19,x19,#0x7b0` → `#0x748`，即 −0x68，属 CFI/type-hash 元数据）
+    ⇒ **栈帧未变** ⇒ `waiter_off / buffer_size / task_offset / lock_offset / compact_waiter` 成立。
+  * 位移是**分区段**的：futex 区 0 位移（`futex_wait_requeue_pi`/`do_futex` 同址同字节）、
+    net/ipv4 区 −0x6c、`remove_waiter` −0x68（本体）/ −0x70（符号起点）——但**每个函数体本身保留**。
+* **⚠️ 修正记录（教训）**：本节初版曾据"稳定 rodata 串位移 +0x8…+0x8fe"推断数据段漂移、
+  并要求重推偏移——**该推断是错的**：那些串在 `.rodata`，与 profile 使用的 `.data/.bss` 符号无必然
+  关系；判据必须是"目标符号同偏移窗口逐字节相同"这种直接证据。
+* **仍需在真机上做一次的**：刷完后跑一次确认 `kernel_phys_load=` 与 alias/落点日志
+  （`W1: SELinux target=…`）。guard/harden 三模块在 vendor 分区，本镜像看不到。
