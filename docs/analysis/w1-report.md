@@ -157,14 +157,49 @@ flowchart TD
   W -.->|"byte2 偶数的灾难分支（H1）"| BAD["permissive but smashed<br/>没有 [+] SELinux permissive<br/>→ 楔死，本节流程救不回"]
 ```
 
+### 3.3 shift 的计算（为什么只有 0 与 -4 两个可行值）
+
+上游的 W1 是 `retry_write_stage("W1: SELinux", data_addr(SELINUX_ENFORCING), …)`
+（`src/core/main.c` 原文）：**shift = 0**，写入字是 **8 字节零**。所以"上游的 shift"就是 0；
+下面算的是"如果想把副产物压到最小，允许的 shift 有哪些"。
+
+```
+S = alias(selinux_state) + off_selinux_enforcing    # 本机 0xffffff802b3f9990
+A = target & ~3                                     # rbtree parent/colour 吃掉低 2 位 ⇒ 落点必 4 字节对齐
+命中 S 需要  0 <= d = S - A <= 7                     # enforcing 必须落在 8 字节窗口内
+对齐又要求   d ≡ S (mod 4)
+⇒ d ∈ { S mod 4 , S mod 4 + 4 }                      # 本机 S mod 4 = 0 ⇒ d ∈ {0, 4}
+⇒ shift ∈ { 0, -4 }
+```
+
+* `-7` **不是"没生效"而是不可达**：`(S-7) & ~3 = S-8` ⇒ `d = 8` 落在 8 字节窗口之外，
+  一个字节都碰不到 `enforcing`。历史 calib 分支注释写 "shift back by 7"，而实现里打印的 target
+  还是未偏移的 `…9990` —— 注释与代码不一致，两次都不对（`memory/2026-09-22.md:157-162`）。
+* 写入字由"期望的 8 字节"按 `d` 对齐得到。期望值（permissive 且保持其余字段）：
+  `00 00 01 01 01 01 00 00`（enforcing=0 / checkreqprot=0 / initialized=1 /
+  policycap[0..4]=`01 01 01 00 00`）：
+
+| shift | d | 写入字（LE u64） | 落字节 |
+|---|---|---|---|
+| **0（现用）** | 0 | `0x0000010101010000` | 原字 `0x0000010101010001` 清掉最低字节（即 `RAW & ~0xFF`）⇒ 只动 enforcing；`+1`/`+3..+7` 仍是副产物（H2/H3） |
+| −4（仅记录） | 4 | `0x0101000000000000` | 只覆盖 `[S-4, S+3]`：enforcing=0、checkreqprot=0、initialized=1、policycap[0]=1，**policycap[1..4] 完全不碰**，不需要修复枪 |
+
+* 两个常量都与此前的实测/补丁记录吻合（`memory/2026-09-22.md:136-137,167-173`），可作公式的交叉验证。
+* `initialized` 只有**最低位**有意义 ⇒ 判据是 byte2 **为奇**而不是"非零"：实测 `0x3a` 这种
+  "非零但偶"照样算把它清掉并楔死（页规则与 `+0x10000` 步进针对的都是这一个 bit）。
+  上游那个"8 字节零写"在这个 bit 上同样不合格。
+* 现状：我们走 shift 0。要用 −4 必须先做 H4 的解耦（当前引擎里"写入字"与 walk 指针是同一个字），
+  **本迭代不实施**。
+
 ## 4. 隐患清单（**全部不处理**）
 
 每条给：机制 / 证据 / 影响 / 为什么不处理。
 
 ### H1 `initialized`（byte2）落到偶数 ⇒ "permissive but smashed"，楔死
 
-* 机制：偶数 byte2 把 `selinux_state.initialized` 清成 0，之后**每一次 SID 查询都失败**；
-  表现为 enforcing 确实变成 0 但**没有** `[+] SELinux permissive`，随后机器卡死/重启。
+* 机制：`initialized` 只有**最低位**有意义（1 bit），byte2 为偶 ⇒ 该位为 0 ⇒ 之后
+  **每一次 SID 查询都失败**；表现为 enforcing 确实变成 0 但**没有** `[+] SELinux permissive`，
+  随后机器卡死/重启。
 * 证据：2026-09-22 21:21 那次跑（用户自己跑 C++ calib 版）：8 字节落在 `+0`，实测
   `checkreqprot←0x20`、`initialized←0x3a`、`policycap[0..4]←2b 80 ff ff ff`
   （`memory/2026-09-22.md:157-162`）；该次直接导致楔死，正是注释里的 "permissive but smashed"。
