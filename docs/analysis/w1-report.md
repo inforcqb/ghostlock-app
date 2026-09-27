@@ -431,3 +431,32 @@ parent = (target - 8) & ~3            # 低 2 位是颜色位 ⇒ 先减 8 再�
   `MEMORY.md:281`。
 * 设备/构建事实：route=3 MulticastWaiter、`mcast_waiter_off=32`、tcp6 carrier、
   `alias(selinux_state)=0xffffff802b3f9990`（`tools/device/w1-selinux.sh:6-10`）。
+
+## 9. 下一次更新（OS_PATCH_LEVEL 2026-08）的内核评估：W1 还能不能跑
+
+评估对象：`D:\adb_pull\new_images\new_boot.img`（`OS_PATCH_LEVEL 2026-08`，当前设备 `2026-02`）。
+
+* **版本**：新 `5.15.180-android13-8-o-01179-g408877dae2c9`，当前设备
+  `5.15.180-android13-8-o-01176-g6333b0dbc8ed`；两镜像 `KERNEL_SZ` 同为 `54123008`。
+* **结论 1 —— 漏洞没修**：`remove_waiter` 仍在（新 `@0x1c3df58`，旧 `@0x1c3dfc8`），
+  且逐指令一致：`mrs x20, sp_el0` → `add x22, x20, #0x884`（current->pi_lock）→ … →
+  `str xzr, [x20, #0x8b0]`（清 **current** 的 `pi_blocked_on`，即 CVE-2026-43499 本体）。
+  提取器独立同判：`CVE-2026-43499 primitive present`。
+* **结论 2 —— 现 profile 不能直接用**：镜像布局动过。稳定 rodata 串在新镜像里位移
+  `+0x8`（`initcall`）、`+0x40`（`rt_mutex`）、`+0x136`（`sysfs: cannot create duplicate filename`）、
+  `+0x24a`（`Unable to handle kernel`）、`+0x8fe`（`Kernel panic - not syncing`）；
+  `remove_waiter` 本体前移 `0x68` 并多出 8 字节序言（`paciasp; str x30,[x18],#8`）。
+  ⇒ 数据段（`.data/.bss`）随之位移 ⇒ profile 里的 `off_selinux_enforcing`
+  （= `54499728` = `0x33F9990`，alias `0xffffff802b3f9990`）**必须在新镜像上重推**；
+  W1 写的是 `selinux_state + 0` 的精确地址，差几十字节就是写到别处。
+* **仍然成立的部分**（字节级模板对比：新旧同偏移、同字节）：`__arm64_sys_futex` 序言、
+  `do_futex` 序言、`futex_wait_requeue_pi` 序言与局部量构造块、`core_sys_select` 序言与
+  "缓冲 + 阈值"块 ⇒ futex/pselect 的**几何与结构偏移未变**；`task_struct.pi_lock = 0x884`、
+  `pi_blocked_on = 0x8b0` 在两个镜像的代码里一致，与 profile 的 `2180 / 2224` 吻合。
+* **工具缺口**：提取器在新镜像上以
+  `error: kernel missing required offsets: missing required values: struct_slab_cache` 退出
+  （`--allow-missing` 无效）⇒ 自动推偏移这条链当前是断的。要么修 CI 里的提取器（Rust 工具链在 CI），
+  要么走手工流程（`magiskboot` 解包 + kallsyms 恢复 + capstone——本地已跑通一次）。
+* **仍待复核（不在本节处理）**：`selinux_state` 字节布局（byte0/1/2）与 MCAST 实测几何
+  （waiter 深度 `0x7C8`、tcp6 落点 `0x7E8`）需在新镜像/真机上再核；
+  guard/harden 三个模块在 vendor 分区，本镜像看不到。
