@@ -14,7 +14,7 @@
          loads libmagica2.so in the APP ZYGOTE, which installs the capset hook of
          libandroid_runtime.so there so that every isolated process forked from the
          zygote inherits it.  The load must happen in the zygote, not in the
-         service -- see com.ghostlock.app.root.AppZygote. -->
+         service (see com.ghostlock.app.root.AppZygote). -->
     <application
         android:name=".GhostlockApplication"
         android:icon="@mipmap/ic_launcher"
