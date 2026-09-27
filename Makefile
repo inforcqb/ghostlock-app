@@ -129,9 +129,15 @@ JNI_HDRS := $(wildcard $(JNI_DIR)/*.h $(JNI_DIR)/*.hpp $(JNI_DIR)/*/*.h $(JNI_DI
 # they keep the vendored resetprop (and the statically linked libc++) inside the
 # shared object instead of exporting -- or being interposed by -- libc's own
 # __system_property_* (same flags as upstream's Application.mk).
+#
+# -include bionic_compat.h is required: the vendored AOSP sources use private
+# bionic helpers (__BIONIC_ALIGN) that the platform build gets from bionic's
+# internal <sys/cdefs.h> but the NDK's public sysroot header does not define.
+# Force-including the shim keeps those vendored files byte-for-byte upstream.
 JNI_CFLAGS := -O2 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
   -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
   -std=c++23 -pthread \
+  -include $(JNI_DIR)/bionic_compat.h \
   -I$(JNI_DIR) \
   -I$(JNI_DIR)/lsplt/include \
   -I$(JNI_DIR)/system_properties/include
