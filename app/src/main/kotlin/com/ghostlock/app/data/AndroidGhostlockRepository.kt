@@ -472,7 +472,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val channel = RootChannel()
         val adb = AdbClient()
         val chain = RootChain(
-            shell = { command, _ -> shizukuRunner.execShell(command, onLog) },
+            /* The timeout the chain passes in is forwarded: dropping it is how a stalled
+             * Shizuku call hung the whole run forever. */
+            shell = { command, timeoutMs -> shizukuRunner.execShell(command, onLog, timeoutMs) },
             w1 = { log -> shizukuRunner.runW1Only(profileBlob, null, log) },
             /* The uid-0 channel is this app's own service now, started by binding it as an
              * isolated service from THIS process (an isolated service may only be bound by
