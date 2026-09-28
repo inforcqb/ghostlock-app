@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts are pushed to the device and parsed by Android's mksh, which rejects
+# CRLF ("unexpected 'do'", "unexpected 'in'"): two files in tools/device shipped with
+# CRLF in the working copy and broke half the device-side tooling on the way over.
+# Pin them to LF regardless of core.autocrlf.
+*.sh text eol=lf
