@@ -75,6 +75,21 @@ object ChainSpec {
      */
     const val TRANSPORT_FAILURE = -1
 
+    /**
+     * Commands that must NOT be repeated when the transport failed: for these we cannot
+     * be sure the command really did not run (the connection can drop *after* the call
+     * was delivered), and running a privileged step twice is worse than stopping.
+     * Everything else is repeatable -- `rm -f`, `echo`, `test`, the reads -- because the
+     * sentinel means the command never ran.
+     */
+    val NON_IDEMPOTENT = listOf(
+        AM_HANG,
+        RMMOD_GUARD,
+        KSUD_LATE_LOAD,
+        ADBD_SET_TCP_PORT,
+        USBD_RESTART_ADBD,
+    )
+
     /** step 4: open the channel and check who we are */
     const val CHANNEL_PROBE = "id"
 
@@ -187,14 +202,31 @@ class RootChain(
      * like that, and the `am hang` verdict then read "unreadable pid" as "the framework
      * restarted" and walked on. Fail the step instead.
      */
-    private suspend fun sh(command: String, timeoutMs: Long = 60_000L): ShellResult {
-        val result = shell.exec(command, timeoutMs)
-        if (result.exitCode == ChainSpec.TRANSPORT_FAILURE) {
-            throw IllegalStateException(
-                "Shizuku 执行失败（命令没有真正运行，不是退出码）：$command",
-            )
+    private suspend fun sh(
+        command: String,
+        timeoutMs: Long = 60_000L,
+        transportRetries: Int = 1,
+    ): ShellResult {
+        var attempt = 0
+        while (true) {
+            attempt++
+            val result = shell.exec(command, timeoutMs)
+            if (result.exitCode != ChainSpec.TRANSPORT_FAILURE) return result
+            /* The Shizuku hop drops connections on its own schedule (measured: several
+             * "UserService 断开连接" per chain). Since the sentinel means the command did
+             * NOT run, repeating it is safe -- except for the privileged steps, where a
+             * lost answer could hide that the command *did* run. */
+            val repeatable = ChainSpec.NON_IDEMPOTENT.none { command.contains(it) }
+            if (attempt > transportRetries || !repeatable) {
+                val why = if (repeatable) {
+                    "已重试 $transportRetries 次仍失败"
+                } else {
+                    "该步骤不允许重复执行"
+                }
+                throw IllegalStateException("Shizuku 执行失败（命令没有真正运行，不是退出码，$why）：$command")
+            }
+            onLog("[*] Shizuku 传输失败（命令没运行），重试 $attempt/$transportRetries：$command")
         }
-        return result
     }
 
     /**
