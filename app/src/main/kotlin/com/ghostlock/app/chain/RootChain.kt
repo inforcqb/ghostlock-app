@@ -244,10 +244,17 @@ class RootChain(
             /* Marker first: this command restarts the framework and kills this app, so
              * a file on the device is the only way the next tap can know the step
              * already ran. Written BEFORE the hang, per the operator's request. */
-            val hangAlreadyDone = lastLineOf(
+            val hangMarkerPresent = lastLineOf(
                 sh("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output,
             ) == "yes"
-            if (hangAlreadyDone) {
+            /* Skip the hang for the SAME reason W1 was skipped -- enforce == 0 means this
+             * boot already went past it, and the hang is the step right after W1 -- and
+             * independently when the marker file is there. Restarting the framework a
+             * second time would just kill this app again for nothing. */
+            val hangAlreadyDone = w1AlreadyDone || hangMarkerPresent
+            if (w1AlreadyDone) {
+                onLog("[*] enforce=0（本次开机已做过 W1）⇒ am hang 一并跳过，直接启动 root 服务")
+            } else if (hangMarkerPresent) {
                 onLog("[*] 标记 ${ChainSpec.MARKER_HANG} 存在 ⇒ 本次开机已做过 am hang，跳过（不再重启一次 framework）")
             } else {
                 sh("echo done > ${ChainSpec.MARKER_HANG}")
