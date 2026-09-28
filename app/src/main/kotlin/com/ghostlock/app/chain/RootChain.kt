@@ -216,8 +216,48 @@ class RootChain(
                     "（enforce / lsmod / adb tcp 端口）判断已跑到哪一步，并从该步继续。",
             )
             onLog("[!] W1 的 park 进程与 SELinux permissive 状态在重启 framework 后仍然保持。")
-            sh(ChainSpec.AM_HANG, timeoutMs = 30_000L).let {
-                onLog("[*] ${ChainSpec.AM_HANG} -> exit=${it.exitCode} (a broken pipe here is expected)")
+            /* `am hang --allow-restart` only *asks* the framework to hang, and it has
+             * been observed to return exit=1 with no output while system_server kept
+             * answering -- i.e. a silent no-op that let the chain walk on as if the
+             * framework had been hung.  So verify it instead of trusting the exit code:
+             *  - if the binder call comes back as "Broken pipe", the hang happened;
+             *  - otherwise (only reachable when THIS app survived, which it should not
+             *    if the framework really restarted) watch system_server's pid change.
+             * One retry, then fail loudly with the captured output. */
+            val ssPidBefore = lastLineOf(sh("pidof system_server").output)
+            onLog("[*] system_server pid before hang: ${ssPidBefore.ifEmpty { "<none>" }}")
+            var hangEffective = false
+            for (hangAttempt in 1..2) {
+                val hang = sh(ChainSpec.AM_HANG, timeoutMs = 30_000L)
+                onLog("[*] attempt $hangAttempt/2: ${ChainSpec.AM_HANG} -> exit=${hang.exitCode}")
+                hang.output.lineSequence().filter { it.isNotBlank() }
+                    .forEach { onLog("    $it") }
+                if (hang.output.contains("Broken pipe", ignoreCase = true)) {
+                    onLog("[*] hang verdict: binder 调用被 broken pipe 打断 ⇒ system_server 已挂起 ✓")
+                    hangEffective = true
+                    break
+                }
+                val hangDeadline = System.currentTimeMillis() + 45_000L
+                while (System.currentTimeMillis() < hangDeadline) {
+                    val now = lastLineOf(sh("pidof system_server").output)
+                    if (now != ssPidBefore) {
+                        onLog(
+                            "[*] hang verdict: system_server pid 变化 " +
+                                "(${ssPidBefore.ifEmpty { "<none>" }} -> ${now.ifEmpty { "<gone>" }}) ⇒ 已重启 ✓",
+                        )
+                        hangEffective = true
+                        break
+                    }
+                    delay(2_000L)
+                }
+                if (hangEffective) break
+                onLog("[!] 第 $hangAttempt 次 am hang 未见效：system_server 仍是 pid=${ssPidBefore.ifEmpty { "<none>" }}")
+            }
+            if (!hangEffective) {
+                throw IllegalStateException(
+                    "am hang --allow-restart 没有生效（system_server 仍在响应，pid=${ssPidBefore.ifEmpty { "<none>" }}）：" +
+                        "已停止推进，避免下一步拿不到 Magica 的 zygote 却继续跑",
+                )
             }
             sh("sleep 2; ${ChainSpec.MAGICA_START}").let {
                 onLog("[*] ${ChainSpec.MAGICA_START} -> exit=${it.exitCode}")
