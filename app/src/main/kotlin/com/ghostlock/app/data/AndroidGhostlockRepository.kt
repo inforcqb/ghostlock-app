@@ -4,6 +4,7 @@ import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.adb.AdbClient
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.RootChain
+import com.ghostlock.app.root.IsolatedRootShell
 import com.ghostlock.app.root.RootChannel
 import android.annotation.SuppressLint
 import android.content.ContentValues
@@ -84,6 +85,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private var shizukuPreferenceSet = false
     private var pendingParsedEntries: ValueList? = null
     private val shizukuRunner = ShizukuExploitRunner(appContext)
+
+    /**
+     * Holds the binding to this app's isolated uid-0 root service (`bindIsolatedService`).
+     * It is created here and deliberately never released: unbinding destroys the isolated
+     * process, and with it the uid-0 shell channel the later chain steps talk to.
+     */
+    private val isolatedRootShell = IsolatedRootShell(appContext)
 
     init {
         buildCpuPairs()
@@ -466,6 +474,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val chain = RootChain(
             shell = { command, _ -> shizukuRunner.execShell(command, onLog) },
             w1 = { log -> shizukuRunner.runW1Only(profileBlob, null, log) },
+            /* The uid-0 channel is this app's own service now, started by binding it as an
+             * isolated service from THIS process (an isolated service may only be bound by
+             * the app that declares it, so it cannot be done from the Shizuku user
+             * service). It used to be `am start` on an external app that is not installed. */
+            rootShell = { isolatedRootShell.launch() },
             channel = channel,
             adb = adb,
             onLog = onLog,

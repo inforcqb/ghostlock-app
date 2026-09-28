@@ -44,8 +44,36 @@ object ChainSpec {
      */
     const val MARKER_HANG = "$DEVICE_DIR/.step-am-hang"
 
-    /** step 3: launch Magica (replaced by the built-in root service once it is ported) */
-    const val MAGICA_START = "am start -n io.github.vvb2060.puellamagi/.MainActivity"
+    /**
+     * step 3: the uid-0 channel.
+     *
+     * This used to be `am start -n io.github.vvb2060.puellamagi/.MainActivity`, i.e. an
+     * *external* app that is not installed on this handset, so the step could only ever
+     * fail ("Activity class ... does not exist"). The port lives in this app now, so the
+     * chain starts it in-process -- see [RootShellLauncher]. No privileged command
+     * changes: they are still the verbatim ones below.
+     */
+    const val CHANNEL_LAUNCH_NOTE = "内置 root 服务：AppZygote 预载 libmagica2.so，绑成隔离进程"
+
+    /**
+     * `am hang --allow-restart` does not return until the watchdog kills system_server.
+     * Measured on this handset: system_server and both zygotes are unchanged for the
+     * first ~80s, the `am` command comes back at ~93s ("Hanging the system..." plus
+     * "Failure calling service activity: Broken pipe (32)"), and only then are the pids
+     * new. A 45s window -- and, worse, accepting an *unreadable* pid as "the pid
+     * changed" -- is what made the chain walk on with a framework that had never
+     * restarted.
+     */
+    const val HANG_WINDOW_MS = 180_000L
+
+    /** Poll period of the restart verdict. */
+    const val HANG_POLL_MS = 5_000L
+
+    /**
+     * Exit code that means "the command never ran" (a Shizuku transport failure), as
+     * opposed to a command that ran and failed. A shell command cannot exit with it.
+     */
+    const val TRANSPORT_FAILURE = -1
 
     /** step 4: open the channel and check who we are */
     const val CHANNEL_PROBE = "id"
@@ -64,6 +92,15 @@ object ChainSpec {
 
     /** verification only (never a substitute for the commands above) */
     const val READ_ENFORCE = "cat /sys/fs/selinux/enforce"
+    /** Same file as [READ_CAPS]; the `Seccomp:` line is what the boot-fact check reads. */
+    const val READ_STATUS = "cat /proc/self/status"
+
+    /**
+     * How often the boot facts are read before the chain refuses to guess. The Shizuku
+     * hop fails intermittently (null-message exception), so a single failed read must
+     * not decide anything.
+     */
+    const val BOOT_FACTS_ATTEMPTS = 4
     const val READ_LISTEN = "ss -lnt"
     const val READ_MODULES = "cat /proc/modules"
     const val READ_IDENTITY = "id"
@@ -109,6 +146,18 @@ fun interface W1Runner {
 }
 
 /**
+ * Starts this app's own uid-0 root service (isolated AppZygote process) and makes sure
+ * it really is uid 0 with a listening channel. Implemented by
+ * `com.ghostlock.app.root.IsolatedRootShell` in the app process -- an isolated service
+ * may only be bound by the app that declares it, so this cannot run in the Shizuku user
+ * service (uid 2000).
+ */
+fun interface RootShellLauncher {
+    /** Returns a line for the log; throws when the channel did not come up. */
+    suspend fun launch(): String
+}
+
+/**
  * The chain state machine. It only coordinates; every privileged step is executed by
  * whatever context the corresponding step requires (shell uid, the Magica channel,
  * or the adb client attached to the root adbd).
@@ -120,6 +169,7 @@ fun interface W1Runner {
 class RootChain(
     private val shell: ShellExec,
     private val w1: W1Runner,
+    private val rootShell: RootShellLauncher,
     private val channel: RootChannel,
     private val adb: AdbClient,
     private val onLog: (String) -> Unit,
@@ -127,9 +177,25 @@ class RootChain(
 ) {
     private val total = ChainStep.entries.size
 
-    /** Shell-uid command with the chain's default budget (the interface itself has none). */
-    private suspend fun sh(command: String, timeoutMs: Long = 60_000L): ShellResult =
-        shell.exec(command, timeoutMs)
+    /**
+     * Shell-uid command with the chain's default budget (the interface itself has none).
+     *
+     * A transport failure (the Shizuku user service call itself failed -- it happens
+     * intermittently, and the exception it throws has a null message, which is how
+     * `error: null` used to get printed) is NOT an empty result: the command never ran,
+     * so no caller may interpret its missing output as a fact. It used to look exactly
+     * like that, and the `am hang` verdict then read "unreadable pid" as "the framework
+     * restarted" and walked on. Fail the step instead.
+     */
+    private suspend fun sh(command: String, timeoutMs: Long = 60_000L): ShellResult {
+        val result = shell.exec(command, timeoutMs)
+        if (result.exitCode == ChainSpec.TRANSPORT_FAILURE) {
+            throw IllegalStateException(
+                "Shizuku 执行失败（命令没有真正运行，不是退出码）：$command",
+            )
+        }
+        return result
+    }
 
     /**
      * Last non-empty line of a command's captured output.
@@ -182,6 +248,131 @@ class RootChain(
         current
     }
 
+    /**
+     * Live facts that decide whether this boot already went through W1.
+     *
+     * `enforce` comes from `/sys/fs/selinux/enforce`, `seccomp` from `Seccomp:` in
+     * `/proc/self/status` (the Shizuku user service, uid 2000). W1 counts as landed only
+     * when BOTH say so: SELinux permissive alone could in principle be the vendor's own
+     * doing, while the shell context having no seccomp filter is the state the exploit
+     * needs to still be able to run at all.
+     */
+    private data class BootFacts(val enforce: String, val seccomp: String, val w1Landed: Boolean)
+
+    /**
+     * Read both facts, with retries.
+     *
+     * This replaces a marker-file check and a single `enforce` read. Two failure modes
+     * came out of that: `am hang --allow-restart` kills this app in the middle of the
+     * step, so the marker it writes can be missing in the next launch (the chain then
+     * re-ran W1 on top of an existing park), and the Shizuku hop fails intermittently
+     * with a null-message exception, which used to be printed as `error: null` and read
+     * as "unreadable ⇒ fresh boot" -- i.e. also a re-run of W1.
+     *
+     * If the state cannot be established after [ChainSpec.BOOT_FACTS_ATTEMPTS] attempts
+     * this throws instead of guessing: neither re-running W1 (a park may already exist)
+     * nor skipping it (the device may be enforcing) is safe on a guess.
+     */
+    private suspend fun readBootFacts(): BootFacts {
+        var enforce: String? = null
+        var seccomp: String? = null
+        var attempts = 0
+        var lastError: String? = null
+        while ((enforce == null || seccomp == null) && attempts < ChainSpec.BOOT_FACTS_ATTEMPTS) {
+            attempts++
+            if (enforce == null) {
+                enforce = runCatching {
+                    lastLineOf(sh(ChainSpec.READ_ENFORCE).output).takeIf { it.isNotEmpty() }
+                }.onFailure { lastError = it.message }.getOrNull()
+            }
+            if (seccomp == null) {
+                seccomp = runCatching {
+                    sh(ChainSpec.READ_STATUS).output.lineSequence()
+                        .firstOrNull { it.startsWith("Seccomp:") }
+                        ?.substringAfter(':')
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                }.onFailure { lastError = it.message }.getOrNull()
+            }
+        }
+        val e = enforce
+        val s = seccomp
+        if (e == null || s == null) {
+            val enforceText = e ?: "读不到"
+            val seccompText = s ?: "读不到"
+            val tail = lastError?.let { "，最后错误：$it" } ?: ""
+            throw IllegalStateException(
+                "无法确认现场状态（enforce=$enforceText, Seccomp=$seccompText，" +
+                    "已重试 $attempts 次$tail）：" +
+                    "不猜 —— 盲目重跑 W1 会在已有 park 上再伪造 waiter，跳过又可能在 Enforcing 下白跑。" +
+                    "请再点一次",
+            )
+        }
+        return BootFacts(e, s, w1Landed = e.startsWith("0") && s == "0")
+    }
+
+    /**
+     * system_server's pid, or null when the read did not work at all.
+     *
+     * `pidof` exits 1 with EMPTY output when there is no such process, so "empty" and
+     * "unreadable" must stay distinguishable: an empty read is meaningful (the server is
+     * momentarily gone, i.e. the restart is in progress), an unreadable one is not
+     * evidence of anything.
+     */
+    private suspend fun readSystemServerPid(): String? = try {
+        lastLineOf(sh("pidof system_server").output)
+    } catch (t: Throwable) {
+        onLog("[*] 读 system_server pid 失败（Shizuku 抖动：${t.message}）⇒ 不作证据，继续等")
+        null
+    }
+
+    /**
+     * Wait for the framework restart that `am hang --allow-restart` triggers.
+     *
+     * The only accepted evidence is a *readable* pid that differs from [before]: the
+     * watchdog needs ~93s here (see [ChainSpec.HANG_WINDOW_MS]), and an empty pid is
+     * logged as "in between" rather than treated as success. In the normal run this
+     * function never returns at all -- the framework restart kills this app, and the
+     * next launch resumes from the marker file and `enforce == 0`.
+     */
+    private suspend fun awaitFrameworkRestart(before: String, deadline: Long): Boolean {
+        var lastSeen = ""
+        while (System.currentTimeMillis() < deadline) {
+            delay(ChainSpec.HANG_POLL_MS)
+            val now = readSystemServerPid() ?: continue
+            if (now.isNotEmpty() && now != before) {
+                onLog("[*] hang verdict: system_server pid $before -> $now ⇒ framework 与 zygote 已重启 ✓")
+                return true
+            }
+            if (now != lastSeen) {
+                lastSeen = now
+                onLog(
+                    if (now.isEmpty()) {
+                        "[*] system_server 当前无 pid（正在重启中）… 继续等"
+                    } else {
+                        "[*] system_server 仍是 pid=$now（watchdog 约需 90s）… 继续等"
+                    },
+                )
+            }
+        }
+        return false
+    }
+
+    /**
+     * Connectability probe for the root channel.
+     *
+     * The step used to wait for `ls -l rshell.sock` to show the file, which a *stale*
+     * socket from an earlier boot satisfies -- that is exactly how a run walked past a
+     * root service that had never started, and died on the first connect with
+     * `Connection refused`. Only a successful connect (and a uid-0 identity) counts.
+     */
+    private fun probeChannel(): String = try {
+        val identity = channel.exec(ChainSpec.CHANNEL_PROBE).trim()
+        if (identity.contains("uid=0")) "connected" else "connected but identity=$identity"
+    } catch (t: Throwable) {
+        "not yet: ${t::class.simpleName}: ${t.message}"
+    }
+
     suspend fun run(): Boolean {
         // step 0 ------------------------------------------------------------------
         var ok = step(ChainStep.PREFLIGHT, "channel socket") {
@@ -195,24 +386,34 @@ class RootChain(
         if (!ok) return false
 
         // step 1: W1 ---------------------------------------------------------------
-        /* Strategy switch on the SELinux state, and stale markers on a fresh boot:
-         *  - enforce == "0" means this boot already ran W1 (a framework restart does
-         *    NOT restore enforcing; only a reboot does), and the parked engine that
-         *    holds the forged PI state is still alive. Running W1 again would forge a
-         *    second waiter on top of it, so skip it.
-         *  - enforce == "1" means a fresh boot: clear the step markers, they describe
-         *    the previous boot. */
-        val enforceAtStart = lastLineOf(sh(ChainSpec.READ_ENFORCE).output)
-        val w1AlreadyDone = enforceAtStart.startsWith("0")
+        /* Live facts decide whether W1 has to run at all -- see [readBootFacts]:
+         *  - `enforce == 0` AND `Seccomp: 0` together mean this boot already ran W1 (a
+         *    framework restart does NOT restore enforcing; only a reboot does), and the
+         *    parked engine that holds the forged PI state is still alive. Running W1
+         *    again would forge a second waiter on top of it, so skip it -- and skip the
+         *    `am hang` right after it as well, unconditionally, without consulting the
+         *    marker file (the hang kills this app, so that file may legitimately be
+         *    absent or invisible in the next launch).
+         *  - otherwise this is a fresh boot: clear the step markers, they describe the
+         *    previous boot.
+         * If neither can be established, [readBootFacts] throws rather than guessing. */
+        val boot = readBootFacts()
+        val w1AlreadyDone = boot.w1Landed
         if (w1AlreadyDone) {
-            onLog("[*] enforce=$enforceAtStart ⇒ 本次开机已做过 W1：跳过 W1（避免在已有 park 上再伪造 waiter）")
+            onLog(
+                "[*] 现场事实 enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ 本次开机已做过 W1：" +
+                    "无条件跳过 W1 与 am hang（不看标记文件）",
+            )
         } else {
             sh("rm -f ${ChainSpec.MARKER_HANG}")
-            onLog("[*] enforce=${enforceAtStart.ifEmpty { "<unreadable>" }} ⇒ 新 boot：清掉旧步骤标记，W1 照常执行")
+            onLog(
+                "[*] 现场事实 enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ 未做过 W1：" +
+                    "清掉旧步骤标记，W1 照常执行",
+            )
         }
         ok = step(ChainStep.W1, "GHOSTLOCK_W1_ONLY + GHOSTLOCK_PARK_AFTER_W1") {
             if (w1AlreadyDone) {
-                return@step "enforce=$enforceAtStart (already permissive; W1 skipped)"
+                return@step "enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ W1 已做过，跳过"
             }
             if (!w1.runW1Only(onLog)) throw IllegalStateException("W1 runner returned failure")
             val enforce = await(
@@ -226,7 +427,7 @@ class RootChain(
         if (!ok) return false
 
         // step 2 + 3: Magica ------------------------------------------------------
-        ok = step(ChainStep.MAGICA_ROOT, "am hang -> Magica -> uid 0") {
+        ok = step(ChainStep.MAGICA_ROOT, "am hang -> 内置 uid-0 服务 -> channel") {
             /* am hang --allow-restart takes system_server down on purpose and lets
              * the watchdog restart it; zygote -- and therefore THIS APP -- goes
              * with it.  That is expected, not a failure, but the user has to be
@@ -241,12 +442,14 @@ class RootChain(
                     "（enforce / lsmod / adb tcp 端口）判断已跑到哪一步，并从该步继续。",
             )
             onLog("[!] W1 的 park 进程与 SELinux permissive 状态在重启 framework 后仍然保持。")
-            /* Marker first: this command restarts the framework and kills this app, so
-             * a file on the device is the only way the next tap can know the step
-             * already ran. Written BEFORE the hang, per the operator's request. */
-            val hangMarkerPresent = lastLineOf(
-                sh("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output,
-            ) == "yes"
+            /* The marker is only a *hint* for the case where the live facts cannot tell
+             * (they can: `w1AlreadyDone` already skips the hang unconditionally, without
+             * this file). Reading it must therefore never fail the step -- a Shizuku
+             * glitch here would otherwise stop a chain whose skip decision is already
+             * made. */
+            val hangMarkerPresent = runCatching {
+                lastLineOf(sh("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output) == "yes"
+            }.getOrDefault(false)
             /* Skip the hang for the SAME reason W1 was skipped -- enforce == 0 means this
              * boot already went past it, and the hang is the step right after W1 -- and
              * independently when the marker file is there. Restarting the framework a
@@ -257,62 +460,80 @@ class RootChain(
             } else if (hangMarkerPresent) {
                 onLog("[*] 标记 ${ChainSpec.MARKER_HANG} 存在 ⇒ 本次开机已做过 am hang，跳过（不再重启一次 framework）")
             } else {
-                sh("echo done > ${ChainSpec.MARKER_HANG}")
-                onLog("[*] 已落标记 ${ChainSpec.MARKER_HANG}（在 am hang 之前写：app 随后被杀也能知道这一步做过）")
+                onLog("[*] 本次开机还没做过 am hang：先读基线 pid，落标记，再执行")
             }
             if (!hangAlreadyDone) {
-            /* `am hang --allow-restart` only *asks* the framework to hang, and it has
-             * been observed to return exit=1 with no output while system_server kept
-             * answering -- i.e. a silent no-op that let the chain walk on as if the
-             * framework had been hung.  So verify it instead of trusting the exit code:
-             *  - if the binder call comes back as "Broken pipe", the hang happened;
-             *  - otherwise (only reachable when THIS app survived, which it should not
-             *    if the framework really restarted) watch system_server's pid change.
-             * One retry, then fail loudly with the captured output. */
-            val ssPidBefore = lastLineOf(sh("pidof system_server").output)
-            onLog("[*] system_server pid before hang: ${ssPidBefore.ifEmpty { "<none>" }}")
+            /* `am hang --allow-restart` only *asks* the framework to hang; the watchdog
+             * does the killing, and on this handset that takes ~93s (measured: pids
+             * unchanged until t=80s, `am` returns at t=93s with "Hanging the system..."
+             * and "Failure calling service activity: Broken pipe (32)", new pids right
+             * after). The old code waited 45s and then accepted an *unreadable* pid as
+             * "the pid changed" -- i.e. it declared success on a framework that had
+             * never restarted, and the next step had no fresh zygote to work with.
+             *
+             * The baseline is now mandatory (without a readable pid there is nothing to
+             * compare against), the window is [ChainSpec.HANG_WINDOW_MS], and the only
+             * accepted evidence is a readable pid that differs from the baseline. */
+            var baseline: String? = null
+            var baselineTries = 0
+            while (baseline.isNullOrEmpty() && baselineTries < 3) {
+                baselineTries++
+                baseline = readSystemServerPid()
+            }
+            val ssPidBefore = baseline
+            if (ssPidBefore.isNullOrEmpty()) {
+                throw IllegalStateException(
+                    "读不到 system_server 的 pid（Shizuku 连续失败 $baselineTries 次）：" +
+                        "没有基线就无法判断 am hang 是否生效，已停止（未落标记，重试即可）",
+                )
+            }
+            onLog("[*] system_server pid before hang: $ssPidBefore")
+            sh("echo done > ${ChainSpec.MARKER_HANG}")
+            onLog("[*] 已落标记 ${ChainSpec.MARKER_HANG}（在 am hang 之前写：app 随后被杀也能知道这一步做过）")
             var hangEffective = false
             for (hangAttempt in 1..2) {
-                val hang = sh(ChainSpec.AM_HANG, timeoutMs = 30_000L)
+                val deadline = System.currentTimeMillis() + ChainSpec.HANG_WINDOW_MS
+                val hang = sh(ChainSpec.AM_HANG, timeoutMs = ChainSpec.HANG_WINDOW_MS + 60_000L)
                 onLog("[*] attempt $hangAttempt/2: ${ChainSpec.AM_HANG} -> exit=${hang.exitCode}")
                 hang.output.lineSequence().filter { it.isNotBlank() }
                     .forEach { onLog("    $it") }
                 if (hang.output.contains("Broken pipe", ignoreCase = true)) {
-                    onLog("[*] hang verdict: binder 调用被 broken pipe 打断 ⇒ system_server 已挂起 ✓")
+                    onLog("[*] am 以 broken pipe 收尾（watchdog 已杀 system_server）⇒ 再用 pid 证据确认")
+                }
+                if (awaitFrameworkRestart(ssPidBefore, deadline)) {
                     hangEffective = true
                     break
                 }
-                val hangDeadline = System.currentTimeMillis() + 45_000L
-                while (System.currentTimeMillis() < hangDeadline) {
-                    val now = lastLineOf(sh("pidof system_server").output)
-                    if (now != ssPidBefore) {
-                        onLog(
-                            "[*] hang verdict: system_server pid 变化 " +
-                                "(${ssPidBefore.ifEmpty { "<none>" }} -> ${now.ifEmpty { "<gone>" }}) ⇒ 已重启 ✓",
-                        )
-                        hangEffective = true
-                        break
-                    }
-                    delay(2_000L)
-                }
-                if (hangEffective) break
-                onLog("[!] 第 $hangAttempt 次 am hang 未见效：system_server 仍是 pid=${ssPidBefore.ifEmpty { "<none>" }}")
+                onLog(
+                    "[!] 第 $hangAttempt 次 am hang 在 ${ChainSpec.HANG_WINDOW_MS / 1000}s 内未见效：" +
+                        "system_server pid 仍是 $ssPidBefore",
+                )
             }
             if (!hangEffective) {
                 throw IllegalStateException(
-                    "am hang --allow-restart 没有生效（system_server 仍在响应，pid=${ssPidBefore.ifEmpty { "<none>" }}）：" +
-                        "已停止推进，避免下一步拿不到 Magica 的 zygote 却继续跑",
+                    "am hang --allow-restart 没有生效：${ChainSpec.HANG_WINDOW_MS / 1000}s 内没有读到" +
+                        "「不同于 $ssPidBefore 且非空的」system_server pid。已停止推进，" +
+                        "避免拿没有重启的 framework 去启动隔离 root 服务",
                 )
             }
-            }
-            sh("sleep 2; ${ChainSpec.MAGICA_START}").let {
-                onLog("[*] ${ChainSpec.MAGICA_START} -> exit=${it.exitCode}")
-            }
+            /* A fresh system_server needs a moment before anything may bind to it. */
             await(
-                "root channel socket",
+                "framework 重启后恢复响应",
+                timeoutMs = 90_000L,
+                read = { runCatching { sh("pm path android").output }.getOrDefault("") },
+                check = { it.contains("package:") },
+            )
+            }
+            onLog("[*] ${ChainSpec.CHANNEL_LAUNCH_NOTE}")
+            onLog("[*] ${rootShell.launch()}")
+            /* Connectability, not existence: a stale socket file from an earlier boot
+             * satisfies `ls`, which is how a run walked past a root service that had
+             * never started and then died on the first connect ("Connection refused"). */
+            await(
+                "root channel（可连接）",
                 timeoutMs = 120_000L,
-                read = { sh("ls -l ${ChainSpec.CHANNEL_SOCK} 2>&1").output },
-                check = { it.contains("rshell.sock") },
+                read = { probeChannel() },
+                check = { it == "connected" },
             )
             channel.open()
             val identity = channel.exec(ChainSpec.CHANNEL_PROBE)

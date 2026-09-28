@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Process
 import androidx.annotation.Keep
 import com.ghostlock.app.BuildConfig
+import com.ghostlock.app.chain.ChainSpec
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicBoolean
@@ -270,8 +271,12 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 }
                 process.waitFor()
             }.getOrElse { error ->
-                runCatching { callback.onLog("error: ${error.message}") }
-                1
+                runCatching {
+                    callback.onLog("error: ${error::class.simpleName}: ${error.message}")
+                }
+                /* Same sentinel as the client side: "the command never ran", which the
+                 * chain must not read as an empty result. */
+                ChainSpec.TRANSPORT_FAILURE
             }
             runCatching { callback.onComplete(exitCode) }
         }, "ghostlock-shizuku-shell").start()

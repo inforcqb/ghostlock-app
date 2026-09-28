@@ -16,8 +16,8 @@
 | # | 执行者（身份/域） | 原命令（逐字） | 作用 |
 |---|---|---|---|
 | 1 | adb shell / Shizuku：`uid=2000`，`u:r:shell:s0`，`Seccomp: 0` | `sh /data/local/tmp/gl-w1/w1.sh` | W1：`Enforcing → Permissive`；跑完脚本返回，**exploit 进程 park** |
-| 2 | adb shell（uid 2000） | `am hang --allow-restart` | 让 system_server 挂掉并允许重启，Magica 的 zygote 才能正常起来 |
-| 3 | 用户在设备上 | 启动 Magica（`am start -n io.github.vvb2060.puellamagi/.MainActivity`），点"启用 rootshell" | 拿到 `u:r:isolated_app:s0` 的 **uid 0 通道**（`CapEff=0x1c0`，**无 caps**） |
+| 2 | adb shell（uid 2000） | `am hang --allow-restart` | 让 system_server 挂掉并允许重启，Magica 的 zygote 才能正常起来。**实测 watchdog 要 ~93 s 才动手**（见下） |
+| 3 | 用户在设备上 | 启动 Magica（`am start -n io.github.vvb2060.puellamagi/.MainActivity`），点"启用 rootshell"。**2026-09-28 起 app 内置等价物**：`bindIsolatedService()` 绑 `.root.RootShellService`（AppZygote 预载 `libmagica2.so`），不再依赖外部 app | 拿到 `u:r:isolated_app:s0` 的 **uid 0 通道**（`CapEff=0x1c0`，**无 caps**） |
 | 4 | 上述 uid 0 通道 | `sh /data/local/tmp/gl-w1/rshell` | 进入根通道 shell（unix socket + token） |
 | 5 | 通道内，**必须借 adbd 域** | `runcon u:r:adbd:s0 sh` → `setprop service.adb.tcp.port 5555` | `service.adb.tcp.port` 属 `adbd_config_prop`，只有 adbd 域有 `set` |
 | 6 | 通道内，**必须借 usbd 域** | `runcon u:r:usbd:s0 sh` → `setprop ctl.restart adbd` | `ctl_adbd_prop` 只授予 `usbd`（`plat_sepolicy.cil`） |
