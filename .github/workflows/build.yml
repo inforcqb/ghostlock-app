@@ -80,7 +80,11 @@ jobs:
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
       - name: Decode Android signing key
-        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        # Sign every non-PR run with the release key, not just main: the debug
+        # keystore is generated fresh on each runner, so two branch builds would
+        # carry different signatures and every reinstall would need an uninstall
+        # (which also drops the Shizuku grant).
+        if: ${{ github.event_name != 'pull_request' }}
         run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
 
       - name: Build Ghostlock binary

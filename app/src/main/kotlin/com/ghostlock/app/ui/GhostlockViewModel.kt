@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
 import com.ghostlock.app.chain.ChainProgress
+import com.ghostlock.app.chain.ChainStateStore
 import com.ghostlock.app.chain.ChainStep
 import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.domain.model.KernelSnapshot
@@ -627,6 +628,17 @@ class GhostlockViewModel(
         appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
         appendLog("chain: W1 -> Magica uid-0 channel -> adbd gate -> rmmod guard -> ksud late-load")
         appendLog("commands are verbatim: docs/analysis/root-chain-integration.md")
+        /* Tell the user where the previous run stopped, if it was interrupted by the
+         * zygote restart that the am hang step causes (same boot only). */
+        ChainStateStore.load()?.let { previous ->
+            if (!previous.finished && ChainStateStore.belongsToThisBoot(previous)) {
+                appendLog("[!] 本次开机内上一次运行未完成：${previous.summary()}")
+                appendLog(
+                    "[!] 若它是被 am hang 之后的 zygote 重启打断的（本 app 一起重启属预期），" +
+                        "再点一次即可；W1 那一步检测到已是 permissive 会自动跳过。",
+                )
+            }
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val ok = runRootChainUseCase(pair, ::appendLog, ::onChainProgress)
@@ -639,6 +651,7 @@ class GhostlockViewModel(
             } finally {
                 endOperation()
                 send(GhostlockEffect.KeepScreenAwake(false))
+                ChainStateStore.markFinished()
             }
         }
     }
@@ -673,6 +686,9 @@ class GhostlockViewModel(
             steps[index] = entry.copy(detail = entry.detail.ifBlank { previous.detail })
             state.copy(rootChainSteps = steps)
         }
+        /* Persist every transition: `am hang --allow-restart` restarts zygote and
+         * this app with it, so the in-memory list alone would lose the place. */
+        ChainStateStore.save(progress)
     }
 
     private fun initialRootChainSteps(): List<RootChainStepUi> =
