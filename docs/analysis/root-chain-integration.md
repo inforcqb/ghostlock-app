@@ -179,11 +179,27 @@ steps = [
 |---|---|---|
 | 第 1 步后 `getenforce` 仍为 Enforcing | W1 没落地（或自检拒绝后重试用尽） | 重跑 `w1.sh`；`w1.log` 里看 `prepare_kernel_page retry` 次数 |
 | 屏幕冻结 / adb 掉线（W1 偶发 panic） | 已知未解规律的故障 | 重启；把现象（停在哪一步、dmesg/pstore）记入样本 |
-| 第 4 步通道连不上 | Magica 的 isolated service 没起来（`am hang` 没做成 / 被 SELinux 拦） | 重做第 2、3 步；必要时重启系统再试 |
+| 第 2 步 `am hang` 迟迟看不到效果 | **正常**：watchdog 实测约 93 s 才杀 system_server（t=80 s 前 pid 不变，`am` 在 t=93 s 才返回 `Broken pipe`）；app 会在这时被杀，属预期 | 重开 app 点一次即可：`enforce==0 && Seccomp==0` ⇒ 无条件跳过 W1 与 hang |
+| 第 2 步窗口内**没有**读到「不同于基线且非空的」system_server pid | hang 真没生效 | 链会明确报错并停止；不要继续（拿没重启的 framework 去启隔离服务必失败） |
+| 第 4 步通道连不上 | 内置 isolated service 没起来（`am hang` 没做成 / AppZygote 的 capset hook 没生效） | 看 `logcat -s GhostlockRoot`：`ensureRoot()` 失败会直说；重做第 2、3 步；必要时重启系统再试 |
 | 第 6 步 `ss` 没有 `*:5555` | 借域失败（此刻非 permissive）或 adbd 没起 | 确认 `getenforce=Permissive`；用 `tools/device/adbd-recover.sh` 的思路救 adbd |
 | 第 7 步连不上 | `ro.adb.secure` 没关 / 端口没监听 / adbd 还没重启完 | 依次核对 `getprop`、`ss -lnt`、`init.svc.adbd` |
 | 第 8 步 `rmmod` 失败 | guard 已被别的路径卸掉，或 refcount 非 0 | `lsmod` 确认；`rmmod -f`（谨慎）；已不在就算成功 |
 | 第 9 步 `ksud late-load` 失败 | `ksud` 路径/kmi 不匹配 | 校验 `/data/adb/ksud` 存在与 `--kmi`；看 `late-load` 输出 |
+
+### 4.1 2026-09-28 的实现修正（与本文旧描述不同之处）
+
+* **第 3 步不再是外部 app**：`am start -n io.github.vvb2060.puellamagi/.MainActivity` 在本机
+  根本不存在（`Activity class ... does not exist`）。改为 app 自己
+  `Context.bindIsolatedService()` 绑 `.root.RootShellService`（`IsolatedRootShell.kt`）——
+  必须在 **app 进程**里绑，uid 2000 的 Shizuku 用户服务无权绑隔离服务。
+* **通道就绪判定改成"真能连上"**：原先等 `ls -l rshell.sock`，而**上一此开机留下的僵尸 socket
+  也能通过**（本次实测就是这样：文件在、connect 得到 `Connection refused`）⇒ 现在必须
+  connect 成功且 `id` 含 `uid=0`。
+* **传输失败 ≠ 空输出**：Shizuku 调用失败时返回 `TRANSPORT_FAILURE = -1`（并打异常类名），
+  `sh()` 见到 -1 直接抛错；否则"命令没运行"会被当成"输出为空"继续往下走（`error: null` 的来源）。
+* **跳过判据用现场事实**：`enforce==0` **且** `/proc/self/status` 的 `Seccomp: 0` ⇒ 无条件跳过
+  W1 与 `am hang`，不看标记文件（`am hang` 会中途杀 app，标记可能读不到）；两者读不到就**报错停止**，不猜。
 
 ---
 
