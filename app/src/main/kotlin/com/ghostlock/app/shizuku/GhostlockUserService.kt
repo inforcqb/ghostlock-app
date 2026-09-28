@@ -174,11 +174,43 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                             isDaemon = true
                             start()
                         }
-                        val code = process.waitFor()
-                        Thread.sleep(200)
-                        tailer.interrupt()
-                        tailer.join(1000)
-                        code
+                        /* W1 does NOT exit when it succeeds: it parks on purpose
+                         * ("parking after W1 ... do NOT exit/kill this process"),
+                         * because the kernel walks the forged PI state if the
+                         * process goes away.  Waiting for exit therefore blocks the
+                         * whole chain forever -- watch the log for the park marker
+                         * instead, and treat an early exit as the failure case.
+                         * Nothing is killed here either way: killing the park wedges
+                         * the machine (a reboot is the clean way out). */
+                        val deadline = System.currentTimeMillis() + W1_PARK_TIMEOUT_MS
+                        var landed = false
+                        while (System.currentTimeMillis() < deadline) {
+                            val seen = runCatching {
+                                nativeLog.isFile && nativeLog.readText().contains(PARK_MARKER)
+                            }.getOrDefault(false)
+                            if (seen) {
+                                landed = true
+                                break
+                            }
+                            if (!process.isAlive) break
+                            Thread.sleep(500)
+                        }
+                        if (landed) {
+                            callback.onLog(
+                                "W1: landed and parked (pid=${runCatching { process.pid() }.getOrNull()}); " +
+                                    "chain continues, do NOT kill that process",
+                            )
+                            0
+                        } else {
+                            val detail = if (process.isAlive) {
+                                "timed out after ${W1_PARK_TIMEOUT_MS / 1000}s without the park marker; " +
+                                    "leaving the process alone (killing it wedges the kernel)"
+                            } else {
+                                "the engine exited before parking (exit=${runCatching { process.exitValue() }.getOrNull()})"
+                            }
+                            callback.onLog("W1: $detail")
+                            1
+                        }
                     }
             }.getOrElse { error ->
                 runCatching { callback.onLog("error: ${error.message}") }
@@ -264,5 +296,19 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
 
     override fun destroy() {
         if (!running.get()) kotlin.system.exitProcess(0)
+    }
+
+    private companion object {
+        /**
+         * The engine does NOT exit after a successful W1: it parks on purpose
+         * ("parking after W1: forged PI state kept alive ... do NOT exit/kill this
+         * process"), because the kernel walks the forged PI state when the process
+         * goes away. This is the marker line it prints right before parking, i.e.
+         * the "the store landed" signal the chain waits for.
+         */
+        const val PARK_MARKER = "parking after W1"
+
+        /** How long to wait for that marker before declaring the attempt failed. */
+        const val W1_PARK_TIMEOUT_MS = 300_000L
     }
 }

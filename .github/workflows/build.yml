@@ -10,6 +10,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      skip_extractor:
+        description: "Skip the Rust extractor (its CI step and the macOS/Windows jobs). Use for app-only or asset-only changes."
+        type: boolean
+        default: false
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -47,6 +52,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('tools/extract_rs/Cargo.lock') }}
 
       - name: Test extractor
+        if: ${{ inputs.skip_extractor != true }}
         working-directory: tools/extract_rs
         run: |
           cargo test --release --features http
@@ -103,6 +109,7 @@ jobs:
         run: mv app/build/outputs/apk/release/*.apk GhostLock-release.apk
 
       - name: Prepare extractor binaries
+        if: ${{ inputs.skip_extractor != true }}
         run: |
           cp tools/extract_rs/target/release/ghostlock-extract tools/extract_rs/ghostlock-extract-linux-x86_64
 
@@ -130,6 +137,7 @@ jobs:
           archive: false
 
       - name: Upload Extractor Linux
+        if: ${{ inputs.skip_extractor != true }}
         uses: actions/upload-artifact@v7
         with:
           name: ghostlock-extract-linux-x86_64
@@ -137,6 +145,7 @@ jobs:
           archive: false
 
       - name: Upload Extractor Android
+        if: ${{ inputs.skip_extractor != true }}
         uses: actions/upload-artifact@v7
         with:
           name: ghostlock-extract-android-arm64
@@ -146,6 +155,7 @@ jobs:
   build-extractor-macos:
     name: Build Extractor (macOS)
     runs-on: macos-latest
+    if: ${{ inputs.skip_extractor != true }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -184,6 +194,7 @@ jobs:
   build-extractor-windows:
     name: Build Extractor (Windows)
     runs-on: windows-latest
+    if: ${{ inputs.skip_extractor != true }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7

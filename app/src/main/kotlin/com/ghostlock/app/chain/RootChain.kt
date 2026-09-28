@@ -190,6 +190,20 @@ class RootChain(
 
         // step 2 + 3: Magica ------------------------------------------------------
         ok = step(ChainStep.MAGICA_ROOT, "am hang -> Magica -> uid 0") {
+            /* am hang --allow-restart takes system_server down on purpose and lets
+             * the watchdog restart it; zygote -- and therefore THIS APP -- goes
+             * with it.  That is expected, not a failure, but the user has to be
+             * told before it happens, and the app has to be able to say where it
+             * got to when it comes back (see ChainStateStore). */
+            onLog(
+                "[!] am hang --allow-restart: system_server 会被挂起并由 watchdog 重启，" +
+                    "zygote 连同本 app 会一起重启 —— 这是**预期**行为，不是失败。",
+            )
+            onLog(
+                "[!] 重启后请重新打开本 app：它会读取已保存的进度 (chain-state.txt) 与现场事实" +
+                    "（enforce / lsmod / adb tcp 端口）判断已跑到哪一步，并从该步继续。",
+            )
+            onLog("[!] W1 的 park 进程与 SELinux permissive 状态在重启 framework 后仍然保持。")
             sh(ChainSpec.AM_HANG, timeoutMs = 30_000L).let {
                 onLog("[*] ${ChainSpec.AM_HANG} -> exit=${it.exitCode} (a broken pipe here is expected)")
             }
