@@ -121,6 +121,18 @@ class RootChain(
     private suspend fun sh(command: String, timeoutMs: Long = 60_000L): ShellResult =
         shell.exec(command, timeoutMs)
 
+    /**
+     * Last non-empty line of a command's captured output.
+     *
+     * The Shizuku user service prints the command it is about to run through the same
+     * callback as the real output, so anything that parses the text must look at the
+     * value, not at the beginning of the buffer: comparing the raw output with "0"
+     * meant the W1 step never noticed that SELinux had turned permissive. [execShell]
+     * now filters the echo, and this keeps the checks robust to any future prefix.
+     */
+    private fun lastLineOf(output: String): String =
+        output.trim().lines().lastOrNull { it.isNotBlank() }?.trim().orEmpty()
+
     private suspend fun step(
         step: ChainStep,
         detail: String = "",
@@ -174,15 +186,15 @@ class RootChain(
 
         // step 1: W1 ---------------------------------------------------------------
         ok = step(ChainStep.W1, "GHOSTLOCK_W1_ONLY + GHOSTLOCK_PARK_AFTER_W1") {
-            if (sh(ChainSpec.READ_ENFORCE).output.trim() == "0") {
+            if (lastLineOf(sh(ChainSpec.READ_ENFORCE).output) == "0") {
                 onLog("[*] SELinux already permissive -- still running W1 to get the park")
             }
             if (!w1.runW1Only(onLog)) throw IllegalStateException("W1 runner returned failure")
             val enforce = await(
                 "SELinux permissive",
                 timeoutMs = 90_000L,
-                read = { sh(ChainSpec.READ_ENFORCE).output.trim() },
-                check = { it.startsWith("0") },
+                read = { sh(ChainSpec.READ_ENFORCE).output },
+                check = { lastLineOf(it).startsWith("0") },
             )
             "enforce=$enforce"
         } != null
