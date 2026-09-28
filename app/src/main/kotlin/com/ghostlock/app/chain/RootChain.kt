@@ -34,6 +34,16 @@ object ChainSpec {
     /** step 2: make system_server hang, so Magica's zygote can come up */
     const val AM_HANG = "am hang --allow-restart"
 
+    /**
+     * Written to the device right BEFORE `am hang --allow-restart` runs.
+     *
+     * That command restarts the framework and kills this app, so the restarted app
+     * cannot tell from memory that the step already happened. The marker plus
+     * `enforce == 0` (this boot already had W1) is what lets a second tap resume
+     * instead of redoing the dangerous parts.
+     */
+    const val MARKER_HANG = "$DEVICE_DIR/.step-am-hang"
+
     /** step 3: launch Magica (replaced by the built-in root service once it is ported) */
     const val MAGICA_START = "am start -n io.github.vvb2060.puellamagi/.MainActivity"
 
@@ -185,9 +195,24 @@ class RootChain(
         if (!ok) return false
 
         // step 1: W1 ---------------------------------------------------------------
+        /* Strategy switch on the SELinux state, and stale markers on a fresh boot:
+         *  - enforce == "0" means this boot already ran W1 (a framework restart does
+         *    NOT restore enforcing; only a reboot does), and the parked engine that
+         *    holds the forged PI state is still alive. Running W1 again would forge a
+         *    second waiter on top of it, so skip it.
+         *  - enforce == "1" means a fresh boot: clear the step markers, they describe
+         *    the previous boot. */
+        val enforceAtStart = lastLineOf(sh(ChainSpec.READ_ENFORCE).output)
+        val w1AlreadyDone = enforceAtStart.startsWith("0")
+        if (w1AlreadyDone) {
+            onLog("[*] enforce=$enforceAtStart ⇒ 本次开机已做过 W1：跳过 W1（避免在已有 park 上再伪造 waiter）")
+        } else {
+            sh("rm -f ${ChainSpec.MARKER_HANG}")
+            onLog("[*] enforce=${enforceAtStart.ifEmpty { "<unreadable>" }} ⇒ 新 boot：清掉旧步骤标记，W1 照常执行")
+        }
         ok = step(ChainStep.W1, "GHOSTLOCK_W1_ONLY + GHOSTLOCK_PARK_AFTER_W1") {
-            if (lastLineOf(sh(ChainSpec.READ_ENFORCE).output) == "0") {
-                onLog("[*] SELinux already permissive -- still running W1 to get the park")
+            if (w1AlreadyDone) {
+                return@step "enforce=$enforceAtStart (already permissive; W1 skipped)"
             }
             if (!w1.runW1Only(onLog)) throw IllegalStateException("W1 runner returned failure")
             val enforce = await(
@@ -216,6 +241,19 @@ class RootChain(
                     "（enforce / lsmod / adb tcp 端口）判断已跑到哪一步，并从该步继续。",
             )
             onLog("[!] W1 的 park 进程与 SELinux permissive 状态在重启 framework 后仍然保持。")
+            /* Marker first: this command restarts the framework and kills this app, so
+             * a file on the device is the only way the next tap can know the step
+             * already ran. Written BEFORE the hang, per the operator's request. */
+            val hangAlreadyDone = lastLineOf(
+                sh("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output,
+            ) == "yes"
+            if (hangAlreadyDone) {
+                onLog("[*] 标记 ${ChainSpec.MARKER_HANG} 存在 ⇒ 本次开机已做过 am hang，跳过（不再重启一次 framework）")
+            } else {
+                sh("echo done > ${ChainSpec.MARKER_HANG}")
+                onLog("[*] 已落标记 ${ChainSpec.MARKER_HANG}（在 am hang 之前写：app 随后被杀也能知道这一步做过）")
+            }
+            if (!hangAlreadyDone) {
             /* `am hang --allow-restart` only *asks* the framework to hang, and it has
              * been observed to return exit=1 with no output while system_server kept
              * answering -- i.e. a silent no-op that let the chain walk on as if the
@@ -258,6 +296,7 @@ class RootChain(
                     "am hang --allow-restart 没有生效（system_server 仍在响应，pid=${ssPidBefore.ifEmpty { "<none>" }}）：" +
                         "已停止推进，避免下一步拿不到 Magica 的 zygote 却继续跑",
                 )
+            }
             }
             sh("sleep 2; ${ChainSpec.MAGICA_START}").let {
                 onLog("[*] ${ChainSpec.MAGICA_START} -> exit=${it.exitCode}")
