@@ -184,9 +184,37 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                          * the machine (a reboot is the clean way out). */
                         val deadline = System.currentTimeMillis() + W1_PARK_TIMEOUT_MS
                         var landed = false
+                        var scanned = 0L
+                        var carry = ""
+                        var parkedPid: String? = null
                         while (System.currentTimeMillis() < deadline) {
+                            /* Read only what was appended since the previous poll.
+                             * This loop runs while W1 races on two pinned cores, and
+                             * re-reading plus re-decoding the whole log four times a
+                             * second is avoidable work on exactly those cores. */
                             val seen = runCatching {
-                                nativeLog.isFile && nativeLog.readText().contains(PARK_MARKER)
+                                if (!nativeLog.isFile) return@runCatching false
+                                RandomAccessFile(nativeLog, "r").use { raf ->
+                                    val length = raf.length()
+                                    if (length <= scanned) return@use false
+                                    raf.seek(scanned)
+                                    val want = (length - scanned)
+                                        .coerceAtMost(MAX_LOG_CHUNK.toLong()).toInt()
+                                    val bytes = ByteArray(want)
+                                    val read = raf.read(bytes)
+                                    if (read <= 0) return@use false
+                                    scanned += read
+                                    /* Keep a marker-sized tail so a marker split
+                                     * across two reads is still recognised. */
+                                    val chunk = carry + String(bytes, 0, read)
+                                    carry = chunk.takeLast(PARK_MARKER.length - 1)
+                                    /* The engine prints its own pid on the marker
+                                     * line; Process.pid() is not usable here. */
+                                    Regex("pid=(\\d+)").find(chunk)?.let {
+                                        parkedPid = it.groupValues[1]
+                                    }
+                                    chunk.contains(PARK_MARKER)
+                                }
                             }.getOrDefault(false)
                             if (seen) {
                                 landed = true
@@ -197,7 +225,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         }
                         if (landed) {
                             callback.onLog(
-                                "W1: landed and parked (pid=${runCatching { process.pid() }.getOrNull()}); " +
+                                "W1: landed and parked (pid=${parkedPid ?: "unknown"}); " +
                                     "chain continues, do NOT kill that process",
                             )
                             0
@@ -279,7 +307,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         }
                     }
                 }
-                Thread.sleep(100)
+                Thread.sleep(RELAY_POLL_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return
@@ -310,5 +338,21 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
 
         /** How long to wait for that marker before declaring the attempt failed. */
         const val W1_PARK_TIMEOUT_MS = 300_000L
+
+        /**
+         * Log tail polling period.
+         *
+         * W1 is a timing race on two pinned cores, and the relay runs while it is in
+         * flight: every period it reads the file and then pushes each new line to the
+         * app over Binder. Only the KernelSnitch collision search quality decides
+         * whether the attempt lands, and that quality collapses when the cores are
+         * busy (measured: 25% collision coverage preceded a silent death in the write
+         * path). 100 ms was needlessly eager, so the UI updates four times a second
+         * instead -- still live, far less interference.
+         */
+        const val RELAY_POLL_MS = 400L
+
+        /** Largest slice read per poll while watching for the park marker. */
+        const val MAX_LOG_CHUNK = 64 * 1024
     }
 }

