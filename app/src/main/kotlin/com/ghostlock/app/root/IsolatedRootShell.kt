@@ -111,7 +111,7 @@ class IsolatedRootShell(private val context: Context) {
         onLog(
             "[*] service info: ${component.flattenToShortString()} exported=${info.exported} " +
                 "isolatedProcess=${(info.flags and FLAG_ISOLATED_PROCESS) != 0} " +
-                "useAppZygote=${(info.flags and FLAG_USE_APP_ZYGOTE) != 0} " +
+                "appZygote=${(info.flags and FLAG_USE_APP_ZYGOTE) != 0} " +
                 "flags=0x${info.flags.toString(16)} processName=${info.processName} " +
                 "appUid=${context.applicationInfo.uid}",
         )
@@ -168,8 +168,13 @@ class IsolatedRootShell(private val context: Context) {
     }
 
     companion object {
-        /** Instance name of the isolated service; per-service, and stable across binds. */
-        const val INSTANCE_NAME = "ghostlock-root"
+        /**
+         * Instance name of the isolated service: per-service, stable across binds, and it
+         * must be a plain identifier. `"ghostlock-root"` was rejected on the device with
+         * `IllegalArgumentException: Illegal instanceName` -- the hyphen is not allowed --
+         * and `bindIsolatedService` then returned false immediately.
+         */
+        const val INSTANCE_NAME = "ghostlockRoot"
 
         /** Starting an isolated process means forking the app zygote; give it room. */
         const val BIND_TIMEOUT_MS = 90_000L
@@ -177,11 +182,12 @@ class IsolatedRootShell(private val context: Context) {
         /**
          * `ServiceInfo.FLAG_ISOLATED_PROCESS` and `ServiceInfo.FLAG_USE_APP_ZYGOTE`.
          *
-         * Written out as literals on purpose: the corresponding `ServiceInfo` *fields*
-         * (`isolatedProcess`, `useAppZygote`) are @hide and do not compile against the
-         * public SDK, and even the flag constants are not all public.
+         * Literals on purpose: the matching `ServiceInfo` *fields* (`isolatedProcess`,
+         * `useAppZygote`) are @hide and do not compile against the public SDK, and the
+         * app-zygote flag constant is not public either. Values verified on the device:
+         * a correctly declared service reports `flags=0xa` (1<<1 | 1<<3).
          */
         private const val FLAG_ISOLATED_PROCESS = 1 shl 1
-        private const val FLAG_USE_APP_ZYGOTE = 1 shl 5
+        private const val FLAG_USE_APP_ZYGOTE = 1 shl 3
     }
 }
