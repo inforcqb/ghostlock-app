@@ -480,7 +480,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user
              * service). It used to be `am start` on an external app that is not installed. */
-            rootShell = { isolatedRootShell.launch() },
+            rootShell = { isolatedRootShell.launch(onLog) },
             channel = channel,
             adb = adb,
             onLog = onLog,

@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
@@ -53,14 +55,26 @@ class IsolatedRootShell(private val context: Context) {
      * Bind the isolated service (if not already bound) and require that it reports both
      * a uid-0 process and a listening channel. Throws with a diagnosis on any failure;
      * the returned string is what the chain prints.
+     *
+     * [onLog] receives the diagnosis as it happens, because the interesting failure is a
+     * silent `false` from the framework (see [logServiceFacts]) that leaves no trace in
+     * logcat.
      */
-    suspend fun launch(): String {
-        val service = withTimeout(BIND_TIMEOUT_MS) { bindOrNull() }
-            ?: throw IllegalStateException(
-                "bindIsolatedService() did not connect to .root.RootShellService within " +
-                    "${BIND_TIMEOUT_MS / 1000}s -- the isolated process did not start " +
-                    "(check logcat -s ${RootShellService.TAG})",
+    suspend fun launch(onLog: (String) -> Unit = {}): String {
+        logServiceFacts(onLog)
+        val service = try {
+            withTimeout(BIND_TIMEOUT_MS) { bindOrNull(onLog) }
+        } catch (timeout: TimeoutCancellationException) {
+            throw IllegalStateException(
+                "bindIsolatedService() 在 ${BIND_TIMEOUT_MS / 1000}s 内没有回调 onServiceConnected" +
+                    " —— 隔离进程没有起来（logcat -s ${RootShellService.TAG}）",
+                timeout,
             )
+        } ?: throw IllegalStateException(
+            "bindIsolatedService() 立刻返回 false：框架拒绝了这次绑定（不是超时）。" +
+                "上面那行 service info 是关键——若 isolatedProcess/useAppZygote 是 false，" +
+                "说明声明没生效；否则是 AMS 策略拒绝了隔离绑定",
+        )
         if (!service.ensureRoot()) {
             throw IllegalStateException(
                 "the isolated process is not uid 0: ensureRoot() == false -- " +
@@ -78,12 +92,36 @@ class IsolatedRootShell(private val context: Context) {
             "(channel ${RootShellService.CHANNEL_SOCK})"
     }
 
-    private suspend fun bindOrNull(): IRootShellService? {
+    /**
+     * What the framework thinks of the service, before anything is bound.
+     *
+     * `bindIsolatedService` reports failure by returning false -- no exception, and no
+     * logcat line of ours -- so a run that failed that way left no evidence at all. These
+     * are the facts: the service must be visible to THIS app and must be declared
+     * isolated, which also requires the AppZygote preload class.
+     */
+    private fun logServiceFacts(onLog: (String) -> Unit) {
+        val component = ComponentName(context, RootShellService::class.java)
+        val info = runCatching {
+            context.packageManager.getServiceInfo(component, 0)
+        }.getOrElse { error ->
+            onLog("[!] getServiceInfo($component) 失败：${error::class.simpleName}: ${error.message}")
+            null
+        } ?: return
+        onLog(
+            "[*] service info: ${component.flattenToShortString()} exported=${info.exported} " +
+                "isolatedProcess=${info.isolatedProcess} useAppZygote=${info.useAppZygote} " +
+                "processName=${info.processName} appUid=${context.applicationInfo.uid}",
+        )
+    }
+
+    private suspend fun bindOrNull(onLog: (String) -> Unit): IRootShellService? {
         bound?.let { return it }
         return suspendCancellableCoroutine { continuation ->
             val conn = object : ServiceConnection {
                 override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                     Log.i(RootShellService.TAG, "isolated root service connected: $name")
+                    onLog("[*] 隔离服务已连接：${name.flattenToShortString()} (pid=${Process.myPid()})")
                     val service = IRootShellService.Stub.asInterface(binder)
                     bound = service
                     if (continuation.isActive) continuation.resume(service)
@@ -91,11 +129,13 @@ class IsolatedRootShell(private val context: Context) {
 
                 override fun onServiceDisconnected(name: ComponentName) {
                     Log.w(RootShellService.TAG, "isolated root service disconnected: $name")
+                    onLog("[!] 隔离服务断开：${name.flattenToShortString()}")
                     bound = null
                     if (continuation.isActive) continuation.resume(null)
                 }
             }
             connection = conn
+            onLog("[*] bindIsolatedService(instance=$INSTANCE_NAME, flags=BIND_AUTO_CREATE) …")
             val requested = runCatching {
                 context.bindIsolatedService(
                     Intent(context, RootShellService::class.java),
@@ -109,8 +149,10 @@ class IsolatedRootShell(private val context: Context) {
                     RootShellService.TAG,
                     "bindIsolatedService threw: ${error::class.simpleName}: ${error.message}",
                 )
+                onLog("[!] bindIsolatedService 抛异常：${error::class.simpleName}: ${error.message}")
                 false
             }
+            onLog("[*] bindIsolatedService -> $requested")
             if (!requested && continuation.isActive) continuation.resume(null)
         }
     }
