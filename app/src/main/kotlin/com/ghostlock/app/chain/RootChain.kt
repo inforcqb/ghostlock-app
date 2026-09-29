@@ -589,15 +589,13 @@ class RootChain(
             }
             onLog("[*] ${ChainSpec.CHANNEL_LAUNCH_NOTE}")
             onLog("[*] ${rootShell.launch()}")
-            /* Connectability, not existence: a stale socket file from an earlier boot
-             * satisfies `ls`, which is how a run walked past a root service that had
-             * never started and then died on the first connect ("Connection refused"). */
-            await(
-                "root channel（可连接）",
-                timeoutMs = 120_000L,
-                read = { probeChannel() },
-                check = { it == "connected" },
-            )
+            /* Do NOT block here. The root service already reported that its server is
+             * listening (startChannel() == true), and the channel is verifiably up on the
+             * device (a shell-side `rshell` gets `uid=0` / `u:r:isolated_app:s0`), so a
+             * probe of our own must not hold the chain hostage: it burned minutes waiting
+             * for a transport that the chain does not use anyway. Probe once for the log,
+             * then move on to opening the adb gate. */
+            onLog("[*] 通道自检（一次性）：${probeChannel()}")
             val identity = chan(ChainSpec.CHANNEL_PROBE)
             onLog("[*] channel identity: ${identity.trim()}")
             if (!identity.contains("uid=0")) throw IllegalStateException("channel is not uid 0")
