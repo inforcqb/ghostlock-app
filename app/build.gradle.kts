@@ -169,7 +169,6 @@ dependencies {
     // fallback) and wireless pairing. Apache-2.0 branch of its dual licence. Replaces the
     // hand-written AdbClient, which stopped at "adbd asked for AUTH".
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
-    implementation("org.conscrypt:conscrypt-android:2.5.3")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("androidx.activity:activity-compose:1.13.0")
