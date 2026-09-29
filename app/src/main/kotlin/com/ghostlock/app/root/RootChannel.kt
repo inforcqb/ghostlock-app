@@ -58,6 +58,16 @@ class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
     /**
      * Run one short command in the channel as uid 0 and return its (combined) output,
      * with the pty's echo of the command itself removed.
+     *
+     * The timing follows the verified device-side `rshell` wrapper (`echo "$T"; sleep 1;
+     * echo "$*"; sleep 3; echo exit; | nc -U $SOCK`): token first, a pause for the server
+     * to consume it, then the command, then `exit`. Writing token+command back to back and
+     * half-closing immediately -- what this used to do -- does not work against the pty.
+     *
+     * This is the transport the chain uses from step 3 on, because it does NOT depend on
+     * uid 2000: `runcon u:r:usbd:s0 setprop ctl.restart adbd` restarts adbd, which kills
+     * every shell-uid process including Shizuku, so Shizuku may only be used up to (and
+     * including) W1.
      */
     fun exec(command: String, timeoutMs: Int = 30_000): String {
         val raw = StringBuilder()
@@ -67,10 +77,13 @@ class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
             socket.soTimeout = timeoutMs
             val out = socket.outputStream
             out.write((token() + "\n").toByteArray(Charsets.UTF_8))
+            out.flush()
+            Thread.sleep(TOKEN_SETTLE_MS)
             out.write((command + "\n").toByteArray(Charsets.UTF_8))
             out.flush()
-            // Half-close so the pty child sees EOF and exits (the one-shot contract).
-            runCatching { socket.shutdownOutput() }
+            Thread.sleep(COMMAND_SETTLE_MS)
+            out.write("exit\n".toByteArray(Charsets.UTF_8))
+            out.flush()
             try {
                 socket.inputStream.bufferedReader(Charsets.UTF_8).forEachLine { line ->
                     raw.appendLine(line)
@@ -104,5 +117,11 @@ class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
     companion object {
         /** The shared directory used by the device-side tooling (`w1.sh`, `rshell`, cleaners). */
         const val DEFAULT_DEVICE_DIR = "/data/local/tmp/gl-w1"
+
+        /** Pause after the token line, before the command (the wrapper sleeps 1s too). */
+        const val TOKEN_SETTLE_MS = 1_000L
+
+        /** Pause after the command, before `exit`, so the pty has time to print. */
+        const val COMMAND_SETTLE_MS = 2_000L
     }
 }

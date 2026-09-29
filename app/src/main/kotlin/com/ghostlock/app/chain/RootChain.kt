@@ -2,7 +2,9 @@ package com.ghostlock.app.chain
 
 import com.ghostlock.app.adb.AdbClient
 import com.ghostlock.app.root.RootChannel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -242,20 +244,17 @@ class RootChain(
         output.trim().lines().lastOrNull { it.isNotBlank() }?.trim().orEmpty()
 
     /**
-     * Run one command in the uid-0 channel.
+     * Run one command in the uid-0 channel, from step 3 on.
      *
-     * Transport is the device-side `rshell` wrapper as the shell user (uid 2000) -- the
-     * path the chain was verified with -- not the app's own AF_UNIX client. Two reasons:
-     * the app (untrusted_app) connecting to the socket of the isolated process is logged
-     * as `avc: denied { connectto }` on this firmware, which only passes because SELinux
-     * is permissive while the chain runs (a hidden dependency on permissive is the last
-     * thing this step needs), and the wrapper re-reads the token on every call, which
-     * matters while root services from earlier runs are still alive and every new
-     * onBind() re-creates the socket and rewrites the token.
+     * Transport is the app's own AF_UNIX client ([RootChannel]), NOT the device-side
+     * `rshell` wrapper and NOT Shizuku: uid 2000 exists only to start W1. Restarting adbd
+     * (`runcon u:r:usbd:s0 setprop ctl.restart adbd`, step 6) kills every shell-uid
+     * process -- including Shizuku's server and user services -- so every command after
+     * that point must come from this app, over the channel that the isolated uid-0 process
+     * serves. [RootChannel] talks to it with the wrapper's own timing.
      */
-    private suspend fun chan(command: String): String {
-        val quoted = command.replace("'", "'\\''")
-        return sh("${ChainSpec.DEVICE_DIR}/rshell '$quoted'", timeoutMs = 60_000L).output
+    private suspend fun chan(command: String): String = withContext(Dispatchers.IO) {
+        channel.exec(command, timeoutMs = 60_000)
     }
 
     private suspend fun step(
@@ -620,7 +619,10 @@ class RootChain(
             val listen = await(
                 "adbd listening on ${ChainSpec.ADB_PORT}",
                 timeoutMs = 60_000L,
-                read = { sh(ChainSpec.READ_LISTEN).output },
+                /* Through the channel, not Shizuku: the setprop above just restarted adbd,
+                 * which takes the whole shell uid (and therefore Shizuku) with it. The
+                 * uid-0 channel is unaffected. */
+                read = { chan(ChainSpec.READ_LISTEN) },
                 check = { it.contains(":${ChainSpec.ADB_PORT}") },
             )
             "listening"
