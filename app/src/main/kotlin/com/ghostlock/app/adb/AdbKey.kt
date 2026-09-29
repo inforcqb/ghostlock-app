@@ -46,7 +46,7 @@ class AdbKey(
 
     /** One line, exactly as it must appear in `/data/misc/adb/adb_keys`. */
     val publicKeyLine: String
-        get() = Base64.encodeToString(encode(publicKey), Base64.NO_WRAP) + " " + NAME
+        get() = io.github.muntashirakon.adb.AdbPubkeyBridge.line(publicKey, NAME)
 
     /** Short fingerprint of the public key, used to keep the push idempotent. */
     val fingerprint: String
