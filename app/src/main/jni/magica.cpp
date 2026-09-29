@@ -573,6 +573,57 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused
  * .dynsym and ART would never call it -- the three registrations below would then
  * be missing and every native call would throw UnsatisfiedLinkError.
  */
+/* Publish our ADB public key so adbd accepts our client's AUTH signature.
+ *
+ * /data/misc/adb/adb_keys is system:system 0640 and this process is uid 0 WITHOUT any
+ * capabilities, so DAC still applies and a plain write fails. Dropping to uid 1000 (the
+ * owner) is allowed precisely because it gives privileges away -- no CAP_SETUID needed.
+ * The drop happens in a forked child that writes and then _exit()s; it never returns to
+ * uid 0, because a process that hands root back is exactly what monitoring looks for.
+ * The parent stays uid 0 and only reaps the child.
+ *
+ * Idempotent: if the file already contains our line, nothing is appended. */
+static jboolean glk_push_adb_key(JNIEnv *env, jobject thiz __unused, jstring pubkey) {
+    const char *pub = env->GetStringUTFChars(pubkey, nullptr);
+    if (pub == nullptr) return JNI_FALSE;
+    const size_t len = strlen(pub);
+    const char *path = "/data/misc/adb/adb_keys";
+    pid_t pid = fork();
+    if (pid < 0) {
+        env->ReleaseStringUTFChars(pubkey, pub);
+        return JNI_FALSE;
+    }
+    if (pid == 0) {
+        if (setresgid(1000, 1000, 1000) != 0) _exit(10);
+        if (setresuid(1000, 1000, 1000) != 0) _exit(11);
+        if (getuid() == 0 || geteuid() == 0) _exit(12);   /* the drop must have taken */
+        int present = 0;
+        int rfd = open(path, O_RDONLY | O_CLOEXEC);
+        if (rfd >= 0) {
+            char buf[65536];
+            ssize_t n = read(rfd, buf, sizeof buf - 1);
+            close(rfd);
+            if (n > 0) {
+                buf[n] = '\0';
+                present = strstr(buf, pub) != nullptr;
+            }
+        }
+        if (present) _exit(0);
+        int wfd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+        if (wfd < 0) _exit(20);
+        if (write(wfd, pub, len) != (ssize_t) len) { close(wfd); _exit(21); }
+        if (write(wfd, "\n", 1) != 1) { close(wfd); _exit(22); }
+        close(wfd);
+        _exit(0);
+    }
+    int status = 0;
+    jboolean result = JNI_FALSE;
+    if (waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        result = JNI_TRUE;
+    }
+    env->ReleaseStringUTFChars(pubkey, pub);
+    return result;
+}
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -593,7 +644,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
             {"root",              "()Z", (void *) root},
             {"adb_root",          "()Z", (void *) adb_root},
             {"start_shell_server", "()Z", (void *) start_shell_server},
-    };
+           {"push_adb_key",    "(Ljava/lang/String;)Z", (void *) glk_push_adb_key},
+ };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");
         return JNI_ERR;

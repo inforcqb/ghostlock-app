@@ -32,6 +32,13 @@ interface IRootShellService {
     /** ensureRoot() + the adbd root patch (blocking, up to 15 s).  Off the main thread. */
     boolean adbRoot() = 3;
 
+    /**
+     * Append this app's ADB public key to /data/misc/adb/adb_keys (idempotent) so that adbd
+     * accepts our client's AUTH signature. Written from a forked child that drops to uid
+     * 1000 and exits -- it never returns to uid 0.
+     */
+    boolean pushAdbKey(String pubkey) = 4;
+
     /** Ask the service to stop itself. */
     void destroy() = 16777114;
 }

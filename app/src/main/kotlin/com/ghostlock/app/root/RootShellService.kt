@@ -87,6 +87,8 @@ class RootShellService : Service() {
 
         override fun adbRoot(): Boolean = root() && adb_root()
 
+        override fun pushAdbKey(pubkey: String): Boolean = push_adb_key(pubkey)
+
         override fun destroy() {
             Log.i(TAG, "destroy() requested by the caller")
             stopSelf()
@@ -140,6 +142,9 @@ class RootShellService : Service() {
     private external fun adb_root(): Boolean
 
     private external fun start_shell_server(): Boolean
+
+    /** Native, in magica.cpp: fork -> setresuid(1000) -> write adb_keys -> _exit. */
+    private external fun push_adb_key(pubkey: String): Boolean
 
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */
