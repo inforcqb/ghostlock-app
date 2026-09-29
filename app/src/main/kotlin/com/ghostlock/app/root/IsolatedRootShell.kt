@@ -110,8 +110,10 @@ class IsolatedRootShell(private val context: Context) {
         } ?: return
         onLog(
             "[*] service info: ${component.flattenToShortString()} exported=${info.exported} " +
-                "isolatedProcess=${info.isolatedProcess} useAppZygote=${info.useAppZygote} " +
-                "processName=${info.processName} appUid=${context.applicationInfo.uid}",
+                "isolatedProcess=${(info.flags and FLAG_ISOLATED_PROCESS) != 0} " +
+                "useAppZygote=${(info.flags and FLAG_USE_APP_ZYGOTE) != 0} " +
+                "flags=0x${info.flags.toString(16)} processName=${info.processName} " +
+                "appUid=${context.applicationInfo.uid}",
         )
     }
 
@@ -171,5 +173,15 @@ class IsolatedRootShell(private val context: Context) {
 
         /** Starting an isolated process means forking the app zygote; give it room. */
         const val BIND_TIMEOUT_MS = 90_000L
+
+        /**
+         * `ServiceInfo.FLAG_ISOLATED_PROCESS` and `ServiceInfo.FLAG_USE_APP_ZYGOTE`.
+         *
+         * Written out as literals on purpose: the corresponding `ServiceInfo` *fields*
+         * (`isolatedProcess`, `useAppZygote`) are @hide and do not compile against the
+         * public SDK, and even the flag constants are not all public.
+         */
+        private const val FLAG_ISOLATED_PROCESS = 1 shl 1
+        private const val FLAG_USE_APP_ZYGOTE = 1 shl 5
     }
 }
