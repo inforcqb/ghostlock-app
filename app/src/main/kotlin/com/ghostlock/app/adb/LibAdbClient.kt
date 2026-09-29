@@ -26,14 +26,45 @@ class LibAdbClient(
 ) {
     private var connection: AdbConnection? = null
 
-    fun connect(connectTimeoutMs: Int = 30_000) {
+    /**
+     * Connect to adbd, retrying a few times.
+     *
+     * adbd has just been restarted by `runcon u:r:usbd:s0 setprop ctl.restart adbd`, and
+     * "ss shows 5555 listening" happens before the daemon actually accepts connections --
+     * a single attempt failed here with libadb's "Unable to establish a new connection"
+     * even though a PC adb could connect to the same port moments later. Each attempt
+     * builds a fresh connection object, because a failed one cannot be reused.
+     *
+     * setApi(SDK_INT) tells the library that client and adbd live on the same device.
+     */
+    fun connect(connectTimeoutMs: Int = 30_000, attempts: Int = 6, gapMs: Long = 2_000L) {
         val key = AdbKey.load(context.filesDir)
-        val conn = AdbConnection.Builder(host, port)
-            .setDeviceName("ghostlock")
-            .setPrivateKey(key.privateKey)
-            .setCertificate(key.certificate)
-            .connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, true)
-        connection = conn
+        var last: Throwable? = null
+        for (attempt in 1..attempts) {
+            try {
+                val conn = AdbConnection.Builder(host, port)
+                    .setDeviceName("ghostlock")
+                    .setApi(android.os.Build.VERSION.SDK_INT)
+                    .setPrivateKey(key.privateKey)
+                    .setCertificate(key.certificate)
+                    .connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, false)
+                if (conn.isConnected) {
+                    connection = conn
+                    return
+                }
+                runCatching { conn.close() }
+                last = IllegalStateException("连接建立后未完成握手（第 $attempt/$attempts 次）")
+            } catch (error: Throwable) {
+                last = error
+            }
+            if (attempt < attempts) {
+                Thread.sleep(gapMs)
+            }
+        }
+        throw IllegalStateException(
+            "adb connect $host:$port 连续 $attempts 次失败：${last?.message}",
+            last,
+        )
     }
 
     /** Run one command through the `shell:` service and return its combined output. */
