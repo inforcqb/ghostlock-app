@@ -1,5 +1,16 @@
 package com.ghostlock.app.adb
 
+import android.sun.security.x509.AlgorithmId
+import android.sun.security.x509.CertificateAlgorithmId
+import android.sun.security.x509.CertificateIssuerName
+import android.sun.security.x509.CertificateSerialNumber
+import android.sun.security.x509.CertificateSubjectName
+import android.sun.security.x509.CertificateValidity
+import android.sun.security.x509.CertificateVersion
+import android.sun.security.x509.CertificateX509Key
+import android.sun.security.x509.X500Name
+import android.sun.security.x509.X509CertImpl
+import android.sun.security.x509.X509CertInfo
 import android.util.Base64
 import java.io.File
 import java.math.BigInteger
@@ -7,6 +18,11 @@ import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.PrivateKey
+import java.security.PublicKey
+import java.security.SecureRandom
+import java.security.cert.Certificate
+import java.security.cert.CertificateFactory
+import java.util.Date
 import java.security.interfaces.RSAPublicKey
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
@@ -22,7 +38,11 @@ import java.security.spec.X509EncodedKeySpec
  * public key format plus a name. Pushing it is our equivalent of `adb pair`; the client
  * still has to answer adbd's AUTH challenge with a signature (libadb does that part).
  */
-class AdbKey(val privateKey: PrivateKey, val publicKey: RSAPublicKey) {
+class AdbKey(
+    val privateKey: PrivateKey,
+    val publicKey: RSAPublicKey,
+    val certificate: Certificate,
+) {
 
     /** One line, exactly as it must appear in `/data/misc/adb/adb_keys`. */
     val publicKeyLine: String
@@ -40,8 +60,11 @@ class AdbKey(val privateKey: PrivateKey, val publicKey: RSAPublicKey) {
 
         private const val PRIVATE_FILE = "adbkey.pk8"
         private const val PUBLIC_FILE = "adbkey.pub.der"
+        private const val CERT_FILE = "adbkey.cert.der"
         private const val MODULUS_BYTES = 256
         private const val MODULUS_WORDS = MODULUS_BYTES / 4
+        private const val VALIDITY_MS = 3650L * 24 * 60 * 60 * 1000
+        private const val ALGORITHM = "SHA1withRSA"
 
         @Volatile
         private var cached: AdbKey? = null
@@ -51,8 +74,10 @@ class AdbKey(val privateKey: PrivateKey, val publicKey: RSAPublicKey) {
             cached?.let { return it }
             val privateFile = File(dir, PRIVATE_FILE)
             val publicFile = File(dir, PUBLIC_FILE)
+            val certFile = File(dir, CERT_FILE)
             val key = if (privateFile.isFile && privateFile.length() > 0L &&
-                publicFile.isFile && publicFile.length() > 0L
+                publicFile.isFile && publicFile.length() > 0L &&
+                certFile.isFile && certFile.length() > 0L
             ) {
                 val factory = KeyFactory.getInstance("RSA")
                 AdbKey(
@@ -64,7 +89,9 @@ class AdbKey(val privateKey: PrivateKey, val publicKey: RSAPublicKey) {
                 val pair = generator.generateKeyPair()
                 privateFile.writeBytes(pair.private.encoded)
                 publicFile.writeBytes(pair.public.encoded)
-                AdbKey(pair.private, pair.public as RSAPublicKey)
+                val certificate = generateCertificate(pair.private, pair.public)
+                certFile.writeBytes(certificate.encoded)
+                AdbKey(pair.private, pair.public as RSAPublicKey, certificate)
             }
             cached = key
             key

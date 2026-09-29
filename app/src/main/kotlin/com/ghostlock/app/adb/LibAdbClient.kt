@@ -31,6 +31,7 @@ class LibAdbClient(
         val conn = AdbConnection.Builder(host, port)
             .setDeviceName("ghostlock")
             .setPrivateKey(key.privateKey)
+            .setCertificate(key.certificate)
             .connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, true)
         connection = conn
     }

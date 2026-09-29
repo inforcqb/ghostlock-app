@@ -169,6 +169,10 @@ dependencies {
     // fallback) and wireless pairing. Apache-2.0 branch of its dual licence. Replaces the
     // hand-written AdbClient, which stopped at "adbd asked for AUTH".
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    // Certificate generation for the adb key: libadb requires BOTH a private key and a
+    // certificate on the connection object (the certificate is only used for wireless
+    // pairing, which we do not do, but the check is unconditional).
+    implementation("com.github.MuntashirAkon:sun-security-android:1.1")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("androidx.activity:activity-compose:1.13.0")
