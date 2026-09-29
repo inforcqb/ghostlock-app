@@ -83,6 +83,7 @@ class AdbKey(
                 AdbKey(
                     factory.generatePrivate(PKCS8EncodedKeySpec(privateFile.readBytes())),
                     factory.generatePublic(X509EncodedKeySpec(publicFile.readBytes())) as RSAPublicKey,
+                    readCertificate(certFile),
                 )
             } else {
                 val generator = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }
