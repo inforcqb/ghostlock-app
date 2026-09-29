@@ -28,12 +28,10 @@ class LibAdbClient(
 
     fun connect(connectTimeoutMs: Int = 30_000) {
         val key = AdbKey.load(context.filesDir)
-        val conn = AdbConnection.create(host, port, key.privateKey)
-        conn.setDeviceName("ghostlock")
-        val ok = conn.connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, true)
-        if (!ok) {
-            throw IllegalStateException("adb connect $host:$port 失败：未授权或超时（公钥推上去了吗？）")
-        }
+        val conn = AdbConnection.Builder(host, port)
+            .setDeviceName("ghostlock")
+            .setPrivateKey(key.privateKey)
+            .connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, true)
         connection = conn
     }
 
