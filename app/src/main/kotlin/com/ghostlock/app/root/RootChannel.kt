@@ -90,8 +90,13 @@ class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
 
     private fun stripEcho(command: String, raw: String): String {
         val commandLine = command.trim()
+        /* "bad token" is deliberately NOT filtered away: it is the server saying that the
+         * token we read does not belong to the instance currently holding the socket --
+         * exactly what happens while root services from earlier runs are still alive,
+         * each having re-created the socket and rewritten the token on its own onBind().
+         * Swallowing it made the chain see an empty result and hid the whole story. */
         return raw.lineSequence()
-            .filterNot { it.trim() == commandLine || it == "bad token" }
+            .filterNot { it.trim() == commandLine }
             .joinToString("\n")
             .trim()
     }

@@ -241,6 +241,23 @@ class RootChain(
     private fun lastLineOf(output: String): String =
         output.trim().lines().lastOrNull { it.isNotBlank() }?.trim().orEmpty()
 
+    /**
+     * Run one command in the uid-0 channel.
+     *
+     * Transport is the device-side `rshell` wrapper as the shell user (uid 2000) -- the
+     * path the chain was verified with -- not the app's own AF_UNIX client. Two reasons:
+     * the app (untrusted_app) connecting to the socket of the isolated process is logged
+     * as `avc: denied { connectto }` on this firmware, which only passes because SELinux
+     * is permissive while the chain runs (a hidden dependency on permissive is the last
+     * thing this step needs), and the wrapper re-reads the token on every call, which
+     * matters while root services from earlier runs are still alive and every new
+     * onBind() re-creates the socket and rewrites the token.
+     */
+    private suspend fun chan(command: String): String {
+        val quoted = command.replace("'", "'\\''")
+        return sh("${ChainSpec.DEVICE_DIR}/rshell '$quoted'", timeoutMs = 60_000L).output
+    }
+
     private suspend fun step(
         step: ChainStep,
         detail: String = "",
@@ -269,13 +286,27 @@ class RootChain(
     ): String = withTimeout(timeoutMs) {
         var warned = false
         var current = ""
+        val started = System.currentTimeMillis()
+        var lastReport = 0L
         while (!check(current)) {
             if (!warned) {
                 onLog("[*] waiting for $what ...")
                 warned = true
             }
             current = runCatching { read() }.getOrDefault("")
-            if (!check(current)) delay(intervalMs)
+            if (!check(current)) {
+                /* Long waits (the root channel, the adb gate) used to print one line and
+                 * then go silent for minutes, which reads as "the app hung". */
+                val elapsed = System.currentTimeMillis() - started
+                if (elapsed - lastReport >= 10_000L) {
+                    lastReport = elapsed
+                    onLog(
+                        "[*] 仍在等待 $what（${elapsed / 1000}s）——最近读到：" +
+                            current.replace("\n", " ").take(160),
+                    )
+                }
+                delay(intervalMs)
+            }
         }
         current
     }
@@ -398,8 +429,8 @@ class RootChain(
      * root service that had never started, and died on the first connect with
      * `Connection refused`. Only a successful connect (and a uid-0 identity) counts.
      */
-    private fun probeChannel(): String = try {
-        val identity = channel.exec(ChainSpec.CHANNEL_PROBE).trim()
+    private suspend fun probeChannel(): String = try {
+        val identity = chan(ChainSpec.CHANNEL_PROBE).trim()
         if (identity.contains("uid=0")) "connected" else "connected but identity=$identity"
     } catch (t: Throwable) {
         "not yet: ${t::class.simpleName}: ${t.message}"
@@ -567,8 +598,7 @@ class RootChain(
                 read = { probeChannel() },
                 check = { it == "connected" },
             )
-            channel.open()
-            val identity = channel.exec(ChainSpec.CHANNEL_PROBE)
+            val identity = chan(ChainSpec.CHANNEL_PROBE)
             onLog("[*] channel identity: ${identity.trim()}")
             if (!identity.contains("uid=0")) throw IllegalStateException("channel is not uid 0")
             if (identity.contains("uid=0") && !identity.contains("isolated_app")) {
@@ -580,13 +610,13 @@ class RootChain(
 
         // step 5 + 6: open the adb gate (domain borrows, permissive only) --------
         ok = step(ChainStep.OPEN_ADB_GATE, "runcon adbd + usbd") {
-            channel.exec(ChainSpec.ADBD_SET_TCP_PORT).let {
+            chan(ChainSpec.ADBD_SET_TCP_PORT).let {
                 onLog("[*] adbd domain: ${ChainSpec.ADBD_SET_TCP_PORT}")
                 if (it.contains("Failed to set property")) {
                     throw IllegalStateException("setprop rejected -- is SELinux still permissive?")
                 }
             }
-            channel.exec(ChainSpec.USBD_RESTART_ADBD).let {
+            chan(ChainSpec.USBD_RESTART_ADBD).let {
                 onLog("[*] usbd domain: ${ChainSpec.USBD_RESTART_ADBD}")
             }
             val listen = await(

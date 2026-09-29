@@ -88,7 +88,17 @@ class IsolatedRootShell(private val context: Context) {
                     RootShellService.CHANNEL_SOCK,
             )
         }
-        return "uid-0 root service ready: bound, ensureRoot=ok, startChannel=ok " +
+        /* Ported Magica's own "enable root shell" step, run automatically (the upstream
+         * app needed a button for it): ensureRoot + the adbd root patch, i.e. the
+         * resetprop/restart of adbd that makes an adb shell come back as uid 0. It is
+         * non-fatal here -- the chain opens the TCP gate through the channel instead --
+         * but its result is worth having in the log. */
+        val adbRoot = runCatching { service.adbRoot() }.getOrElse { error ->
+            onLog("[!] adbRoot() 抛异常：${error::class.simpleName}: ${error.message}")
+            false
+        }
+        onLog("[*] Magica adbRoot()（内置 resetprop/adbd 重启逻辑）-> $adbRoot")
+        return "uid-0 root service ready: bound, ensureRoot=ok, startChannel=ok, adbRoot=$adbRoot " +
             "(channel ${RootShellService.CHANNEL_SOCK})"
     }
 
