@@ -110,6 +110,38 @@ class AdbKey(
          * libadb exposes an encoder for this, but its class is package-private, so the
          * 524 bytes are built here. `adb_keys` stores base64 of exactly this blob.
          */
+        private fun readCertificate(file: File): Certificate =
+            CertificateFactory.getInstance("X.509").generateCertificate(file.inputStream())
+
+        /**
+         * A self-signed certificate for our adb key.
+         *
+         * libadb refuses to connect unless the connection carries both a private key and a
+         * certificate; the certificate itself is only used for the wireless-pairing TLS
+         * handshake, which we do not use (we authorize by writing the public key into
+         * /data/misc/adb/adb_keys). Any valid self-signed certificate will do, and it is
+         * created once, together with the key.
+         */
+        private fun generateCertificate(privateKey: PrivateKey, publicKey: PublicKey): Certificate {
+            val info = X509CertInfo()
+            val subject = X500Name("CN=" + NAME)
+            info.set(
+                X509CertInfo.VALIDITY,
+                CertificateValidity(Date(), Date(System.currentTimeMillis() + VALIDITY_MS)),
+            )
+            info.set(X509CertInfo.SERIAL_NUMBER, CertificateSerialNumber(BigInteger(64, SecureRandom())))
+            info.set(X509CertInfo.SUBJECT, CertificateSubjectName(subject))
+            info.set(X509CertInfo.ISSUER, CertificateIssuerName(subject))
+            info.set(X509CertInfo.KEY, CertificateX509Key(publicKey))
+            info.set(X509CertInfo.VERSION, CertificateVersion(CertificateVersion.V3))
+            info.set(
+                X509CertInfo.ALGORITHM_ID,
+                CertificateAlgorithmId(AlgorithmId(AlgorithmId.sha1WithRSAEncryption_oid)),
+            )
+            val certificate = X509CertImpl(info)
+            certificate.sign(privateKey, ALGORITHM)
+            return certificate
+        }
         fun encode(key: RSAPublicKey): ByteArray {
             val modulus = key.modulus
             val two32 = BigInteger.ONE.shiftLeft(32)
