@@ -1,7 +1,7 @@
 package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
-import com.ghostlock.app.adb.AdbClient
+import com.ghostlock.app.adb.LibAdbClient
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.RootChain
 import com.ghostlock.app.root.IsolatedRootShell
@@ -470,7 +470,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             return false
         }
         val channel = RootChannel()
-        val adb = AdbClient()
+        val adb = LibAdbClient(appContext)
         val chain = RootChain(
             /* The timeout the chain passes in is forwarded: dropping it is how a stalled
              * Shizuku call hung the whole run forever. */

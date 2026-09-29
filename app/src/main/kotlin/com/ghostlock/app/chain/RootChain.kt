@@ -1,6 +1,6 @@
 package com.ghostlock.app.chain
 
-import com.ghostlock.app.adb.AdbClient
+import com.ghostlock.app.adb.LibAdbClient
 import com.ghostlock.app.root.RootChannel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -188,7 +188,7 @@ class RootChain(
     private val w1: W1Runner,
     private val rootShell: RootShellLauncher,
     private val channel: RootChannel,
-    private val adb: AdbClient,
+    private val adb: LibAdbClient,
     private val onLog: (String) -> Unit,
     private val onProgress: (ChainProgress) -> Unit,
 ) {
