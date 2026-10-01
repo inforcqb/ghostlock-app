@@ -396,3 +396,30 @@ snapshot() → chainPhase()`。于是 `chainPhase()` 里一次 `AdbCommand.exec(
 
 真机实测的 `READ_PHASE` 输出（uid 2000）：第一行 `1`，第二行 `Seccomp:\t0`。
 `versionCode 534` 已装机。
+
+### 14.5 kread_min + fix-selinux.sh 成为链的一步（2026-10-01 晚，用户要求）
+
+用户：「把设备上的 kread_min.ko 和 fix-selinux.sh 加入逻辑，然后脚本运行完成之后要 rmmod kread_min」
+
+新增 `ChainStep.SELINUX_REPAIR`（Part 2，紧跟 `REMOVE_GUARD` 之后、属性恢复之前），三条命令：
+
+```sh
+insmod /data/local/tmp/gl-w1/kread_min.ko     # 提供 /proc/kread + /proc/kwrite
+sh /data/local/tmp/gl-w1/fix-selinux.sh       # 回填 selinux_state +1..+10（不碰 enforcing）
+rmmod kread_min                                # 用完就卸，不留模块
+```
+
+* **位置理由**：脚本自己的头注释写着「Run after every W1, once kread_min is loaded」；而 Part 2 里
+  最早的「有 root 且 guard 已卸」的点就是 `rmmod oplus_security_guard` 之后 —— 设备侧的
+  `cleanup-parked.sh` 同样是「先卸 OPPO 模块，再 insmod kread_min」的顺序（guard 会跟模块加载较劲）。
+* 真机验证（PJA110，2026-10-01 18:01，用 root 身份 `u:r:ksu:s0` 手工跑这三条）：
+  `insmod` 成功（`/proc/kread`、`/proc/kwrite` 出现，**在 Enforcing 下也成功**）；
+  脚本的 before/after 证明**修复确有必要**：
+  ```
+  before: ffffffff802b3f9990  01 81 89 5d 88 ff ff ff 01 00 00 01 01 00 00 00   ← +1..+7 是被 W1 砸进去的内核指针
+  after : ffffffff802b3f9990  01 00 01 01 01 01 00 00 01 00 00 01 01 00 00 00   ← 期望值，enforcing(+0)=01 未动
+  ```
+  `rmmod kread_min` 之后 `/proc/kwrite` 消失 ✓。也就是说 **ksud 重载策略并不会修这些字节**，
+  这一步不是可选的收尾。
+* 模块名核对：`kread_min.ko` 的 `.modinfo` 里是 `name=kread_min` ✓，所以 `rmmod kread_min` 正确；
+  设备上 `/system/bin/insmod`、`/system/bin/rmmod` 都在 ✓。
