@@ -301,3 +301,25 @@ adb shell id
 打开无线调试 / 连接并自检 / 忘掉配对 / 通道详情 / 端点 192.168.0.113:42509 / 日志 / 无线调试」；
 截图取色：状态卡 `#16243A`（深色主题下的"已配对蓝"）、动作卡 `#242424`、日志面板 `#0B1220`
 （与主界面日志面板同色）⇒ 主题与调色板确实生效（设备当前是深色模式）。
+
+## 13. 利用路径按 am hang 分成 Part 1 / Part 2（2026-10-01）
+
+用户定稿：「把当前利用路径替换为 part1 和 part2，不在本阶段的步骤不显示，然后通过 selinux 和
+Seccomp 判断当前阶段（以 `am hang --allow-restart` 命令分界，之前的 part1，之后是 part2，
+pre 不在规则之内）」。
+
+* `ChainStep` 现在带 `phase`：`PREFLIGHT` 为 **null**（不属于分段，永远显示）；
+  **Part 1** = `W1` + `AM_HANG`（新增独立步骤，`am hang --allow-restart` 就是分界线本身）；
+  **Part 2** = `MAGICA_ROOT`（启动 uid-0 服务）→ `OPEN_ADB_GATE` → `ADB_CONNECT` →
+  `REMOVE_GUARD` → `KSU_LATE_LOAD`。原来 `am hang` 挤在 Magica 那一步里，现在拆开，
+  分界点才和图上的步骤一一对应。
+* 阶段判定 `ChainPhaseRule.of(enforce, seccomp)`：`enforce == 0` **且** `Seccomp: 0`
+  ⇒ **PART2**（W1 留下的状态，framework 重启不会撤销），其余（enforcing / 读不到 / seccomp 非 0）
+  ⇒ **PART1**。两个事实由仓库在 `snapshot()` 里通过无线通道读
+  （`cat /sys/fs/selinux/enforce` + `/proc/self/status` 的 `Seccomp:` 行），
+  读失败或还没配对时保留上一次的值（`lastChainPhase`）—— 刚被 `am hang` 重启的实例可能还没连上通道，
+  这时退化成 PART1 会把当前那一半藏起来。阶段变化会往 logcat（`GhostlockWireless`）打一行，
+  附带它依据的两个事实。
+* UI：`RootChainStepPanel` 只渲染 `phase == null || phase == 当前阶段` 的步骤，
+  标题是「root 链路 · Part 1 / Part 2」；ViewModel 在每次 snapshot 时按当前阶段播种步骤列表，
+  所以 `am hang` 重启后重新打开 app 就能直接看到 Part 2。
