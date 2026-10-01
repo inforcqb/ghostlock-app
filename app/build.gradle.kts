@@ -92,14 +92,15 @@ android {
     val alias = properties.getProperty("KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
     val pwd = properties.getProperty("KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
     /* Signing key resolution: local.properties / environment win -- CI fills those from
-     * repository secrets -- and when they are absent the key committed in keystore/ is
-     * used instead of AGP's debug key (see keystore/README.md).
+     * repository secrets, and fetches the keystore itself from the private `ghostlock-keys`
+     * repo (a read-only deploy key does the clone) -- and when they are absent the key that
+     * used to live in keystore/ is the fallback (see keystore/README.md).
      *
      * Why: AGP generates the debug keystore fresh on every CI runner, so every build had
      * a different signature, every update needed an uninstall, and an uninstall drops the
      * app's adb key pair together with its pairing record -- which means the wireless
-     * debugging channel has to be paired again from scratch on every single build. A
-     * committed key makes `adb install -r` work between builds. */
+     * debugging channel has to be paired again from scratch on every single build. One fixed
+     * key makes `adb install -r` work between builds. */
     val secretsKeystore = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
     val repoKeystore = rootProject.file("keystore/ghostlock-dev.jks").takeIf { it.isFile && it.length() > 0L }
     val keystoreFile = secretsKeystore ?: repoKeystore
@@ -110,6 +111,13 @@ android {
         ?: if (fallbackSigning) "ghostlock" else alias
     val keyPasswordResolved = pwd?.takeIf { it.isNotEmpty() }
         ?: if (fallbackSigning) "ghostlock-dev" else pwd
+    /* One line saying which key signed the build: "did the CI actually pick up the keystore it
+     * fetched from the private repo, or did it fall back?" is the question this answers, and
+     * getting it wrong silently changes the APK's signature. */
+    println(
+        "signing: keystore=${keystoreFile?.absolutePath ?: "<none> (unsigned release!>"}" +
+            " alias=${aliasResolved ?: "-"} fallback=$fallbackSigning",
+    )
     if (keystoreFile != null) {
         signingConfigs {
             create("release") {

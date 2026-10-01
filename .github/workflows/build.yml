@@ -121,6 +121,44 @@ jobs:
           sha256sum app/src/main/jniLibs/arm64-v8a/libksud.so app/src/main/assets/device/sukisu-manager.apk
           ls -l app/src/main/jniLibs/arm64-v8a/libksud.so app/src/main/assets/device/sukisu-manager.apk
 
+      # The signing keystore lives in a PRIVATE repo (inforcqb/ghostlock-keys) so the public tree
+      # no longer carries the private key. CI clones it with a read-only deploy key held in the
+      # repository secret KEYSTORE_DEPLOY_KEY and drops it where KEYSTORE_PATH (below) points:
+      # `<repo root>/keystore.jks`. The sha256 is printed so it can be compared with the key that
+      # signed earlier releases -- a different hash means a different signature, i.e. every
+      # installed device would need an uninstall first.
+      - name: Fetch the signing keystore from the private repo
+        env:
+          KEYSTORE_DEPLOY_KEY: ${{ secrets.KEYSTORE_DEPLOY_KEY }}
+          KEYSTORE_REPO: inforcqb/ghostlock-keys
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_DEPLOY_KEY}" ]; then
+            echo "::warning::KEYSTORE_DEPLOY_KEY is not set -- falling back to whatever key the tree has; the signature may differ from previous releases"
+            exit 0
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEYSTORE_DEPLOY_KEY" > ~/.ssh/gl-keys
+          chmod 600 ~/.ssh/gl-keys
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/gl-keys -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git clone --depth 1 "git@github.com:${KEYSTORE_REPO}.git" /tmp/gl-keys
+          cp /tmp/gl-keys/ghostlock-dev.jks keystore.jks
+          echo "keystore fetched from ${KEYSTORE_REPO}:"
+          sha256sum keystore.jks
+          ls -l keystore.jks
+
+      # A release signed with nothing -- or with a freshly generated debug key -- is worse than a
+      # failed build: it looks fine and silently breaks `adb install -r` on every installed device.
+      # (Pull requests cannot read repository secrets, so they only warn.)
+      - name: Require the fetched keystore
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          set -euo pipefail
+          if [ ! -s keystore.jks ]; then
+            echo "::error::keystore.jks is missing or empty -- the private-repo fetch did not run (check the KEYSTORE_DEPLOY_KEY secret and the deploy key on inforcqb/ghostlock-keys)"
+            exit 1
+          fi
+
       - name: Build Release APK
         run: |
           export ONDK_HOME="${{ runner.temp }}/ondk"
@@ -130,6 +168,13 @@ jobs:
           export KEYSTORE_PASS="${{ secrets.KEY_STORE_PASSWORD }}"
           export KEY_ALIAS="${{ secrets.ALIAS }}"
           export KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
+          # No signing secrets are configured in this repository, so the keystore fetched above
+          # is used with the values recorded in ghostlock-keys/README.md. If secrets are ever
+          # added, they win (they are non-empty and the assignments below keep them).
+          : "${KEYSTORE_PASS:=ghostlock-dev}"
+          : "${KEY_ALIAS:=ghostlock}"
+          : "${KEY_PASSWORD:=ghostlock-dev}"
+          export KEYSTORE_PASS KEY_ALIAS KEY_PASSWORD
           ./gradlew :app:assembleRelease --no-daemon
 
       - name: Strip Ghostlock binary
