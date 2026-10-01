@@ -57,6 +57,21 @@ object WirelessPairingController {
     private const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
     private const val CONNECT_DISCOVERY_TIMEOUT_MS = 20_000L
     private const val PAIRING_TIMEOUT_MS = 60_000L
+
+    /**
+     * Total connect + self-check rounds. Retries are driven by the self-check alone: a
+     * successful self-check returns immediately, a failed one spends one of these.
+     */
+    private const val CONNECT_ATTEMPTS = 4
+
+    /**
+     * The self-check runs `id` and `cat /proc/self/status` in ONE shell call, so it opens
+     * one stream instead of two (a kicked transport turned the second stream into a 30s
+     * hang on the device), and it fails fast into the retry budget.
+     */
+    private const val SELF_CHECK_TIMEOUT_MS = 15_000L
+    private const val SELF_CHECK_COMMAND = "id; cat /proc/self/status"
+
     private const val MAX_LOG_LINES = 200
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -246,15 +261,18 @@ object WirelessPairingController {
     /**
      * Connect (or reuse a live connection) and prove the channel works.
      *
+     * Retry semantics (user-set, 2026-10-01): **four attempts in total, and only a failed
+     * self-check justifies the next one -- a successful self-check stops immediately.**
+     * Each round is exactly one connect plus one self-check; the connect itself never
+     * loops (it used to run 4 connections in a row inside `WirelessAdb.connect`, which
+     * made adbd kick three transports while the real problem was the self-check).
+     *
      * Connection discipline, straight from the device log: adbd kicks a transport when a
      * second connection shows up under the same client identity
      * (`I/adbd: kicking transport ... host-25`, then `SSL_read failed`, then
      * `ADB wifi device disconnected`), which killed the stream a self-check had just
      * opened. So: reuse a live connection whenever there is one, and when a new one is
      * really needed, close the old one *before* connecting -- never hold two.
-     *
-     * If a reused connection turns out to be dead (its transport was kicked), drop it and
-     * do exactly one fresh attempt before reporting failure.
      */
     private fun connectFlow(context: Context, alreadyBusy: Boolean = false) {
         if (!alreadyBusy) {
@@ -265,6 +283,7 @@ object WirelessPairingController {
             mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
         }
         try {
+            log("自检最多 $CONNECT_ATTEMPTS 次：只有自检失败才重试，自检成功立刻停止")
             var attempt = 0
             while (true) {
                 attempt++
@@ -273,10 +292,10 @@ object WirelessPairingController {
                     verify(context, established)
                     return
                 } catch (error: Throwable) {
-                    log("自检失败（第 $attempt 次）：${WirelessAdb.describe(error)}")
+                    log("自检失败（第 $attempt/$CONNECT_ATTEMPTS 次）：${WirelessAdb.describe(error)}")
                     closeConnection()
-                    if (attempt >= 2) throw error
-                    log("丢弃这条连接，重连一次再自检")
+                    if (attempt >= CONNECT_ATTEMPTS) throw error
+                    log("丢弃这条连接，重连后再自检（第 ${attempt + 1}/$CONNECT_ATTEMPTS 次）")
                     mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
                 }
             }
@@ -320,11 +339,14 @@ object WirelessPairingController {
 
     /** `id` + `/proc/self/status`: uid 2000 and `Seccomp: 0` are what W1 needs. */
     private fun verify(context: Context, established: AdbConnection) {
-        val identity = WirelessAdb.shell(established, "id").trim()
-        log("$ id\n$identity")
-        val status = WirelessAdb.shell(established, "cat /proc/self/status")
-        val seccomp = Regex("Seccomp:\\s*(\\d+)").find(status)?.groupValues?.get(1)?.toIntOrNull() ?: -1
-        val uid = Regex("Uid:\\s*(\\d+)").find(status)?.groupValues?.get(1).orEmpty()
+        val text = WirelessAdb.shell(established, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
+        log("$ $SELF_CHECK_COMMAND\n${text.trim()}")
+        val identity = text.lineSequence()
+            .firstOrNull { it.trimStart().startsWith("uid=") }
+            ?.trim()
+            .orEmpty()
+        val seccomp = Regex("Seccomp:\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        val uid = Regex("Uid:\\s*(\\d+)").find(text)?.groupValues?.get(1).orEmpty()
         log("通道身份：uid=$uid Seccomp=$seccomp")
         val ready = identity.contains("uid=2000") && seccomp == 0
         mutate {

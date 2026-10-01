@@ -102,11 +102,15 @@ object WirelessAdb {
     }
 
     /**
-     * Connect to adbd and finish the AUTH handshake.
+     * Connect to adbd and finish the AUTH handshake -- ONE attempt.
      *
-     * adbd needs a moment after it starts listening (and after a pairing), so the
-     * connection is retried; a failed [AdbConnection] cannot be reused, hence the fresh
-     * object per attempt. `setApi(SDK_INT)` says client and daemon are on the same device.
+     * The retry budget deliberately does NOT live here (it used to loop 4 times inside
+     * this function, and on the device that meant 4 connections in a row, each one making
+     * adbd kick a transport, even when the only thing that was actually wrong was the
+     * self-check). The caller owns the budget: connect once, run the self-check, and only
+     * a *failed self-check* justifies another attempt -- a success stops immediately.
+     *
+     * `setApi(SDK_INT)` says client and daemon are on the same device.
      *
      * IMPORTANT: do NOT call `AdbConnection.Builder.connect(...)`. In libadb 3.1.1 that
      * wrapper has the boolean inverted -- it throws "Unable to establish a new connection."
@@ -120,7 +124,7 @@ object WirelessAdb {
         context: Context,
         endpoint: AdbEndpoint,
         timeoutMs: Long = 30_000L,
-        attempts: Int = 4,
+        attempts: Int = 1,
         gapMs: Long = 2_000L,
     ): AdbConnection {
         val key = AdbKey.load(context.filesDir)
