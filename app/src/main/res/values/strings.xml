@@ -247,7 +247,5 @@
     <string name="wireless_channel_name">Wireless debugging channel</string>
     <string name="wireless_channel_description">Pairing-code input and channel state</string>
     <string name="wireless_log_title">Log</string>
-    <string name="wireless_waiting_service">Waiting for the pairing service: open \'Pair device with pairing code\' in Settings</string>
-    <string name="wireless_searching_service">Looking for the pairing port - open \'Pair device with pairing code\' in Settings</string>
     <string name="wireless_code_input_found">Pairing port %1$s found - enter the six-digit code below</string>
 </resources>
