@@ -1,4 +1,4 @@
-﻿package com.ghostlock.app.ui
+package com.ghostlock.app.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -1016,9 +1016,12 @@ internal fun AdvancedAction(
 }
 
 /**
- * The two run entries, side by side: the regular exploit run and the one-click
- * root chain. Both share the same gating (`supported`, `profileValid`, `running`),
- * and a greyed-out button still explains itself through [GhostlockActions.onProfileInvalid].
+ * The run entry: the one-click root chain, on its own.
+ *
+ * The plain "run" (the local exploit binary) was removed from this screen by request
+ * (2026-10-01) -- the chain is the supported path. The gating is unchanged (`supported`,
+ * `profileValid`, `running`), and a greyed-out button still explains itself through
+ * [GhostlockActions.onProfileInvalid].
  */
 @Composable
 private fun RunActions(
@@ -1029,31 +1032,16 @@ private fun RunActions(
     val supported = state.kernelSupported &&
         state.wirelessStatus != WirelessChannelStatus.NOT_PAIRED
     val profileValid = state.profileInvalidPaths.isEmpty()
-    Row(
+    RunButton(
+        running = state.running,
+        supported = supported,
+        profileValid = profileValid,
+        labelRes = R.string.action_root_chain,
+        runningLabelRes = R.string.action_root_chain_running,
+        onClick = actions::onRunRootChain,
+        onBlockedClick = actions::onProfileInvalid,
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        RunButton(
-            running = state.running,
-            supported = supported,
-            profileValid = profileValid,
-            labelRes = R.string.action_run,
-            onClick = actions::onRun,
-            onBlockedClick = actions::onProfileInvalid,
-            modifier = Modifier.weight(1f),
-        )
-        RunButton(
-            running = state.running,
-            supported = supported,
-            profileValid = profileValid,
-            labelRes = R.string.action_root_chain,
-            runningLabelRes = R.string.action_root_chain_running,
-            onClick = actions::onRunRootChain,
-            onBlockedClick = actions::onProfileInvalid,
-            modifier = Modifier.weight(1f),
-        )
-    }
+    )
 }
 
 @Composable
