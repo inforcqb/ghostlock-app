@@ -757,7 +757,9 @@ class RootChain(
             "kernelsu loaded"
         } != null
 
-        adb.close()
+        /* Nothing to close on the adb side: the CLI's server owns both transports and
+         * [AdbService] keeps them alive across chain runs (the root serial stays marked, so
+         * a second tap reuses it). The uid-0 channel is ours to drop. */
         channel.close()
         onLog(if (ok) "[+] root chain complete" else "[!] root chain stopped early")
         return ok

@@ -55,8 +55,8 @@ class W1Stage(private val context: Context) {
             val profileFile = File(context.filesDir, LOCAL_PROFILE)
             profileFile.writeBytes(profile)
 
-            if (!sync(engine, ChainSpec.W1_ENGINE, 0755, onLog)) return@withContext false
-            if (!sync(profileFile, ChainSpec.W1_PROFILE, 0644, onLog)) return@withContext false
+            if (!sync(engine, ChainSpec.W1_ENGINE, "755", onLog)) return@withContext false
+            if (!sync(profileFile, ChainSpec.W1_PROFILE, "644", onLog)) return@withContext false
 
             val started = AdbCommand.exec(
                 ChainSpec.W1_START,
@@ -140,25 +140,25 @@ class W1Stage(private val context: Context) {
     private suspend fun sync(
         source: File,
         remote: String,
-        mode: Int,
+        mode: String,
         onLog: (String) -> Unit,
     ): Boolean {
         val local = sha256(source)
-        val remoteSha = remoteSha(remote)
-        if (local == remoteSha) {
+        val onDevice = remoteSha(remote)
+        if (local == onDevice) {
             onLog("[*] 已同步 ${remote.substringAfterLast('/')}（sha256 一致，跳过推送）")
             return true
         }
         onLog(
             "[*] 推送 ${source.name} -> $remote" +
-                if (remoteSha.isEmpty()) "（设备上没有）" else "（设备上是 ${remoteSha.take(12)}…）",
+                if (onDevice.isEmpty()) "（设备上没有）" else "（设备上是 ${onDevice.take(12)}…）",
         )
         if (!AdbCommand.push(source.absolutePath, remote, onLog)) {
             onLog("[!] 推送失败：${source.absolutePath} -> $remote")
             return false
         }
         val chmod = AdbCommand.exec(
-            "chmod ${Integer.toOctalString(mode)} $remote",
+            "chmod $mode $remote",
             retries = 2,
             timeoutMs = 20_000,
             onLog = null,
