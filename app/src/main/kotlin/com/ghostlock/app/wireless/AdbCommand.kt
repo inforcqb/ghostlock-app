@@ -1,6 +1,8 @@
 package com.ghostlock.app.wireless
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * `adb_command` -- the only API the app uses to talk to adbd.
@@ -41,14 +43,20 @@ object AdbCommand {
         retries: Int = DEFAULT_RETRIES,
         timeoutMs: Long = DEFAULT_TIMEOUT_MS,
         onLog: ((String) -> Unit)? = null,
-    ): AdbService.Result = AdbService.exec(
-        command = command,
-        timeoutMs = timeoutMs,
-        rounds = retries,
-        onLog = onLog ?: AdbService.defaultLogger(),
-    )
+    ): AdbService.Result = withContext(Dispatchers.IO) {
+        /* The CLI and the platform resolver block; the chain calls this from the main
+         * dispatcher, so the blocking belongs here and not on the caller's thread. */
+        AdbService.exec(
+            command = command,
+            timeoutMs = timeoutMs,
+            rounds = retries,
+            onLog = onLog ?: AdbService.defaultLogger(),
+        )
+    }
 
     /** Make sure the channel exists and answers a round trip. */
     suspend fun ensure(retries: Int = DEFAULT_RETRIES, onLog: ((String) -> Unit)? = null): Boolean =
-        AdbService.ensure(rounds = retries, onLog = onLog ?: AdbService.defaultLogger())
+        withContext(Dispatchers.IO) {
+            AdbService.ensure(rounds = retries, onLog = onLog ?: AdbService.defaultLogger())
+        }
 }

@@ -37,6 +37,12 @@ object AdbService {
     private const val GAP_MS = 800L
     private const val SERVICE_CONNECT = "_adb-tls-connect"
     private const val SERVICE_PAIRING = "_adb-tls-pairing"
+    private const val CONNECT_ROUNDS = 3
+    private const val CONNECT_ROUND_GAP_MS = 1_500L
+    private const val NSD_CONNECT_TIMEOUT_MS = 6_000L
+
+    @Volatile
+    private var appContext: Context? = null
 
     /** What a command produced; [transportFailure] means it never ran. */
     data class Result(val exitCode: Int, val output: String) {
@@ -66,6 +72,7 @@ object AdbService {
     private var everConnected = false
 
     fun attach(context: Context) {
+        appContext = context.applicationContext
         if (cli == null) {
             val created = AdbCli(context.applicationContext)
             cli = created
@@ -98,10 +105,10 @@ object AdbService {
         timeoutMs: Long,
         rounds: Int,
         onLog: (String) -> Unit,
-    ): Result {
+    ): Result = withContext(Dispatchers.IO) {
         val repeatable = ChainSpec.NON_IDEMPOTENT.none { command.contains(it) }
         val attempts = if (repeatable) rounds.coerceAtLeast(1) else 1
-        return gate.withLock {
+        gate.withLock {
             var round = 0
             var last = "原因不明"
             while (round < attempts) {
@@ -181,28 +188,34 @@ object AdbService {
 
     /** Connect to the advertised `_adb-tls-connect` endpoint; false when none worked. */
     fun connectAdvertised(onLog: (String) -> Unit): Boolean {
-        val candidates = cli()?.mdnsServices()
-            ?.filter { it.serviceType == SERVICE_CONNECT }
-            ?.map { it.endpoint }
-            ?.distinct()
-            .orEmpty()
-        if (candidates.isEmpty()) {
-            onLog("[!] 还没有发现无线调试端点：请确认「无线调试」已打开，并先在「打开无线调试」里完成配对")
-            return false
-        }
-        for (endpoint in candidates) {
-            val result = cli()?.connect(endpoint) ?: return false
-            val message = result.output.trim().ifBlank { "exit=${result.exitCode}" }
-            if (cli()?.stateOf(endpoint) == "device") {
-                serial = endpoint
-                everConnected = true
-                onLog("[*] 已连上 $endpoint")
-                liveness?.invoke(true)
-                return true
+        val context = appContext ?: return false
+        for (round in 1..CONNECT_ROUNDS) {
+            /* The platform resolver first: the CLI's mDNS listing is a cache and still shows
+             * ports adbd has already moved away from (measured: three stale ones after a
+             * pairing, while the live port was a fresh one that was not in the list yet). */
+            val fresh = NsdPairingFinder.find(context, NSD_CONNECT_TIMEOUT_MS, NsdPairingFinder.CONNECT)
+            val fromCli = cli()?.mdnsServices()
+                ?.filter { it.serviceType == SERVICE_CONNECT }
+                ?.map { it.endpoint }
+                .orEmpty()
+            val candidates = (listOfNotNull(fresh) + fromCli).distinct()
+            if (candidates.isEmpty()) {
+                onLog("[!] 第$round/$CONNECT_ROUNDS 次：还没发现无线调试端点（无线调试是否已打开？）")
             }
-            onLog("[!] 连接 $endpoint 失败：$message")
+            for (endpoint in candidates) {
+                val result = cli()?.connect(endpoint) ?: return false
+                if (cli()?.stateOf(endpoint) == "device") {
+                    serial = endpoint
+                    everConnected = true
+                    onLog("[*] 已连上 $endpoint")
+                    liveness?.invoke(true)
+                    return true
+                }
+                onLog("[!] 连接 $endpoint 失败：${result.output.trim().ifBlank { "exit=${result.exitCode}" }}")
+            }
+            if (round < CONNECT_ROUNDS) Thread.sleep(CONNECT_ROUND_GAP_MS)
         }
-        onLog("[!] 所有候选端点都没连上：请确认本机已完成配对（配对码是否输过），并保持无线调试开启")
+        onLog("[!] 没有连上的端点：请确认本机已配对（输过 6 位配对码）并保持无线调试开启")
         return false
     }
 

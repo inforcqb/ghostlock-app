@@ -15,10 +15,11 @@ import java.util.concurrent.atomic.AtomicReference
  * though the pairing dialog is open. The platform resolver answers immediately in that case.
  */
 object NsdPairingFinder {
-    private const val SERVICE_TYPE = "_adb-tls-pairing._tcp"
+    const val PAIRING = "_adb-tls-pairing._tcp"
+    const val CONNECT = "_adb-tls-connect._tcp"
 
-    /** `host:port` of the first resolved pairing service, or null within [timeoutMs]. */
-    fun find(context: Context, timeoutMs: Long): String? {
+    /** `host:port` of the first resolved service, or null within [timeoutMs]. */
+    fun find(context: Context, timeoutMs: Long, serviceType: String = PAIRING): String? {
         val manager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return null
         val found = AtomicReference<String?>(null)
         val latch = CountDownLatch(1)
@@ -46,7 +47,7 @@ object NsdPairingFinder {
             }
         }
         return try {
-            manager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+            manager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
             if (latch.await(timeoutMs, TimeUnit.MILLISECONDS)) found.get() else null
         } catch (_: Throwable) {
             null
