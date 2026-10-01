@@ -282,3 +282,22 @@ adb shell id
 且 `gl-engine`/`gl-profile.bin` 被清理 —— 因此**不能断定**是引擎崩溃：也可能是那次清理脚本把 park 进程
 与文件一起删了。复跑一次（重新点「一键 root」）即可区分：成功时日志里应出现 `Write 1 complete`，
 并且 `pidof gl-engine` 有 pid、SELinux 变 Permissive。
+
+## 12. 无线调试界面改成本 app 的主题（2026-10-01）
+
+用户反馈：点开无线调试那个界面「太单调」。原来它是 Android 原生控件堆出来的诊断页
+（`TextView`/`Button`/`ScrollView`），和 app 的 miuix 主题完全无关。现在：
+
+* `ui/wireless/WirelessScreen.kt`（新）：Compose + `MiuixTheme(light/darkColorScheme())`，
+  结构是「状态卡 → 动作卡 → 手动配对码卡（仅通知不可用时）→ 通道详情卡 → 日志面板」；
+* 状态卡沿用主界面激活卡的调色板：**未配对=琥珀**（`#FFF1D6`/`#3B2715`）、**已配对=蓝**
+  （`#DCE9FF`/`#16243A`）、**通道就绪=绿**（`#DFFAE4`/`#173923`），右下角是同一个大状态图标；
+* 日志复用主界面的 `LogPanel`（`GhostlockUi.kt` 里由 `private` 改 `internal`），
+  `FormatLogUseCase` 把引擎输出解析成 tone 再映射成同一套颜色，并加了复制按钮；
+* `WirelessDebuggingActivity` 只留宿主职责：状态（`mutableStateOf` + `WirelessStateListener`）、
+  通知权限、系统栏，其余全在 `WirelessScreen` 里。
+
+真机验证（PJA110，versionCode 524）：`uiautomator dump` 里能看到「已配对 / 已配对。点「连接并自检」/
+打开无线调试 / 连接并自检 / 忘掉配对 / 通道详情 / 端点 192.168.0.113:42509 / 日志 / 无线调试」；
+截图取色：状态卡 `#16243A`（深色主题下的"已配对蓝"）、动作卡 `#242424`、日志面板 `#0B1220`
+（与主界面日志面板同色）⇒ 主题与调色板确实生效（设备当前是深色模式）。
