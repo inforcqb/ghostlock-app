@@ -323,3 +323,38 @@ pre 不在规则之内）」。
 * UI：`RootChainStepPanel` 只渲染 `phase == null || phase == 当前阶段` 的步骤，
   标题是「root 链路 · Part 1 / Part 2」；ViewModel 在每次 snapshot 时按当前阶段播种步骤列表，
   所以 `am hang` 重启后重新打开 app 就能直接看到 Part 2。
+
+## 14. 防呆、属性恢复、主界面精简（2026-10-01）
+
+### 14.1 预检里的防呆：已经有 root 就不跑链
+
+`PREFLIGHT` 现在多做一件事：通过同一条 uid-2000 通道跑 `su -c id`（`ChainSpec.SU_PROBE`，
+20s 预算）。拿到干净的 `uid=0` 就**当场结束并报成功**，不做 W1、不 `am hang`：
+
+```
+[+] 预检：`su -c id` 拿到了 uid=0 ⇒ 本机已有 root，不必执行利用链
+[+] root 可用（su -c id 返回 uid=0）—— 利用链已跳过，没有伪造任何内核状态。
+```
+
+理由：这条链每一步都在改内核状态（伪造 waiter、挂 system_server、重启 adbd），在已经拿到 root
+的机器上跑它只有代价没有收益。判据只认「干净 uid=0」：命令没跑（通道失败）、超时、退出码非 0 都按
+「没有 root」处理 —— 这个方向的误判只是多跑一次链，反向误判会让用户什么都拿不到。
+（如果希望这种情况报"异常"而不是"成功"，改 `run()` 里那一处的返回值即可。）
+
+### 14.2 rmmod → ksud 之间的属性恢复（新步骤）
+
+新增 `ChainStep.HARDEN_PROPS`（Part 2，位于 `REMOVE_GUARD` 与 `KSU_LATE_LOAD` 之间）。
+窗口是用户给的：安全模块已经卸载、ksud 还没重新加载策略，此时 `resetprop` 可用。
+命令按顺序逐条执行并通过 root adbd 执行（`resetprop` 在 adb root shell 的 PATH 里，用户的
+`resetprop --help` 就是在 `:/ #` 里跑的）：
+
+| # | 命令 | 作用 |
+|---|---|---|
+| 1 | `resetprop -c u:object_r:userdebug_or_eng_prop:s0` | **重建** `ro.secure`/`ro.debuggable` 所在的属性区（`-c/--rebuild`），否则后面的写入可能被该区的状态吞掉 |
+| 2 | `resetprop ro.secure 1` | 恢复 ro.secure |
+| 3 | `resetprop ro.debuggable 0` | 恢复 ro.debuggable |
+| 4 | `echo 0 > /proc/sys/fs/suid_dumpable` | 恢复 suid_dumpable |
+| 5 | `resetprop -c` | 不带名字 = 重建**全部**属性区（收尾） |
+
+每条命令的退出码都会打日志；**失败不阻断**后面的 `ksud late-load`（那才是持久 root 的来源），
+只把失败条数与命令名报出来。

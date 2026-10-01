@@ -108,3 +108,5 @@ Magica 内部自己做的事（`ro.debuggable`、`service.adb.root`、adbd patch
   `cleanup-w1.sh` + `cleanup-parked.sh`（W1 park 的安全网；链本身不做收尾）。
 * **进行中**：app 内一键集成（Shizuku 跑 W1 + 搬 Magica + app 内 adb 客户端）。
   设计见 `docs/analysis/root-chain-integration.md`；命令集严格按 §1。
+
+> 2026-10-01 补充：mmod oplus_security_guard 之后、ksud late-load 之前新增一步属性恢复（esetprop -c <userdebug_or_eng_prop 区> → o.secure 1 → o.debuggable 0 → suid_dumpable=0 → esetprop -c），见 wireless-debugging-pairing.md §14.2；PREFLIGHT 也会先用 su -c id 判断本机是否已有 root，有则整链跳过。
