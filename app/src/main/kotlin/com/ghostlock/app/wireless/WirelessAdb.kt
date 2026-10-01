@@ -215,18 +215,26 @@ object WirelessAdb {
      * do (`redirectErrorStream(true)`). This is the adb equivalent of "the exit code the
      * user service reported".
      *
-     * A missing probe line means the command never finished: that is
+     * The bare `echo` before the marker is not decoration: `cat /sys/fs/selinux/enforce`
+     * prints WITHOUT a trailing newline, so `echo $marker$?` used to land on the same line
+     * as the output ("1__GHOSTLOCK_EXIT__0"); the line-based parse then missed the marker
+     * and a perfectly good command was reported as a channel failure. The newline is forced
+     * here, and the parse below tolerates the marker appearing anywhere in the last line.
+     *
+     * A missing marker means the command never finished: that is
      * [ChainSpec.TRANSPORT_FAILURE], never an empty output.
      */
     fun shellWithExitCode(connection: AdbConnection, command: String, timeoutMs: Long): ShellOutcome {
         val marker = "__GHOSTLOCK_EXIT__"
-        val raw = shell(connection, "{ $command ; } 2>&1; echo $marker\$?", timeoutMs)
-        val lines = raw.split('\n')
-        val index = lines.indexOfLast { it.trim().startsWith(marker) }
+        val raw = shell(connection, "{ $command ; } 2>&1; echo; echo $marker\$?", timeoutMs)
+        val index = raw.lastIndexOf(marker)
         if (index < 0) return ShellOutcome(ChainSpec.TRANSPORT_FAILURE, raw.trim())
-        val code = lines[index].trim().removePrefix(marker).trim().toIntOrNull()
+        val code = raw.substring(index + marker.length)
+            .trim()
+            .takeWhile { it.isDigit() || it == '-' }
+            .toIntOrNull()
             ?: ChainSpec.TRANSPORT_FAILURE
-        return ShellOutcome(code, lines.take(index).joinToString("\n").trim())
+        return ShellOutcome(code, raw.substring(0, index).trim())
     }
 
     fun closeQuietly(connection: AdbConnection?) {

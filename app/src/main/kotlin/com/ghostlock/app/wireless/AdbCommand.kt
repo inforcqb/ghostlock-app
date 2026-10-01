@@ -11,33 +11,25 @@ import kotlinx.coroutines.sync.withLock
  * `adb_command` -- the single entry point for talking to adbd.
  *
  * **One command, one channel.** Every call opens its own connection and releases it
- * completely before returning, so no session is ever carried between commands. That is a
- * deliberate change of model, because holding a session kept failing on the device:
+ * completely before returning, so no session is ever carried between commands. Holding a
+ * session kept failing on the device: adbd kicks a transport when a second connection
+ * appears under the same client identity, and a kicked transport still looks *connected* to
+ * libadb (`isConnected`/`isConnectionEstablished` stay true) while its reader never
+ * delivers again, so the next command either hung or died with `Stream closed.` on the
+ * freshly opened stream.
  *
- *  * adbd kicks a transport when a second connection appears under the same client
- *    identity (`I/adbd: kicking transport ... host-25`, `SSL read failed`,
- *    `ADB wifi device disconnected`). Reusing a session therefore meant "hold a session
- *    that adbd may kick at any moment", and a kicked transport looks *connected* to libadb
- *    (`isConnected`/`isConnectionEstablished` stay true) while its reader never delivers
- *    again -- so the next command either hung until its watchdog or died with
- *    `Stream closed.` on the freshly opened stream;
- *  * the device log showed exactly that cascade: `复用已有连接` -> probe says the session is
- *    dead -> fresh connection -> `Stream closed.` again, command after command.
+ * **It blocks and verifies instead of handing failures back.** A command is only started on
+ * a channel that has just answered a round trip, and if that channel dies mid-command the
+ * facade waits, opens another one and tries again -- up to [retries] rounds (default
+ * [DEFAULT_RETRIES]) and up to [CHANNEL_READY_BUDGET_MS] per round just to get a usable
+ * channel. Callers therefore never see a transient channel hiccup; a returned
+ * [ChainSpec.TRANSPORT_FAILURE] means the facade really ran out of options.
  *
- * Opening a connection per command is what `adb shell cmd` itself does, and it makes the
- * lifecycle trivial: connect, run, close. A short settle between the release and the next
- * connect ([RELEASE_SETTLE_MS]) keeps adbd from seeing the new connection as a duplicate of
- * one it has not finished tearing down.
- *
- * ## Retries
- *
- * [exec]'s second parameter is the retry count for **channel** failures -- a connect that
- * did not happen, or a stream that died without ever reporting an exit code. It defaults to
- * [DEFAULT_RETRIES]. Safety is enforced here, not left to the caller: a command that
- * appears in [ChainSpec.NON_IDEMPOTENT] (`am hang --allow-restart`,
- * `rmmod oplus_security_guard`, `/data/adb/ksud late-load`, the two `setprop`s) is **never**
- * repeated, because a failed read may mean the command did run and running those twice is
- * worse than stopping. Those return [ChainSpec.TRANSPORT_FAILURE] on the first failure.
+ * **Safety is enforced here, not left to callers.** A command whose text appears in
+ * [ChainSpec.NON_IDEMPOTENT] (`am hang --allow-restart`, `rmmod oplus_security_guard`,
+ * `/data/adb/ksud late-load`, the two `setprop`s) is never repeated: a failed read may mean
+ * the command DID run, and running those twice is worse than stopping. It is verified once
+ * and executed exactly once.
  *
  * Usage: [attach] once from the application, then `AdbCommand.exec(command)` or
  * `AdbCommand.exec(command, retries)`.
@@ -48,18 +40,23 @@ object AdbCommand {
 
     const val DEFAULT_TIMEOUT_MS = 30_000L
 
-    /** Pause between a full release and the next connect, so adbd sees no duplicate. */
-    private const val RELEASE_SETTLE_MS = 500L
+    /**
+     * How long one round may spend getting a *usable* channel (connect + round-trip probe,
+     * repeated). This is the "block internally" part: a flaky wireless-debugging endpoint
+     * gets time to come back instead of failing the caller on the first try.
+     */
+    private const val CHANNEL_READY_BUDGET_MS = 20_000L
 
-    /** Pause between two attempts that failed before running anything. */
-    private const val CONNECT_GAP_MS = 1_500L
+    /** Pause between two channel attempts (and after a failed command, before retrying). */
+    private const val CHANNEL_GAP_MS = 800L
 
     private const val DISCOVERY_TIMEOUT_MS = 20_000L
 
-    /**
-     * The self-check, as ONE shell call: `id` for the identity and `/proc/self/status` for
-     * `Seccomp`.
-     */
+    /** The round trip that proves a fresh connection is actually usable. */
+    private const val PROBE_COMMAND = "true"
+    private const val PROBE_TIMEOUT_MS = 5_000L
+
+    /** The self-check: `id` for the identity, `/proc/self/status` for `Seccomp`. */
     const val SELF_CHECK_COMMAND = "id; cat /proc/self/status"
     const val SELF_CHECK_TIMEOUT_MS = 15_000L
 
@@ -92,10 +89,11 @@ object AdbCommand {
     }
 
     /**
-     * Run one command on its own fresh channel.
+     * Run one command on its own fresh, verified channel.
      *
-     * @param retries how often a *channel* failure may be retried; a non-repeatable command
-     *   (see [ChainSpec.NON_IDEMPOTENT]) is never retried regardless of this value.
+     * @param retries how many rounds (channel failure -> wait -> new channel -> try again)
+     *   are allowed. A non-repeatable command (see [ChainSpec.NON_IDEMPOTENT]) uses exactly
+     *   one round regardless of this value.
      * @param timeoutMs how long the command itself may take.
      * @param onLog where the command, its output and the channel diagnostics go; defaults to
      *   the sink registered with [setLogger].
@@ -112,22 +110,22 @@ object AdbCommand {
             log("[!] adb_command 尚未初始化，命令没有运行：$command")
             return Result(ChainSpec.TRANSPORT_FAILURE, "")
         }
-        val attempts = retries.coerceAtLeast(1)
-        /* A command that must not run twice is never retried -- a failed read may mean it ran. */
         val repeatable = ChainSpec.NON_IDEMPOTENT.none { command.contains(it) }
+        val rounds = if (repeatable) retries.coerceAtLeast(1) else 1
         return gate.withLock {
-            var attempt = 0
+            var round = 0
             var last = "原因不明"
-            while (attempt < attempts) {
-                attempt++
+            while (round < rounds) {
+                round++
                 log("$ $command")
+                /* Verified before the command runs: this is what keeps a non-repeatable
+                 * command from being fired into a channel that is already dying. */
                 val connection = try {
-                    open(context, attempt, attempts, log)
+                    openVerified(context, log)
                 } catch (error: Throwable) {
                     last = WirelessAdb.describe(error)
-                    log("[!] 通道不可用 第$attempt/$attempts 次：$last")
-                    if (!repeatable || attempt >= attempts) break
-                    delay(CONNECT_GAP_MS)
+                    log("[!] 通道不可用 第$round/$rounds 轮：$last")
+                    if (round < rounds) delay(CHANNEL_GAP_MS)
                     continue
                 }
                 try {
@@ -140,15 +138,15 @@ object AdbCommand {
                 } catch (error: Throwable) {
                     last = WirelessAdb.describe(error)
                 } finally {
-                    /* Complete release: nothing of this attempt survives into the next one. */
+                    /* Complete release: nothing of this round survives into the next one. */
                     WirelessAdb.closeQuietly(connection)
                 }
-                log("[!] 第$attempt/$attempts 次失败：$last")
+                log("[!] 第$round/$rounds 轮失败：$last")
                 if (!repeatable) {
                     log("[!] 该命令不允许重复执行，停止")
                     break
                 }
-                if (attempt < attempts) delay(RELEASE_SETTLE_MS)
+                if (round < rounds) delay(CHANNEL_GAP_MS)
             }
             log("[!] 命令未能执行：$last")
             Result(ChainSpec.TRANSPORT_FAILURE, "")
@@ -159,8 +157,8 @@ object AdbCommand {
      * Make sure a channel can be opened and prove it with the self-check.
      *
      * Used before the chain starts: pairing is the standing authorization, so "paired but not
-     * connected yet" is normal. The self-check is idempotent, so this retries the whole
-     * connect + self-check cycle up to [retries] times.
+     * connected yet" is normal. The self-check is idempotent, so the whole cycle is repeated
+     * on the same round budget.
      */
     suspend fun ensure(retries: Int = DEFAULT_RETRIES, onLog: ((String) -> Unit)? = null): Boolean {
         val log = onLog ?: logger
@@ -169,16 +167,17 @@ object AdbCommand {
             log("[!] adb_command 尚未初始化")
             return false
         }
-        val attempts = retries.coerceAtLeast(1)
+        val rounds = retries.coerceAtLeast(1)
         return gate.withLock {
-            var attempt = 0
-            while (attempt < attempts) {
-                attempt++
+            var round = 0
+            while (round < rounds) {
+                round++
+                /* No separate probe here: the self-check IS the verification. */
                 val connection = try {
-                    open(context, attempt, attempts, log)
+                    open(context, round, rounds, log)
                 } catch (error: Throwable) {
-                    log("[!] 通道不可用 第$attempt/$attempts 次：${WirelessAdb.describe(error)}")
-                    if (attempt < attempts) delay(CONNECT_GAP_MS)
+                    log("[!] 连接失败 第$round/$rounds 轮：${WirelessAdb.describe(error)}")
+                    if (round < rounds) delay(CHANNEL_GAP_MS)
                     continue
                 }
                 try {
@@ -197,13 +196,13 @@ object AdbCommand {
                         log("[*] 通道就绪：$identity Seccomp=${seccomp ?: "?"}")
                         return@withLock true
                     }
-                    log("[!] 自检没有返回 第$attempt/$attempts 次")
+                    log("[!] 自检没有返回 第$round/$rounds 轮")
                 } catch (error: Throwable) {
-                    log("[!] 自检失败 第$attempt/$attempts 次：${WirelessAdb.describe(error)}")
+                    log("[!] 自检失败 第$round/$rounds 轮：${WirelessAdb.describe(error)}")
                 } finally {
                     WirelessAdb.closeQuietly(connection)
                 }
-                if (attempt < attempts) delay(RELEASE_SETTLE_MS)
+                if (round < rounds) delay(CHANNEL_GAP_MS)
             }
             log("[!] 无线调试通道不可用")
             false
@@ -212,11 +211,46 @@ object AdbCommand {
 
     // ---------------------------------------------------------------- internals
 
-    /** Open one connection, on its own. Callers hold [gate] and must close what they get. */
+    /**
+     * A fresh connection that has answered a round trip. Callers hold [gate].
+     *
+     * Keeps trying until [CHANNEL_READY_BUDGET_MS] runs out: a connect that fails, or a probe
+     * that does not come back, means "this channel is not usable yet" -- not "the caller's
+     * command failed" -- so it is retried here rather than returned upward.
+     */
+    private suspend fun openVerified(context: Context, onLog: (String) -> Unit): AdbConnection {
+        val deadline = System.currentTimeMillis() + CHANNEL_READY_BUDGET_MS
+        var attempt = 0
+        var last: Throwable? = null
+        while (true) {
+            attempt++
+            try {
+                val connection = open(context, attempt, 0, onLog)
+                if (probe(connection)) {
+                    onLog("[*] 通道验证通过")
+                    return connection
+                }
+                WirelessAdb.closeQuietly(connection)
+                last = IllegalStateException("通道探针没有返回")
+                onLog("[*] 通道探针没有返回，换一条通道")
+            } catch (error: Throwable) {
+                last = error
+                onLog("[*] 连接失败：${WirelessAdb.describe(error)}")
+            }
+            if (System.currentTimeMillis() >= deadline) break
+            delay(CHANNEL_GAP_MS)
+        }
+        throw IllegalStateException(
+            "在 ${CHANNEL_READY_BUDGET_MS / 1000}s 内没有拿到可用通道：${WirelessAdb.describe(last)}",
+            last,
+        )
+    }
+
+    /** One connect, no retry. [rounds] of 0 means "part of openVerified's own loop". */
     private suspend fun open(
         context: Context,
         attempt: Int,
-        attempts: Int,
+        rounds: Int,
         onLog: (String) -> Unit,
     ): AdbConnection {
         val endpoint = WirelessAdb.discover(
@@ -226,11 +260,17 @@ object AdbCommand {
         ) ?: throw IllegalStateException(
             "没有发现 ${WirelessAdb.SERVICE_CONNECT}，无线调试打开了吗",
         )
-        onLog("[*] 连接 $endpoint 第$attempt/$attempts 次")
+        val suffix = if (rounds > 0) " 第$attempt/$rounds 轮" else " 第$attempt 次"
+        onLog("[*] 连接 $endpoint$suffix")
         val connection = WirelessAdb.connect(context, endpoint)
         onLog("[*] adb 已连接")
         return connection
     }
+
+    /** A trivial round trip: the only way to know a fresh channel really works. */
+    private fun probe(connection: AdbConnection): Boolean = runCatching {
+        WirelessAdb.shellWithExitCode(connection, PROBE_COMMAND, PROBE_TIMEOUT_MS).exitCode == 0
+    }.getOrDefault(false)
 
     private fun logOutput(output: String, onLog: (String) -> Unit) {
         val lines = output.lineSequence().filter { it.isNotBlank() }.toList()

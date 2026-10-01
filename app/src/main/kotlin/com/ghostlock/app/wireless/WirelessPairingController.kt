@@ -58,13 +58,6 @@ object WirelessPairingController {
     private const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
     private const val PAIRING_TIMEOUT_MS = 60_000L
 
-    /**
-     * Total connect + self-check rounds. Retries are driven by the self-check alone: a
-     * successful self-check returns immediately, a failed one spends one of these. The
-     * connection itself lives in [AdbCommand] and never loops per command.
-     */
-    private const val CONNECT_ATTEMPTS = 4
-
     private const val MAX_LOG_LINES = 200
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -303,18 +296,12 @@ object WirelessPairingController {
     }
 
     /**
-     * Prove the channel works, retrying only when the self-check fails.
+     * Prove the channel works.
      *
-     * Retry semantics (user-set, 2026-10-01): **four attempts in total, and only a failed
-     * self-check justifies the next one -- a successful self-check stops immediately.**
-     *
-     * The connection is [AdbCommand]'s business, not this function's: it reuses a live
-     * session when there is one and drops a session that failed, so a round here never
-     * creates a second connection. That matters because adbd kicks a transport when a
-     * second connection shows up under the same client identity
-     * (`I/adbd: kicking transport ... host-25`, then `SSL_read failed`, then
-     * `ADB wifi device disconnected`) -- which is what used to break the run right after a
-     * successful self-check.
+     * All the retrying lives in [AdbCommand] now: it blocks until a fresh channel answers a
+     * round trip, retries a failed command on another channel, and only then reports
+     * failure. This function just shows the result, so a channel hiccup no longer surfaces
+     * as "connect failed" in the UI.
      */
     private suspend fun connectFlow(context: Context, alreadyBusy: Boolean = false) {
         if (!alreadyBusy) {
@@ -325,20 +312,7 @@ object WirelessPairingController {
             mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
         }
         try {
-            log("自检最多 $CONNECT_ATTEMPTS 次，失败才重试")
-            var attempt = 0
-            while (true) {
-                attempt++
-                try {
-                    verify(context)
-                    return
-                } catch (error: Throwable) {
-                    log("自检失败 第$attempt/$CONNECT_ATTEMPTS 次：${WirelessAdb.describe(error)}")
-                    if (attempt >= CONNECT_ATTEMPTS) throw error
-                    log("重新自检 第${attempt + 1}/$CONNECT_ATTEMPTS 次")
-                    mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
-                }
-            }
+            verify(context)
         } catch (error: Throwable) {
             markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
         } finally {
