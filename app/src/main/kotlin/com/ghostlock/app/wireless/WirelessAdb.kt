@@ -36,10 +36,10 @@ object WirelessAdb {
     const val TAG = "GhostlockWireless"
 
     /** `_adb-tls-pairing._tcp`: only advertised while the pairing dialog is open. */
-    const val SERVICE_PAIRING: String = AdbMdns.SERVICE_TYPE_TLS_PAIRING
+    val SERVICE_PAIRING: String = AdbMdns.SERVICE_TYPE_TLS_PAIRING
 
     /** `_adb-tls-connect._tcp`: advertised while wireless debugging is on. */
-    const val SERVICE_CONNECT: String = AdbMdns.SERVICE_TYPE_TLS_CONNECT
+    val SERVICE_CONNECT: String = AdbMdns.SERVICE_TYPE_TLS_CONNECT
 
     /**
      * mDNS discovery of one service type.

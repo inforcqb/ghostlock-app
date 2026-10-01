@@ -126,6 +126,15 @@ object WirelessNotifications {
 
     private fun notify(context: Context, id: Int, notification: Notification) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        /* Explicit guard next to the call: posting without the runtime permission throws
+         * on API 33+, and keeping the check here also keeps lint's permission analysis
+         * satisfied at every call site. */
+        if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(WirelessAdb.TAG, "notifications are not permitted; dropping notification $id")
+            return
+        }
         runCatching { manager.notify(id, notification) }
             .onFailure { Log.w(WirelessAdb.TAG, "notify($id) failed: ${it.message}") }
     }
