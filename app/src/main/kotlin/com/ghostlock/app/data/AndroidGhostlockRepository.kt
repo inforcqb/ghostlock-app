@@ -448,11 +448,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             /* The timeout the chain passes in is forwarded: dropping it is how a stalled
              * call hung the whole run forever. */
             shell = { command, timeoutMs ->
-                WirelessPairingController.execChainCommand(appContext, command, timeoutMs, onLog)
+                WirelessPairingController.execChainCommand(command, timeoutMs, onLog)
             },
             /* W1 is the frozen device-side command (`sh /data/local/tmp/gl-w1/w1.sh`); the
              * app no longer needs to push a blob or bind a user service to run it. */
-            w1 = { log -> WirelessPairingController.runW1OnChannel(appContext, log) },
+            w1 = { log -> WirelessPairingController.runW1OnChannel(log) },
             /* The uid-0 channel is this app's own service now, started by binding it as an
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user

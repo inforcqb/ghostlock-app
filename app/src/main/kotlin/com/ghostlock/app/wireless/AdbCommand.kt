@@ -6,47 +6,65 @@ import io.github.muntashirakon.adb.AdbConnection
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * The single entry point for talking to adbd.
+ * `adb_command` -- the single entry point for talking to adbd.
  *
  * Nothing else in the app owns a connection: the channel self-check, the one-click chain
- * and the screen's buttons all call [exec] and let this object decide when to connect,
- * when to reuse and when to drop the session. That is what makes the channel manageable,
- * because the failure modes here are all about *who holds the socket*:
+ * and the screen's buttons all run commands through here, and this object decides when to
+ * connect, when to reuse and when to drop the session. That is what makes the channel
+ * manageable, because every failure mode here is about *who holds the socket*:
  *
  *  * **one session at a time.** adbd kicks a transport when a second connection appears
  *    under the same client identity (measured on the PJA110: `I/adbd: kicking transport
- *    ... host-25`, then `SSL_read failed`, then `ADB wifi device disconnected`). Two live
+ *    ... host-25`, then `SSL read failed`, then `ADB wifi device disconnected`). Two live
  *    connections are therefore not "two channels", they are a race that kills both -- which
  *    is exactly what happened when a completed self-check held a connection and the next
  *    tap tried to build another one;
  *  * **commands are serialised** on a mutex, so a chain step and a UI tap cannot interleave
  *    into that race;
- *  * **dead sessions are closed here.** A kicked transport leaves libadb's connection
- *    "connected" as far as its flags go while its reader never delivers again; detecting
- *    that (hung read, `Stream closed.`, missing exit probe) and closing it means the next
- *    command reconnects instead of reading from a corpse;
- *  * **connecting may be retried, a command may not.** A failed connect proves nothing ran,
- *    so [CONNECT_TRIES] attempts are safe. A failed read may well mean the command DID run
- *    -- repeating `am hang --allow-restart`, `rmmod oplus_security_guard` or
- *    `/data/adb/ksud late-load` is worse than stopping -- so a command is never retried
- *    here. The failure is reported as [ChainSpec.TRANSPORT_FAILURE] and the chain's
- *    `NON_IDEMPOTENT` policy decides what may be repeated.
+ *  * **dead sessions are closed here**, so the next command reconnects instead of reading
+ *    from a corpse;
+ *  * **the retry count covers CHANNEL failures only.** A connect that fails proves nothing
+ *    ran, so it may be repeated ([retries], default [DEFAULT_RETRIES]); a command that fails
+ *    may already have run -- repeating `am hang --allow-restart`,
+ *    `rmmod oplus_security_guard` or `/data/adb/ksud late-load` is worse than stopping -- so
+ *    a command is never retried here. It is reported as [ChainSpec.TRANSPORT_FAILURE] and
+ *    the chain's `NON_IDEMPOTENT` policy decides what may be repeated.
+ *
+ * Usage: [attach] once from the application, then
+ * `AdbCommand.exec(command)` or `AdbCommand.exec(command, retries)`.
  */
 object AdbCommand {
-    /** Total connect attempts before a command reports "the channel is not usable". */
-    private const val CONNECT_TRIES = 3
+    /** Channel-failure retries: how often a *connect* may be attempted. */
+    const val DEFAULT_RETRIES = 3
+
     private const val CONNECT_GAP_MS = 1_500L
     private const val DISCOVERY_TIMEOUT_MS = 20_000L
+    const val DEFAULT_TIMEOUT_MS = 30_000L
 
     /**
-     * The channel self-check, as ONE shell call: `id` for the identity and
-     * `/proc/self/status` for `Seccomp`. One call means one stream (a kicked transport used
-     * to turn a second stream into a 30s hang).
+     * Budget of the reuse probe.
+     *
+     * A kicked transport leaves libadb's flags saying "connected" while its reader thread
+     * never delivers again, so flags cannot tell a live session from a zombie -- the device
+     * showed exactly that: `复用已有连接` followed by a 15s timeout on the self-check. One
+     * trivial round trip before trusting a reused session is cheap next to that.
+     */
+    private const val PROBE_COMMAND = "true"
+    private const val PROBE_TIMEOUT_MS = 5_000L
+
+    /**
+     * The self-check, as ONE shell call: `id` for the identity and `/proc/self/status` for
+     * `Seccomp`. One call means one stream (a kicked transport used to turn a second stream
+     * into a 30s hang).
      */
     const val SELF_CHECK_COMMAND = "id; cat /proc/self/status"
     const val SELF_CHECK_TIMEOUT_MS = 15_000L
+
+    /** Log lines are capped so one `cat /proc/self/status` cannot drown the log panel. */
+    private const val MAX_LOGGED_OUTPUT_LINES = 24
 
     /** What the caller gets back: an exit code plus combined output. */
     data class Result(val exitCode: Int, val output: String) {
@@ -57,40 +75,66 @@ object AdbCommand {
     private val mutex = Mutex()
 
     @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
+    private var logger: (String) -> Unit = {}
+
+    @Volatile
     private var connection: AdbConnection? = null
+
+    /** Bind the application context once (`GhostlockApplication.onCreate`). */
+    fun attach(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    /** Where log lines go when a caller does not pass its own sink. */
+    fun setLogger(sink: (String) -> Unit) {
+        logger = sink
+    }
 
     /**
      * Run one command, connecting first if there is no live session.
      *
-     * Never throws: an unusable channel is reported as [ChainSpec.TRANSPORT_FAILURE] with
-     * the reason pushed to [onLog], because "the command did not run" is a verdict callers
-     * must be able to distinguish from "it ran and failed".
+     * @param retries how often a *channel* failure may be retried; it never retries the
+     *   command itself. [DEFAULT_RETRIES] by default.
+     * @param timeoutMs how long one command may take.
+     * @param onLog where the command, its output and the channel diagnostics go; defaults
+     *   to the sink registered with [setLogger].
      */
     suspend fun exec(
-        context: Context,
         command: String,
-        timeoutMs: Long = 30_000L,
-        onLog: (String) -> Unit = {},
-    ): Result = mutex.withLock {
-        onLog("$ $command")
-        val active = try {
-            connect(context, onLog)
-        } catch (error: Throwable) {
-            onLog("[!] 通道不可用，命令没有运行：${WirelessAdb.describe(error)}")
-            return@withLock Result(ChainSpec.TRANSPORT_FAILURE, "")
+        retries: Int = DEFAULT_RETRIES,
+        timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+        onLog: ((String) -> Unit)? = null,
+    ): Result {
+        val log = onLog ?: logger
+        val context = appContext
+        if (context == null) {
+            log("[!] adb_command 尚未初始化，命令没有运行：$command")
+            return Result(ChainSpec.TRANSPORT_FAILURE, "")
         }
-        try {
-            val outcome = WirelessAdb.shellWithExitCode(active, command, timeoutMs)
-            outcome.output.lineSequence().filter { it.isNotBlank() }.forEach(onLog)
-            if (outcome.exitCode == ChainSpec.TRANSPORT_FAILURE) {
-                onLog("[!] 命令没有返回退出码，会话已失效并丢弃")
-                closeLocked()
+        return mutex.withLock {
+            log("$ $command")
+            val active = try {
+                connect(context, retries, log)
+            } catch (error: Throwable) {
+                log("[!] 通道不可用，命令没有运行：${WirelessAdb.describe(error)}")
+                return@withLock Result(ChainSpec.TRANSPORT_FAILURE, "")
             }
-            Result(outcome.exitCode, outcome.output)
-        } catch (error: Throwable) {
-            onLog("[!] 命令执行失败，可能已经运行：${WirelessAdb.describe(error)}")
-            closeLocked()
-            Result(ChainSpec.TRANSPORT_FAILURE, "")
+            try {
+                val outcome = WirelessAdb.shellWithExitCode(active, command, timeoutMs)
+                logOutput(outcome.output, log)
+                if (outcome.exitCode == ChainSpec.TRANSPORT_FAILURE) {
+                    log("[!] 命令没有返回退出码，会话已失效并丢弃")
+                    closeLocked()
+                }
+                Result(outcome.exitCode, outcome.output)
+            } catch (error: Throwable) {
+                log("[!] 命令执行失败，可能已经运行：${WirelessAdb.describe(error)}")
+                closeLocked()
+                Result(ChainSpec.TRANSPORT_FAILURE, "")
+            }
         }
     }
 
@@ -98,27 +142,45 @@ object AdbCommand {
      * Make sure a session exists and prove it with the self-check.
      *
      * Used before the chain starts: pairing is the standing authorization, so "paired but
-     * not connected yet" is normal and resolved here rather than failing inside step 1.
+     * not connected yet" is normal and is resolved here instead of failing inside step 1.
      */
-    suspend fun ensure(context: Context, onLog: (String) -> Unit = {}): Boolean = mutex.withLock {
-        try {
-            val active = connect(context, onLog)
-            val probe = WirelessAdb.shellWithExitCode(active, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
-            if (probe.exitCode == ChainSpec.TRANSPORT_FAILURE) {
+    suspend fun ensure(retries: Int = DEFAULT_RETRIES, onLog: ((String) -> Unit)? = null): Boolean {
+        val log = onLog ?: logger
+        val context = appContext
+        if (context == null) {
+            log("[!] adb_command 尚未初始化")
+            return false
+        }
+        val attempts = retries.coerceAtLeast(1)
+        return mutex.withLock {
+            var attempt = 0
+            while (attempt < attempts) {
+                attempt++
+                try {
+                    val active = connect(context, retries = 1, onLog = log)
+                    val probe = WirelessAdb.shellWithExitCode(
+                        active,
+                        SELF_CHECK_COMMAND,
+                        SELF_CHECK_TIMEOUT_MS,
+                    )
+                    if (probe.exitCode != ChainSpec.TRANSPORT_FAILURE) {
+                        val identity = probe.output.lineSequence()
+                            .firstOrNull { it.trimStart().startsWith("uid=") }
+                            ?.trim()
+                            .orEmpty()
+                        val seccomp = Regex("Seccomp:\\s*(\\d+)")
+                            .find(probe.output)?.groupValues?.get(1)
+                        log("[*] 通道就绪：$identity Seccomp=${seccomp ?: "?"}")
+                        return@withLock true
+                    }
+                    log("[!] 自检没有返回 第$attempt/$attempts 次")
+                } catch (error: Throwable) {
+                    log("[!] 通道不可用 第$attempt/$attempts 次：${WirelessAdb.describe(error)}")
+                }
                 closeLocked()
-                onLog("[!] 通道自检没有返回，会话已丢弃")
-                return@withLock false
+                if (attempt < attempts) delay(CONNECT_GAP_MS)
             }
-            val identity = probe.output.lineSequence()
-                .firstOrNull { it.trimStart().startsWith("uid=") }
-                ?.trim()
-                .orEmpty()
-            val seccomp = Regex("Seccomp:\\s*(\\d+)").find(probe.output)?.groupValues?.get(1)
-            onLog("[*] 通道就绪：$identity Seccomp=${seccomp ?: "?"}")
-            true
-        } catch (error: Throwable) {
-            onLog("[!] 无线调试通道不可用：${WirelessAdb.describe(error)}")
-            closeLocked()
+            log("[!] 无线调试通道不可用")
             false
         }
     }
@@ -135,17 +197,25 @@ object AdbCommand {
     /**
      * A live connection, or a fresh one. Callers hold [mutex].
      *
-     * Connecting is the only step that may be retried, and the endpoint is re-discovered on
-     * every attempt because the wireless-debugging port changes whenever the user toggles
-     * it.
+     * [retries] counts *connect* attempts only, and the endpoint is re-discovered each time
+     * because the wireless-debugging port changes whenever the user toggles it.
      */
-    private suspend fun connect(context: Context, onLog: (String) -> Unit): AdbConnection {
+    private suspend fun connect(
+        context: Context,
+        retries: Int,
+        onLog: (String) -> Unit,
+    ): AdbConnection {
         liveLocked()?.let { active ->
             onLog("[*] 复用已有连接")
-            return active
+            if (alive(active)) return active
+            /* Flags said connected but a round trip says otherwise: the transport was
+             * kicked while we were idle. Drop it and build a fresh one. */
+            onLog("[*] 复用的连接已失效，重连")
+            closeLocked()
         }
+        val attempts = retries.coerceAtLeast(1)
         var last: Throwable? = null
-        for (attempt in 1..CONNECT_TRIES) {
+        for (attempt in 1..attempts) {
             val endpoint = WirelessAdb.discover(
                 context,
                 WirelessAdb.SERVICE_CONNECT,
@@ -156,7 +226,7 @@ object AdbCommand {
                     "没有发现 ${WirelessAdb.SERVICE_CONNECT}，无线调试打开了吗",
                 )
             } else {
-                onLog("[*] 连接端点 $endpoint 第$attempt/$CONNECT_TRIES 次")
+                onLog("[*] 连接端点 $endpoint 第$attempt/$attempts 次")
                 try {
                     val fresh = WirelessAdb.connect(context, endpoint)
                     connection = fresh
@@ -167,16 +237,31 @@ object AdbCommand {
                     closeLocked()
                 }
             }
-            if (attempt < CONNECT_TRIES) {
-                onLog("[*] 连接失败 第$attempt/$CONNECT_TRIES 次：${WirelessAdb.describe(last)}")
+            if (attempt < attempts) {
+                onLog("[*] 连接失败 第$attempt/$attempts 次：${WirelessAdb.describe(last)}")
                 delay(CONNECT_GAP_MS)
             }
         }
         throw IllegalStateException(
-            "adb 连接失败 $CONNECT_TRIES 次：${WirelessAdb.describe(last)}",
+            "adb 连接失败 $attempts 次：${WirelessAdb.describe(last)}",
             last,
         )
     }
+
+    private fun logOutput(output: String, onLog: (String) -> Unit) {
+        val lines = output.lineSequence().filter { it.isNotBlank() }.toList()
+        lines.take(MAX_LOGGED_OUTPUT_LINES).forEach(onLog)
+        if (lines.size > MAX_LOGGED_OUTPUT_LINES) {
+            onLog("[*] 其余 ${lines.size - MAX_LOGGED_OUTPUT_LINES} 行未展开")
+        }
+    }
+
+    /** A trivial round trip: the only way to tell a live session from a kicked one. */
+    private suspend fun alive(active: AdbConnection): Boolean = runCatching {
+        withTimeoutOrNull(PROBE_TIMEOUT_MS + 2_000L) {
+            WirelessAdb.shellWithExitCode(active, PROBE_COMMAND, PROBE_TIMEOUT_MS).ok
+        } ?: false
+    }.getOrDefault(false)
 
     /** The current session if it is still usable, otherwise null (and dropped). */
     private fun liveLocked(): AdbConnection? {

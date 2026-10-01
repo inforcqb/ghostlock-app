@@ -88,6 +88,9 @@ object WirelessPairingController {
 
     /** Read the persisted pairing so a restart does not ask for the code again. */
     fun load(context: Context) {
+        /* Channel diagnostics go to this screen's log unless a caller passes its own sink
+         * (the chain does, so its step log gets them instead). */
+        AdbCommand.setLogger(::log)
         val prefs = prefs(context)
         val paired = prefs.getBoolean(KEY_PAIRED, false)
         val endpoint = prefs.getString(KEY_ENDPOINT, "").orEmpty()
@@ -163,7 +166,7 @@ object WirelessPairingController {
      * state.
      */
     suspend fun ensureChannel(context: Context, onLog: (String) -> Unit): Boolean {
-        val ready = AdbCommand.ensure(context, onLog)
+        val ready = AdbCommand.ensure(onLog = onLog)
         if (ready) {
             mutate { it.copy(shellReady = true, status = context.getString(R.string.wireless_status_ready)) }
         } else {
@@ -182,12 +185,11 @@ object WirelessPairingController {
      * decide whether repeating a step is safe.
      */
     suspend fun execChainCommand(
-        context: Context,
         command: String,
         timeoutMs: Long,
         onLog: (String) -> Unit,
     ): ShellResult {
-        val result = AdbCommand.exec(context, command, timeoutMs, onLog)
+        val result = AdbCommand.exec(command, timeoutMs = timeoutMs, onLog = onLog)
         return ShellResult(result.exitCode, result.output)
     }
 
@@ -196,9 +198,8 @@ object WirelessPairingController {
      * (`sh /data/local/tmp/gl-w1/w1.sh`, which drives the engine with
      * `GHOSTLOCK_W1_ONLY` + `GHOSTLOCK_PARK_AFTER_W1`).
      */
-    suspend fun runW1OnChannel(context: Context, onLog: (String) -> Unit): Boolean {
+    suspend fun runW1OnChannel(onLog: (String) -> Unit): Boolean {
         val result = execChainCommand(
-            context,
             "sh ${ChainSpec.SCRIPT_W1}",
             ChainSpec.W1_TIMEOUT_MS,
             onLog,
@@ -357,10 +358,8 @@ object WirelessPairingController {
      */
     private suspend fun verify(context: Context) {
         val result = AdbCommand.exec(
-            context,
             AdbCommand.SELF_CHECK_COMMAND,
-            AdbCommand.SELF_CHECK_TIMEOUT_MS,
-            ::log,
+            timeoutMs = AdbCommand.SELF_CHECK_TIMEOUT_MS,
         )
         if (result.transportFailure) {
             throw IllegalStateException("自检没有返回结果，通道失效")
