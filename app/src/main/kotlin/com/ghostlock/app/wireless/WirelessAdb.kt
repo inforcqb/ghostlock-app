@@ -107,6 +107,14 @@ object WirelessAdb {
      * adbd needs a moment after it starts listening (and after a pairing), so the
      * connection is retried; a failed [AdbConnection] cannot be reused, hence the fresh
      * object per attempt. `setApi(SDK_INT)` says client and daemon are on the same device.
+     *
+     * IMPORTANT: do NOT call `AdbConnection.Builder.connect(...)`. In libadb 3.1.1 that
+     * wrapper has the boolean inverted -- it throws "Unable to establish a new connection."
+     * precisely when the connection SUCCEEDS (measured on the PJA110, 2026-10-01: every
+     * attempt logged a successful TLS handshake and then that exception). Use `build()`
+     * plus the instance `connect(...)`, which is what the library's own
+     * `AbsAdbConnectionManager.autoConnect` does and what its javadoc promises:
+     * `true` when the connection was established.
      */
     fun connect(
         context: Context,
@@ -118,22 +126,62 @@ object WirelessAdb {
         val key = AdbKey.load(context.filesDir)
         var last: Throwable? = null
         for (attempt in 1..attempts) {
+            var pending: AdbConnection? = null
+            var returned = false
             try {
                 val connection = AdbConnection.Builder(endpoint.host, endpoint.port)
                     .setDeviceName("ghostlock")
                     .setApi(Build.VERSION.SDK_INT)
                     .setPrivateKey(key.privateKey)
                     .setCertificate(key.certificate)
-                    .connect(timeoutMs, TimeUnit.MILLISECONDS, false)
-                if (connection.isConnected) return connection
-                runCatching { connection.close() }
-                last = IllegalStateException("连接建立后握手未完成（第 $attempt/$attempts 次）")
+                    .build()
+                pending = connection
+                val established = connection.connect(timeoutMs, TimeUnit.MILLISECONDS, false)
+                if (established && connection.isConnectionEstablished()) {
+                    returned = true
+                    return connection
+                }
+                last = IllegalStateException(
+                    "连接未建立（第 $attempt/$attempts 次，connect()=$established）",
+                )
             } catch (error: Throwable) {
                 last = error
+            } finally {
+                /* Every attempt that does not hand the connection back must close it. A
+                 * leaked connection keeps an authenticated adbd session and its reader
+                 * thread alive, and the next retry then competes with it -- which is what
+                 * the device showed on 2026-10-01 once the first attempt "succeeded" but
+                 * was reported as a failure. */
+                if (!returned) closeQuietly(pending)
             }
             if (attempt < attempts) Thread.sleep(gapMs)
         }
-        throw IllegalStateException("adb connect $endpoint 连续 $attempts 次失败：${last?.message}", last)
+        throw IllegalStateException(
+            "adb connect $endpoint 连续 $attempts 次失败：${describe(last)}",
+            last,
+        )
+    }
+
+    /**
+     * Class name, message and the first causes of [error].
+     *
+     * libadb's own messages are thin ("Unable to establish a new connection."), so the
+     * class and cause chain are what actually make a device log diagnosable.
+     */
+    fun describe(error: Throwable?): String {
+        if (error == null) return "原因不明"
+        return buildString {
+            append(error::class.java.simpleName)
+            error.message?.let { append(": ").append(it) }
+            var cause = error.cause
+            var depth = 0
+            while (cause != null && depth < 3) {
+                append(" <- ").append(cause::class.java.simpleName)
+                cause.message?.let { append(": ").append(it) }
+                cause = cause.cause
+                depth++
+            }
+        }
     }
 
     /**

@@ -104,7 +104,48 @@ adb shell id
 失败时界面上的 `wireless_pair_no_service` / `wireless_connect_no_service` 直接指明
 缺的是配对对话框还是无线调试开关。
 
-## 6. 仍未验证 / 风险
+## 6. 真机上踩到的四个坑（2026-10-01，PJA110 / Android 16 / SDK 36）
+
+1. **平台 conscrypt 的导出密钥是隐藏 API** ✗
+   `NoSuchMethodException: com.android.org.conscrypt.Conscrypt.exportKeyingMaterial`
+   ⇒ 配对协议要用 RFC 5705 导出密钥把 SPAKE2 口令绑到 TLS 通道上，而 Android 16 上这个平台方法是
+   hidden API（`hiddenapi: ... api=blocked`）。**修法**：打包 `org.conscrypt:conscrypt-android:2.5.3`，
+   让 libadb 走它优先的 `org.conscrypt` 路径（普通库方法）；R8 另需两条 `-dontwarn`
+   （`com.android.org.conscrypt.SSLParametersImpl`、`org.apache.harmony.xnet.provider.jsse.SSLParametersImpl`
+   —— 就是 2026-09-29 那次放弃 conscrypt 的确切原因）。
+
+2. **`AdbConnection.Builder.connect(...)` 的判断是反的** ✗（上游 libadb 3.1.1 的 bug）
+   ```java
+   if (adbConnection.connect(timeout, unit, throwOnUnauthorised)) {
+       throw new IOException("Unable to establish a new connection.");   // 成功时反而抛
+   }
+   ```
+   实例方法 `connect(...)` 的语义是"成功返回 true"（javadoc + `AbsAdbConnectionManager` 的用法都这样），
+   而这个 Builder 包装器把布尔取反了。真机日志的特征是：每次重试都先 `Handshake succeeded.`（TLS 升级完成）
+   再抛 `Unable to establish a new connection.`。
+   **修法**：一律 `Builder(...).build()` 后用实例 `connect(...)` 判真假。
+   **这条同时是 `project-status-20260929.md` §4「唯一未通的一环」的真正根因**（旧链的
+   `LibAdbClient` 走的就是这个包装器）⇒ 旧方向第 ⑤ 步也一并修好了。
+
+3. **失败/中断的那次连接必须关掉** ✗
+   上面那个 bug 让"其实已建立"的连接被当成失败，而失败路径又不关闭它 ⇒ 泄漏的会话和它的读线程一直留着，
+   后续重试在与它竞争（用户观察到的"第一次连接成功后没有释放，导致后面的连接失败"）。**修法**：
+   `connect()` 的每次尝试用 `finally` 兜底，凡不交还调用方的连接一律 `close()`。
+
+4. **通知的生命周期** ✗
+   配对码通知曾被设成 `setOngoing(true)`（拖不掉），且配对成功后没有释放 ⇒ 用户报告"通知框 bug"。
+   **修法**：提示类通知改 `setOngoing(false)` + `setAutoCancel(true)`；收到配对码、以及整条流程结束时
+   （成功或失败）都 `cancel`；整条流程**只留一条**结果通知（去掉中间那条"配对成功"）。
+
+## 7. 签名 key：为什么仓库里放了一把 key
+
+`keystore/ghostlock-dev.jks` 是**刻意提交**的（细节与安全提示见 `keystore/README.md`）。原因：
+仓库没有签名 secrets ⇒ CI 走 AGP 的 debug key ⇒ **每个 runner 现生成** ⇒ 每次构建签名都不同 ⇒
+覆盖安装 `INSTALL_FAILED_UPDATE_INCOMPATIBLE` ⇒ 必须卸载 ⇒ **卸载清掉 app 私有目录里的
+`adbkey.pk8` 与配对记录** ⇒ 每装一个构建都要重新配对。仓内固定 key 之后，构建之间 `adb install -r`
+直接可用，密钥与配对状态都保留。解析顺序：`local.properties` → 环境变量/secrets → 仓内 key（secrets 优先）。
+
+## 8. 仍未验证 / 风险
 
 * **root adbd 是否认配对密钥**：本轮之后必须真机证实（第 ④ 步开门后连 5555）。
   推理上成立（adb_keys 不随 adbd 重启丢失），但**没有实测证据**，属于假设。

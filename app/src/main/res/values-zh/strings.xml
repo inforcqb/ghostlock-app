@@ -231,6 +231,7 @@
     <string name="wireless_connect_no_service">20 秒内没有发现 _adb-tls-connect._tcp：无线调试打开了吗？</string>
     <string name="wireless_paired_title">配对成功</string>
     <string name="wireless_paired_text">adbd 已登记本应用的公钥，正在打开通道…</string>
+    <string name="wireless_ready_title">通道就绪</string>
     <string name="wireless_failed_title">无线调试</string>
     <string name="wireless_shell_ready">通道就绪：%1$s（Seccomp=%2$d）</string>
     <string name="wireless_shell_not_ready">通道未达预期：%1$s Seccomp=%2$d（需要 uid=2000 且 Seccomp: 0）</string>

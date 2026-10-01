@@ -54,6 +54,14 @@
 
 ## 4. 唯一未通的一环
 
+> **2026-10-01 补记：根因已找到并修掉。** `AdbConnection.Builder.connect(...)`（libadb 3.1.1）
+> 把布尔判断写反了——**连接成功时它反而抛** `Unable to establish a new connection.`，而实例方法
+> `connect(...)` 的语义是"成功返回 true"（库自己的 `AbsAdbConnectionManager` 就是这么用的）。
+> 真机日志特征：每次重试先 `Handshake succeeded.`（TLS 升级完成）再抛该异常。改用
+> `Builder(...).build()` + 实例 `connect(...)` 即可（`LibAdbClient` 与新的无线调试通道都已改），
+> 同时补上"失败路径必须关闭连接"，否则泄漏的会话会让后续重试一起失败。
+> 详见 `docs/analysis/wireless-debugging-pairing.md` §6。
+
 ```
 [!] adb 客户端连 127.0.0.1:5555 failed: Unable to establish a new connection.
 ```

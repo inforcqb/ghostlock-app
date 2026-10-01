@@ -232,11 +232,11 @@ object WirelessPairingController {
             savePaired(context, endpoint)
             mutate { it.copy(paired = true, endpoint = endpoint.toString()) }
             log("配对成功：adbd 已登记本应用的公钥（无需 setuid 写 adb_keys）")
-            WirelessNotifications.showStatus(
-                context,
-                context.getString(R.string.wireless_paired_title),
-                context.getString(R.string.wireless_paired_text),
-            )
+            /* Release the code-input notification the moment the pairing is done: it is
+             * the prompt for a code that no longer matters, and leaving it in the shade
+             * was reported as "pair succeeded but the notification was never released".
+             * Exactly one result notification is posted, at the end of the flow. */
+            WirelessNotifications.cancelCodeInput(context)
             connectFlow(context, alreadyBusy = true)
         } catch (error: Throwable) {
             markFailed(context, "配对失败：${error::class.simpleName}: ${error.message}")
@@ -292,12 +292,25 @@ object WirelessPairingController {
             }
             if (ready) {
                 log("通道就绪 ✓ uid=2000 且 Seccomp: 0 ⇒ 可用来跑 W1")
+                WirelessNotifications.showStatus(
+                    context,
+                    context.getString(R.string.wireless_ready_title),
+                    context.getString(R.string.wireless_shell_ready, identity, seccomp),
+                )
             } else {
                 log("通道未达预期 ✗ 需要 uid=2000 且 Seccomp: 0（当前 uid=$uid Seccomp=$seccomp）")
+                WirelessNotifications.showStatus(
+                    context,
+                    context.getString(R.string.wireless_failed_title),
+                    context.getString(R.string.wireless_shell_not_ready, identity, seccomp),
+                )
             }
         } catch (error: Throwable) {
-            markFailed(context, "连接/自检失败：${error::class.simpleName}: ${error.message}")
+            markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
         } finally {
+            /* Nothing of this flow should stay in the shade: the prompt is cancelled when
+             * the code arrives, and the flow owns exactly one result notification. */
+            WirelessNotifications.cancelCodeInput(context)
             mutate { it.copy(busy = false) }
         }
     }
@@ -312,6 +325,7 @@ object WirelessPairingController {
 
     private fun markFailed(context: Context, message: String) {
         log("✗ $message")
+        WirelessNotifications.cancelCodeInput(context)
         mutate { it.copy(status = message) }
         if (WirelessNotifications.canPost(context)) {
             WirelessNotifications.showStatus(

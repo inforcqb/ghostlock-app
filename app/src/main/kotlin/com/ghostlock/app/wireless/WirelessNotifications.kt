@@ -76,7 +76,11 @@ object WirelessNotifications {
             .setContentTitle(context.getString(R.string.wireless_pairing_code_title))
             .setContentText(text)
             .setStyle(Notification.BigTextStyle().bigText(text))
-            .setOngoing(true)
+            /* Not ongoing and auto-cancel: this notification is a prompt, so the user must
+             * be able to dismiss it, and the flow cancels it as soon as the code arrives
+             * (an un-dismissable prompt left in the shade was reported as a bug). */
+            .setOngoing(false)
+            .setAutoCancel(true)
             .addAction(action)
             .build()
         notify(context, ID_CODE_INPUT, notification)

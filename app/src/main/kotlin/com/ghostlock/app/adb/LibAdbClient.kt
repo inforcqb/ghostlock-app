@@ -41,28 +41,43 @@ class LibAdbClient(
         val key = AdbKey.load(context.filesDir)
         var last: Throwable? = null
         for (attempt in 1..attempts) {
+            var pending: AdbConnection? = null
+            var kept = false
             try {
+                /* build() + the instance connect(), NOT Builder.connect(): in libadb 3.1.1
+                 * that wrapper throws "Unable to establish a new connection." exactly when
+                 * the connection succeeds (inverted boolean). This is the bug that kept the
+                 * chain at "adb client connects to 127.0.0.1:5555" (see
+                 * docs/analysis/project-status-20260929.md §4); the device log showed a
+                 * successful TLS handshake followed by that exception on every retry. */
                 val conn = AdbConnection.Builder(host, port)
                     .setDeviceName("ghostlock")
                     .setApi(android.os.Build.VERSION.SDK_INT)
                     .setPrivateKey(key.privateKey)
                     .setCertificate(key.certificate)
-                    .connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, false)
-                if (conn.isConnected) {
+                    .build()
+                pending = conn
+                val established = conn.connect(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS, false)
+                if (established && conn.isConnectionEstablished) {
                     connection = conn
+                    kept = true
                     return
                 }
-                runCatching { conn.close() }
-                last = IllegalStateException("连接建立后未完成握手（第 $attempt/$attempts 次）")
+                last = IllegalStateException("连接未建立（第 $attempt/$attempts 次，connect()=$established）")
             } catch (error: Throwable) {
                 last = error
+            } finally {
+                /* A failed or abandoned attempt must not leave an authenticated session
+                 * (and its reader thread) open behind us. */
+                if (!kept) runCatching { pending?.close() }
             }
             if (attempt < attempts) {
                 Thread.sleep(gapMs)
             }
         }
         throw IllegalStateException(
-            "adb connect $host:$port 连续 $attempts 次失败：${last?.message}",
+            "adb connect $host:$port 连续 $attempts 次失败：" +
+                "${last?.let { "${it::class.java.simpleName}: ${it.message}" }}",
             last,
         )
     }

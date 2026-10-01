@@ -91,14 +91,32 @@ android {
     val keystorePwd = properties.getProperty("KEYSTORE_PASS") ?: System.getenv("KEYSTORE_PASS")
     val alias = properties.getProperty("KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
     val pwd = properties.getProperty("KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
-    val keystoreFile = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    /* Signing key resolution: local.properties / environment win -- CI fills those from
+     * repository secrets -- and when they are absent the key committed in keystore/ is
+     * used instead of AGP's debug key (see keystore/README.md).
+     *
+     * Why: AGP generates the debug keystore fresh on every CI runner, so every build had
+     * a different signature, every update needed an uninstall, and an uninstall drops the
+     * app's adb key pair together with its pairing record -- which means the wireless
+     * debugging channel has to be paired again from scratch on every single build. A
+     * committed key makes `adb install -r` work between builds. */
+    val secretsKeystore = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    val repoKeystore = rootProject.file("keystore/ghostlock-dev.jks").takeIf { it.isFile && it.length() > 0L }
+    val keystoreFile = secretsKeystore ?: repoKeystore
+    val fallbackSigning = secretsKeystore == null && repoKeystore != null
+    val storePasswordResolved = keystorePwd?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock-dev" else keystorePwd
+    val aliasResolved = alias?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock" else alias
+    val keyPasswordResolved = pwd?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock-dev" else pwd
     if (keystoreFile != null) {
         signingConfigs {
             create("release") {
                 storeFile = keystoreFile
-                storePassword = keystorePwd
-                keyAlias = alias
-                keyPassword = pwd
+                storePassword = storePasswordResolved
+                keyAlias = aliasResolved
+                keyPassword = keyPasswordResolved
                 enableV2Signing = true
                 enableV3Signing = true
             }

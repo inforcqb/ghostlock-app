@@ -232,6 +232,7 @@
     <string name="wireless_connect_no_service">No _adb-tls-connect._tcp within 20s. Is wireless debugging switched on?</string>
     <string name="wireless_paired_title">Paired</string>
     <string name="wireless_paired_text">adbd stored this app\'s public key. Opening the channel…</string>
+    <string name="wireless_ready_title">Channel ready</string>
     <string name="wireless_failed_title">Wireless debugging</string>
     <string name="wireless_shell_ready">Channel ready: %1$s (Seccomp=%2$d)</string>
     <string name="wireless_shell_not_ready">Channel not usable yet: %1$s Seccomp=%2$d (needs uid=2000 and Seccomp: 0)</string>
