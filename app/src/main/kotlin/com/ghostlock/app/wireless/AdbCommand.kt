@@ -259,7 +259,7 @@ object AdbCommand {
     /** A trivial round trip: the only way to tell a live session from a kicked one. */
     private suspend fun alive(active: AdbConnection): Boolean = runCatching {
         withTimeoutOrNull(PROBE_TIMEOUT_MS + 2_000L) {
-            WirelessAdb.shellWithExitCode(active, PROBE_COMMAND, PROBE_TIMEOUT_MS).ok
+            WirelessAdb.shellWithExitCode(active, PROBE_COMMAND, PROBE_TIMEOUT_MS).exitCode == 0
         } ?: false
     }.getOrDefault(false)
 
