@@ -1,4 +1,4 @@
-package com.ghostlock.app.chain
+﻿package com.ghostlock.app.chain
 
 import android.content.Context
 import com.ghostlock.app.wireless.AdbCommand
@@ -69,11 +69,29 @@ class W1Stage(private val context: Context) {
             )
             if (started.transportFailure) {
                 onLog("[!] W1 启动命令没有真正执行：${started.output.trim().take(200)}")
+                panicHint(onLog)
                 return@withContext false
             }
             onLog("[*] W1 已启动（引擎 ${ChainSpec.W1_ENGINE}，日志 ${ChainSpec.W1_LOG}）")
-            await(onLog)
+            val landed = await(onLog)
+            if (!landed) panicHint(onLog)
+            landed
         }
+
+    /**
+     * The known W1 risk, said out loud when W1 does not land.
+     *
+     * The exploit's collateral store occasionally panics the kernel; a panic reboots the device
+     * on the spot, which looks exactly like "the chain just stopped". Nothing is wrong with the
+     * device and nothing needs cleaning up (the reboot clears the park and SELinux state), so the
+     * useful advice is one retry.
+     */
+    private fun panicHint(onLog: (String) -> Unit) {
+        onLog(
+            "[!] 提醒：当前 W1 有小概率把内核打 panic（设备会当场重启，属已知风险，不是坏了）。" +
+                "如果设备重启过，请再点一次「一键 root」重试一次；重启已经把现场清干净，不需要别的收尾。",
+        )
+    }
 
     /** Stream the engine's log until the landing marker, a deadline, or an early death. */
     private suspend fun await(onLog: (String) -> Unit): Boolean {

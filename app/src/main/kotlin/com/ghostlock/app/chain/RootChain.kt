@@ -760,7 +760,14 @@ class RootChain(
             if (w1AlreadyDone) {
                 return@step "enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ W1 已做过，跳过"
             }
-            if (!w1.runW1Only(onLog)) throw IllegalStateException("W1 runner returned failure")
+            if (!w1.runW1Only(onLog)) {
+                /* W1 occasionally panics the kernel, and a panic reboots the device -- so the
+                 * one useful thing to say here is "try again once" (see [W1Stage.panicHint]). */
+                throw IllegalStateException(
+                    "W1 没有落地。当前 W1 有小概率把内核打 panic（设备会当场重启，属已知风险）：" +
+                        "若设备重启过，请再点一次「一键 root」重试一次；重启已把现场清干净，无需别的收尾。",
+                )
+            }
             val enforce = await(
                 "SELinux permissive",
                 timeoutMs = 90_000L,

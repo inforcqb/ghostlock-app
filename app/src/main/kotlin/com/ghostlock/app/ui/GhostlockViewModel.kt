@@ -595,13 +595,27 @@ class GhostlockViewModel(
         appendLog("chain: W1 -> Magica uid-0 channel -> adbd gate -> rmmod guard -> ksud late-load")
         appendLog("commands are verbatim: docs/analysis/root-chain-integration.md")
         /* Tell the user where the previous run stopped, if it was interrupted by the
-         * zygote restart that the am hang step causes (same boot only). */
+         * zygote restart that the am hang step causes (same boot only) -- or, when the record
+         * is from an *earlier boot*, say the thing that actually helps: W1 panics the kernel
+         * every so often, and a panic reboots the device exactly like this. */
         ChainStateStore.load()?.let { previous ->
-            if (!previous.finished && ChainStateStore.belongsToThisBoot(previous)) {
+            if (previous.finished) return@let
+            if (ChainStateStore.belongsToThisBoot(previous)) {
                 appendLog("[!] 本次开机内上一次运行未完成：${previous.summary()}")
                 appendLog(
                     "[!] 若它是被 am hang 之后的 zygote 重启打断的（本 app 一起重启属预期），" +
                         "再点一次即可；W1 那一步检测到已是 permissive 会自动跳过。",
+                )
+            } else {
+                appendLog(
+                    "[!] 上一次运行（${previous.summary()}）之后设备重启过 —— 利用链跑到一半设备重启，" +
+                        "最常见的原因是 W1 把内核打 panic（当前 W1 有小概率 panic，是已知风险，" +
+                        "不是设备坏了）。",
+                )
+                appendLog("[!] 请再点一次「一键 root」重试：第二次通常就过。")
+                appendLog(
+                    "[!] 重试前不需要做别的收尾：重启已经把 W1 的 park 与 SELinux 状态清掉了，" +
+                        "链会照常从 W1 重新开始。",
                 )
             }
         }
