@@ -36,8 +36,9 @@ import kotlinx.coroutines.withContext
 object AdbService {
     private const val KEEP_ALIVE_INTERVAL_MS = 5_000L
     private const val GAP_MS = 800L
-    private const val SERVICE_CONNECT = "_adb-tls-connect"
-    private const val SERVICE_PAIRING = "_adb-tls-pairing"
+    /* `adb mdns services` prints `_adb-tls-connect._tcp.`; AdbCli normalises that to `adb-tls-connect`*/(leading underscore trimmed), so the constants must match THAT form -- comparing against the underscored form silently filtered every candidate away. */
+    private const val SERVICE_CONNECT = "adb-tls-connect"
+    private const val SERVICE_PAIRING = "adb-tls-pairing"
     private const val CONNECT_ROUNDS = 3
     private const val CONNECT_ROUND_GAP_MS = 1_500L
     private const val NSD_CONNECT_TIMEOUT_MS = 6_000L
