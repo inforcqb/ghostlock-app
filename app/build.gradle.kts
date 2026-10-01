@@ -169,6 +169,15 @@ dependencies {
     // fallback) and wireless pairing. Apache-2.0 branch of its dual licence. Replaces the
     // hand-written AdbClient, which stopped at "adbd asked for AUTH".
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    // Wireless pairing needs the TLS exporter (RFC 5705): the handshake binds the SPAKE2
+    // password to the TLS channel with `exportKeyingMaterial`. Android's own
+    // `com.android.org.conscrypt.Conscrypt#exportKeyingMaterial` is a HIDDEN api on
+    // Android 16 -- reflecting on it throws NoSuchMethodException (measured on the
+    // PJA110, 2026-10-01: "配对失败：SSLException: java.lang.NoSuchMethodException:
+    // com.android.org.conscrypt.Conscrypt.exportKeyingMaterial"). Bundling Conscrypt
+    // gives libadb the `org.conscrypt` path it prefers, which is a normal library class
+    // and therefore reachable.
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
     // Certificate generation for the adb key: libadb requires BOTH a private key and a
     // certificate on the connection object (the certificate is only used for wireless
     // pairing, which we do not do, but the check is unconditional).

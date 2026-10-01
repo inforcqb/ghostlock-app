@@ -22,3 +22,15 @@
 # implements; the app binds it through IRootShellService.Stub.asInterface).
 -keep interface com.ghostlock.app.root.IRootShellService { *; }
 -keep class com.ghostlock.app.root.IRootShellService$Stub { *; }
+
+# Bundled Conscrypt: libadb reaches it by name
+# (Class.forName("org.conscrypt.OpenSSLProvider")), so it must survive R8 with that
+# name, and Conscrypt itself is entered through reflection for the TLS exporter.
+-keep class org.conscrypt.OpenSSLProvider { *; }
+-keep class org.conscrypt.Conscrypt { *; }
+-keepnames class org.conscrypt.**
+# Conscrypt's KitKat / pre-KitKat SSLSocket adapters reference platform classes that
+# no longer exist; they are unreachable on API 34+. Without these two lines R8 fails
+# the release build with "Missing classes detected" (measured 2026-09-29).
+-dontwarn com.android.org.conscrypt.SSLParametersImpl
+-dontwarn org.apache.harmony.xnet.provider.jsse.SSLParametersImpl

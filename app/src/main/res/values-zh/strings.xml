@@ -242,6 +242,7 @@
     <string name="wireless_pairing_code_title">输入无线调试配对码</string>
     <string name="wireless_pairing_code_hint">先在无线调试里打开“使用配对码配对设备”，再把 6 位配对码填在这里（只在该对话框打开时有效）。</string>
     <string name="wireless_settings_jump_failed">跳转无线调试失败，请手动进 设置 → 开发者选项 → 无线调试。</string>
+    <string name="wireless_jump_hint">已打开设置。本机（ColorOS）无线调试页在开发者选项里：下滑找到「无线调试」→「使用配对码配对设备」，然后在下拉通知里输入 6 位配对码。</string>
     <string name="wireless_channel_name">无线调试通道</string>
     <string name="wireless_channel_description">配对码输入与通道状态</string>
     <string name="wireless_log_title">日志</string>

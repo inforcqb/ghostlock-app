@@ -162,10 +162,15 @@ object WirelessPairingController {
     /**
      * Jump to the system's wireless-debugging page.
      *
-     * Three attempts, in the order that is most likely to land on the right screen, each
-     * one validated with `resolveActivity` and wrapped so a missing activity cannot crash:
-     * the OPPO/AOSP component, the semantic action, then developer options (which always
-     * exists). Returns which attempt worked, or null when the user has to navigate by hand.
+     * Attempts, in the order that is most likely to land on the right screen, each one
+     * validated with `resolveActivity` and wrapped so a missing activity cannot crash:
+     * the AOSP/OPPO component, the semantic action, the developer-options component, then
+     * the developer-options action. On the PJA110 (ColorOS) only the last two resolve --
+     * its Settings.apk has no wireless-debugging activity at all (checked on the device:
+     * 196 `Settings$*` activities, none of them WifiDebugging/WirelessDebugging), so the
+     * page lives inside developer options and the user has to scroll to it; the log says so.
+     *
+     * Returns which attempt worked, or null when the user has to navigate by hand.
      */
     fun openWirelessDebuggingSettings(context: Context): String? {
         val attempts = listOf(
@@ -176,6 +181,12 @@ object WirelessPairingController {
                 ),
             ),
             "action" to Intent("android.settings.WIRELESS_DEBUGGING_SETTINGS"),
+            "development-component" to Intent().setComponent(
+                ComponentName(
+                    "com.android.settings",
+                    "com.android.settings.Settings\$DevelopmentSettingsDashboardActivity",
+                ),
+            ),
             "developer-options" to Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS),
         )
         for ((label, intent) in attempts) {
@@ -190,6 +201,9 @@ object WirelessPairingController {
             val started = runCatching { context.startActivity(intent) }.isSuccess
             if (started) {
                 log("跳转无线调试成功：$label -> ${resolved.activityInfo?.name}")
+                if (label.startsWith("development") || label == "developer-options") {
+                    log(context.getString(R.string.wireless_jump_hint))
+                }
                 return label
             }
             log("跳转尝试「$label」启动失败")
