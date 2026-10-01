@@ -224,7 +224,7 @@
     <string name="wireless_screen_paired">Paired. Tap connect and self-check.</string>
     <string name="wireless_waiting_code">Waiting for the pairing code — type it into the notification</string>
     <string name="wireless_waiting_service">Waiting for the pairing service: open \'Pair device with pairing code\' in Settings</string>
-    <string name="wireless_searching_service">Looking for the pairing port - open 'Pair device with pairing code' in Settings</string>
+    <string name="wireless_searching_service">Looking for the pairing port - open \'Pair device with pairing code\' in Settings</string>
     <string name="wireless_pairing_busy">Pairing: finding the pairing service</string>
     <string name="wireless_connecting_busy">Connecting: finding the port and self-checking</string>
     <string name="wireless_pair_no_service">No pairing service found. Open \'Pair device with pairing code\' in Settings and keep that dialog open.</string>
