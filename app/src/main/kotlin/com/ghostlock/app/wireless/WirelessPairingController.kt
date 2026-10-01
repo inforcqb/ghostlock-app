@@ -13,7 +13,10 @@ import com.ghostlock.app.chain.ShellResult
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -57,6 +60,16 @@ object WirelessPairingController {
 
     private const val MAX_LOG_LINES = 200
 
+    /** How long to keep looking for the pairing service while the dialog is open. */
+    private const val PAIRING_WATCH_MS = 300_000L
+    private const val PAIRING_POLL_MS = 1_500L
+
+    private var pairingWatch: Job? = null
+
+    /** The endpoint the code will be submitted to; found before the code is asked for. */
+    @Volatile
+    private var pairingEndpoint: String? = null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listeners = CopyOnWriteArrayList<WirelessStateListener>()
     private val main = Handler(Looper.getMainLooper())
@@ -98,17 +111,44 @@ object WirelessPairingController {
      * dialog is open, so this is paired with a jump to that screen; the code is entered
      * from the notification shade.
      */
+    /**
+     * Find the pairing endpoint FIRST, then ask for the code (user-set, 2026-10-01).
+     *
+     * The `_adb-tls-pairing` service is only advertised while the system's pairing dialog is
+     * open, and a freshly started adb server needs a moment before its mDNS view lists it --
+     * asking for the code first and searching afterwards is how the flow ended in "no pairing
+     * service" even though the dialog was open. So: watch for the endpoint, and only when it
+     * is known does the code-input notification appear. The code stays valid as long as the
+     * dialog is open, and the endpoint we paired against is remembered for the submission.
+     */
     fun startPairing(context: Context): Boolean {
-        if (!WirelessNotifications.canPost(context)) {
+        val app = context.applicationContext
+        if (!WirelessNotifications.canPost(app)) {
             log("通知权限未授予 ⇒ 无法在通知里输入配对码，改用页面内的输入框")
-            mutate { it.copy(status = context.getString(R.string.wireless_manual_code_hint)) }
+            mutate { it.copy(status = app.getString(R.string.wireless_manual_code_hint)) }
             return false
         }
-        WirelessNotifications.showCodeInput(
-            context,
-            context.getString(R.string.wireless_pairing_code_hint),
-        )
-        mutate { it.copy(status = context.getString(R.string.wireless_waiting_code)) }
+        if (pairingWatch?.isActive == true) return true
+        mutate { it.copy(status = app.getString(R.string.wireless_waiting_service)) }
+        pairingWatch = scope.launch {
+            val deadline = System.currentTimeMillis() + PAIRING_WATCH_MS
+            while (isActive && System.currentTimeMillis() < deadline) {
+                val endpoints = AdbService.pairingEndpoints().distinct()
+                if (endpoints.isNotEmpty()) {
+                    pairingEndpoint = endpoints.first()
+                    log("发现配对服务：$pairingEndpoint")
+                    if (endpoints.size > 1) log("其它候选：${endpoints.drop(1).joinToString()}")
+                    WirelessNotifications.showCodeInput(
+                        app,
+                        app.getString(R.string.wireless_pairing_code_hint),
+                    )
+                    mutate { it.copy(status = app.getString(R.string.wireless_waiting_code)) }
+                    return@launch
+                }
+                delay(PAIRING_POLL_MS)
+            }
+            markFailed(app, app.getString(R.string.wireless_pair_no_service))
+        }
         return true
     }
 
@@ -275,11 +315,13 @@ object WirelessPairingController {
         mutate { it.copy(busy = true, status = context.getString(R.string.wireless_pairing_busy)) }
         try {
             log("查找配对服务 ...")
-            val endpoints = AdbService.pairingEndpoints().distinct()
+            val remembered = pairingEndpoint
+            val endpoints = (listOfNotNull(remembered) + AdbService.pairingEndpoints()).distinct()
             if (endpoints.isEmpty()) {
                 markFailed(context, context.getString(R.string.wireless_pair_no_service))
                 return
             }
+            pairingWatch?.cancel()
             var message = ""
             var paired = false
             for (endpoint in endpoints) {

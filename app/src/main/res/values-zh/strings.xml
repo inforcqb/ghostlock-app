@@ -223,7 +223,7 @@
     <string name="wireless_waiting_code">等待配对码，请在通知里输入</string>
     <string name="wireless_pairing_busy">配对中，正在查找配对服务</string>
     <string name="wireless_connecting_busy">连接中，正在查找端口并自检</string>
-    <string name="wireless_pair_no_service">30 秒内没有发现配对服务，请保持配对对话框打开。</string>
+    <string name="wireless_pair_no_service">没找到配对服务：请先在设置里打开「使用配对码配对设备」，并保持该对话框打开。</string>
     <string name="wireless_connect_no_service">20 秒内没有发现无线调试端口，请确认无线调试已开启。</string>
     <string name="wireless_paired_title">配对成功</string>
     <string name="wireless_paired_text">正在连接无线调试通道…</string>

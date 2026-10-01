@@ -223,9 +223,10 @@
     <string name="wireless_screen_unpaired">Not paired yet. Open wireless debugging and pair with the code from the notification.</string>
     <string name="wireless_screen_paired">Paired. Tap connect and self-check.</string>
     <string name="wireless_waiting_code">Waiting for the pairing code — type it into the notification</string>
+    <string name="wireless_waiting_service">Waiting for the pairing service: open \'Pair device with pairing code\' in Settings</string>
     <string name="wireless_pairing_busy">Pairing: finding the pairing service</string>
     <string name="wireless_connecting_busy">Connecting: finding the port and self-checking</string>
-    <string name="wireless_pair_no_service">No pairing service found in 30s. Keep the pairing dialog open.</string>
+    <string name="wireless_pair_no_service">No pairing service found. Open \'Pair device with pairing code\' in Settings and keep that dialog open.</string>
     <string name="wireless_connect_no_service">No wireless-debugging port found in 20s. Switch wireless debugging on.</string>
     <string name="wireless_paired_title">Paired</string>
     <string name="wireless_paired_text">Connecting the channel…</string>
