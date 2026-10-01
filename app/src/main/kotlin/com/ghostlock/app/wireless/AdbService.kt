@@ -184,17 +184,25 @@ object AdbService {
         val candidates = cli()?.mdnsServices()
             ?.filter { it.serviceType == SERVICE_CONNECT }
             ?.map { it.endpoint }
+            .distinct()
             .orEmpty()
-        for (endpoint in candidates.distinct()) {
+        if (candidates.isEmpty()) {
+            onLog("[!] 还没有发现无线调试端点：请确认「无线调试」已打开，并先在「打开无线调试」里完成配对")
+            return false
+        }
+        for (endpoint in candidates) {
             val result = cli()?.connect(endpoint) ?: return false
-            onLog("[*] adb connect $endpoint -> ${result.output.trim().ifBlank { "exit=${result.exitCode}" }}")
+            val message = result.output.trim().ifBlank { "exit=${result.exitCode}" }
             if (cli()?.stateOf(endpoint) == "device") {
                 serial = endpoint
                 everConnected = true
+                onLog("[*] 已连上 $endpoint")
                 liveness?.invoke(true)
                 return true
             }
+            onLog("[!] 连接 $endpoint 失败：$message")
         }
+        onLog("[!] 所有候选端点都没连上：请确认本机已完成配对（配对码是否输过），并保持无线调试开启")
         return false
     }
 
@@ -222,7 +230,7 @@ object AdbService {
             dropTransport(null, onLog)
         }
         if (!connectAdvertised(onLog)) {
-            throw IllegalStateException("没有可连接的无线调试端点（配对了吗？无线调试开着吗？）")
+            throw IllegalStateException("还没有可用的无线调试通道：请先完成配对并保持无线调试开启")
         }
         return serial ?: throw IllegalStateException("连接成功但没有拿到序列号")
     }

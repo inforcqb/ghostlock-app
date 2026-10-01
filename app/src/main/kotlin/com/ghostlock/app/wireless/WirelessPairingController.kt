@@ -154,11 +154,11 @@ object WirelessPairingController {
                 }
                 if (endpoints.isNotEmpty()) {
                     pairingEndpoint = endpoints.first()
-                    log("发现配对服务：$pairingEndpoint")
+                    log("发现配对端口：$pairingEndpoint")
                     if (endpoints.size > 1) log("其它候选：${endpoints.drop(1).joinToString()}")
                     WirelessNotifications.showCodeInput(
                         app,
-                        app.getString(R.string.wireless_pairing_code_hint),
+                        app.getString(R.string.wireless_code_input_found, pairingEndpoint),
                     )
                     mutate { it.copy(status = app.getString(R.string.wireless_waiting_code)) }
                     return@launch
