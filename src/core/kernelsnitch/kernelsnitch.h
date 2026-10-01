@@ -397,7 +397,7 @@ KernelSnitchContext *kernelsnitch_context_init(size_t __mm_struct_sz,
 /* How much of the candidate pool must have been scanned before an early exit is
  * accepted at all, as a percentage of total_futexes. */
 #ifndef KERNELSNITCH_EARLY_MIN_COVERAGE_PCT
-#define KERNELSNITCH_EARLY_MIN_COVERAGE_PCT 50
+#define KERNELSNITCH_EARLY_MIN_COVERAGE_PCT 100
 #endif
 
 typedef struct { size_t t, addr; } coll_cand_t;
