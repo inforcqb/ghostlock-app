@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GhostLock</string>
     <string name="action_run">执行</string>
@@ -246,4 +246,8 @@
     <string name="wireless_waiting_service">正在等待配对服务，请在设置里打开「使用配对码配对设备」</string>
     <string name="wireless_searching_service">正在寻找配对端口（请在设置里打开「使用配对码配对设备」）</string>
     <string name="wireless_code_input_found">已找到配对端口 %1$s，请在下面输入 6 位配对码</string>
+    <string name="wireless_identity_title">通道详情</string>
+    <string name="wireless_shell_identity_label">shell 身份</string>
+    <string name="wireless_seccomp_label">Seccomp</string>
+    <string name="wireless_endpoint_label">端点</string>
 </resources>

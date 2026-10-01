@@ -1081,7 +1081,7 @@ private fun RunButton(
 }
 
 @Composable
-private fun LogPanel(
+internal fun LogPanel(
     lines: List<GhostlockLogLine>,
     modifier: Modifier = Modifier,
 ) {

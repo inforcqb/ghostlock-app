@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GhostLock</string>
     <string name="action_run">Run</string>
@@ -248,4 +248,8 @@
     <string name="wireless_channel_description">Pairing-code input and channel state</string>
     <string name="wireless_log_title">Log</string>
     <string name="wireless_code_input_found">Pairing port %1$s found - enter the six-digit code below</string>
+    <string name="wireless_identity_title">Channel details</string>
+    <string name="wireless_shell_identity_label">Shell identity</string>
+    <string name="wireless_seccomp_label">Seccomp</string>
+    <string name="wireless_endpoint_label">Endpoint</string>
 </resources>
