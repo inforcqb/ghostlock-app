@@ -10,13 +10,11 @@ import android.util.Log
 import com.ghostlock.app.R
 import com.ghostlock.app.chain.ChainSpec
 import com.ghostlock.app.chain.ShellResult
-import io.github.muntashirakon.adb.AdbConnection
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Everything the wireless-debugging path knows, as one immutable snapshot.
@@ -58,22 +56,14 @@ object WirelessPairingController {
     private const val KEY_ENDPOINT = "endpoint"
 
     private const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
-    private const val CONNECT_DISCOVERY_TIMEOUT_MS = 20_000L
     private const val PAIRING_TIMEOUT_MS = 60_000L
 
     /**
      * Total connect + self-check rounds. Retries are driven by the self-check alone: a
-     * successful self-check returns immediately, a failed one spends one of these.
+     * successful self-check returns immediately, a failed one spends one of these. The
+     * connection itself lives in [AdbCommand] and never loops per command.
      */
     private const val CONNECT_ATTEMPTS = 4
-
-    /**
-     * The self-check runs `id` and `cat /proc/self/status` in ONE shell call, so it opens
-     * one stream instead of two (a kicked transport turned the second stream into a 30s
-     * hang on the device), and it fails fast into the retry budget.
-     */
-    private const val SELF_CHECK_TIMEOUT_MS = 15_000L
-    private const val SELF_CHECK_COMMAND = "id; cat /proc/self/status"
 
     private const val MAX_LOG_LINES = 200
 
@@ -83,7 +73,6 @@ object WirelessPairingController {
     private val lock = Any()
 
     private var current = WirelessState()
-    private var connection: AdbConnection? = null
 
     val state: WirelessState
         get() = synchronized(lock) { current }
@@ -150,7 +139,7 @@ object WirelessPairingController {
 
     fun forget(context: Context) {
         prefs(context).edit().clear().apply()
-        closeConnection()
+        AdbCommand.close()
         mutate {
             it.copy(
                 paired = false,
@@ -165,38 +154,24 @@ object WirelessPairingController {
         log("已清除本机的配对记录（adbd 侧的密钥仍在）")
     }
 
-    /** Exposed for the chain: run one command on the already-verified channel. */
-    fun runShell(command: String, timeoutMs: Long = 30_000L): String {
-        val active = connection ?: throw IllegalStateException("无线调试通道尚未连接")
-        return WirelessAdb.shell(active, command, timeoutMs)
-    }
-
     /**
      * Make sure the chain has a live channel, connecting (or reusing) one if needed.
      *
-     * The chain calls this before its first step: pairing is the standing authorization,
-     * so a connected channel may simply not exist yet when the user taps one-click root.
-     * A cheap probe follows, because "connected" is not the same as "usable".
+     * The chain calls this before its first step: pairing is the standing authorization, so
+     * a connected channel may simply not exist yet when the user taps one-click root. The
+     * session itself belongs to [AdbCommand] -- this only mirrors the result into the UI
+     * state.
      */
-    suspend fun ensureChannel(context: Context, onLog: (String) -> Unit): Boolean =
-        withContext(Dispatchers.IO) {
-            try {
-                val established = establish(context, reuse = true)
-                val probe = WirelessAdb.shell(established, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
-                val identity = probe.lineSequence()
-                    .firstOrNull { it.trimStart().startsWith("uid=") }
-                    ?.trim()
-                    .orEmpty()
-                val seccomp = Regex("Seccomp:\\s*(\\d+)").find(probe)?.groupValues?.get(1)
-                onLog("[*] 无线调试通道就绪：$identity Seccomp=${seccomp ?: "?"}")
-                true
-            } catch (error: Throwable) {
-                closeConnection()
-                onLog("[!] 无线调试通道不可用：${WirelessAdb.describe(error)}")
-                onLog("[!] 请先在「无线调试」里完成配对与连接（一键 root 依赖这条通道）")
-                false
-            }
+    suspend fun ensureChannel(context: Context, onLog: (String) -> Unit): Boolean {
+        val ready = AdbCommand.ensure(context, onLog)
+        if (ready) {
+            mutate { it.copy(shellReady = true, status = context.getString(R.string.wireless_status_ready)) }
+        } else {
+            onLog("[!] 请先在「无线调试」里完成配对与连接（一键 root 依赖这条通道）")
+            mutate { it.copy(shellReady = false) }
         }
+        return ready
+    }
 
     /**
      * One chain command on the channel.
@@ -211,21 +186,9 @@ object WirelessPairingController {
         command: String,
         timeoutMs: Long,
         onLog: (String) -> Unit,
-    ): ShellResult = withContext(Dispatchers.IO) {
-        onLog("$ $command")
-        val active = connection
-        if (active == null) {
-            onLog("[!] 无线调试通道未连接（命令没有运行）：$command")
-            return@withContext ShellResult(ChainSpec.TRANSPORT_FAILURE, "")
-        }
-        try {
-            val outcome = WirelessAdb.shellWithExitCode(active, command, timeoutMs)
-            outcome.output.lineSequence().filter { it.isNotBlank() }.forEach(onLog)
-            ShellResult(outcome.exitCode, outcome.output)
-        } catch (error: Throwable) {
-            onLog("[!] adb 通道执行失败：${WirelessAdb.describe(error)}")
-            ShellResult(ChainSpec.TRANSPORT_FAILURE, "")
-        }
+    ): ShellResult {
+        val result = AdbCommand.exec(context, command, timeoutMs, onLog)
+        return ShellResult(result.exitCode, result.output)
     }
 
     /**
@@ -248,7 +211,7 @@ object WirelessPairingController {
     }
 
     fun close() {
-        closeConnection()
+        AdbCommand.close()
     }
 
     /**
@@ -306,7 +269,7 @@ object WirelessPairingController {
 
     // ---------------------------------------------------------------- internals
 
-    private fun pairFlow(context: Context, code: String) {
+    private suspend fun pairFlow(context: Context, code: String) {
         mutate { it.copy(busy = true, status = context.getString(R.string.wireless_pairing_busy)) }
         try {
             log("查找 ${WirelessAdb.SERVICE_PAIRING} ...")
@@ -338,22 +301,20 @@ object WirelessPairingController {
     }
 
     /**
-     * Connect (or reuse a live connection) and prove the channel works.
+     * Prove the channel works, retrying only when the self-check fails.
      *
      * Retry semantics (user-set, 2026-10-01): **four attempts in total, and only a failed
      * self-check justifies the next one -- a successful self-check stops immediately.**
-     * Each round is exactly one connect plus one self-check; the connect itself never
-     * loops (it used to run 4 connections in a row inside `WirelessAdb.connect`, which
-     * made adbd kick three transports while the real problem was the self-check).
      *
-     * Connection discipline, straight from the device log: adbd kicks a transport when a
+     * The connection is [AdbCommand]'s business, not this function's: it reuses a live
+     * session when there is one and drops a session that failed, so a round here never
+     * creates a second connection. That matters because adbd kicks a transport when a
      * second connection shows up under the same client identity
      * (`I/adbd: kicking transport ... host-25`, then `SSL_read failed`, then
-     * `ADB wifi device disconnected`), which killed the stream a self-check had just
-     * opened. So: reuse a live connection whenever there is one, and when a new one is
-     * really needed, close the old one *before* connecting -- never hold two.
+     * `ADB wifi device disconnected`) -- which is what used to break the run right after a
+     * successful self-check.
      */
-    private fun connectFlow(context: Context, alreadyBusy: Boolean = false) {
+    private suspend fun connectFlow(context: Context, alreadyBusy: Boolean = false) {
         if (!alreadyBusy) {
             mutate {
                 it.copy(busy = true, status = context.getString(R.string.wireless_connecting_busy))
@@ -366,20 +327,19 @@ object WirelessPairingController {
             var attempt = 0
             while (true) {
                 attempt++
-                val established = establish(context, reuse = attempt == 1)
                 try {
-                    verify(context, established)
+                    verify(context)
                     return
                 } catch (error: Throwable) {
                     log("自检失败（第 $attempt/$CONNECT_ATTEMPTS 次）：${WirelessAdb.describe(error)}")
-                    closeConnection()
+                    AdbCommand.close()
                     if (attempt >= CONNECT_ATTEMPTS) throw error
-                    log("丢弃这条连接，重连后再自检（第 ${attempt + 1}/$CONNECT_ATTEMPTS 次）")
+                    log("会话已丢弃，重连后再自检（第 ${attempt + 1}/$CONNECT_ATTEMPTS 次）")
                     mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
                 }
             }
         } catch (error: Throwable) {
-            closeConnection()
+            AdbCommand.close()
             markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
         } finally {
             /* Nothing of this flow should stay in the shade: the prompt is cancelled when
@@ -389,37 +349,23 @@ object WirelessPairingController {
         }
     }
 
-    /** A live connection, or a fresh one; keeps [connection] in sync either way. */
-    private fun establish(context: Context, reuse: Boolean): AdbConnection {
-        if (reuse) {
-            val active = connection
-            val alive = active != null &&
-                runCatching { active.isConnected && active.isConnectionEstablished }
-                    .getOrDefault(false)
-            if (alive) {
-                log("复用已有连接（同一身份重复建链会被 adbd kick）")
-                return active!!
-            }
-        }
-        /* Close first, connect second: never two connections under the same identity. */
-        closeConnection()
-        log("查找 ${WirelessAdb.SERVICE_CONNECT} ...")
-        val endpoint = WirelessAdb.discover(
+    /**
+     * `id` + `/proc/self/status` in ONE command through [AdbCommand]: uid 2000 and
+     * `Seccomp: 0` are what W1 needs, and one call means one stream.
+     *
+     * Throws when the command did not come back, which is what spends a retry round.
+     */
+    private suspend fun verify(context: Context) {
+        val result = AdbCommand.exec(
             context,
-            WirelessAdb.SERVICE_CONNECT,
-            CONNECT_DISCOVERY_TIMEOUT_MS,
-        ) ?: throw IllegalStateException(context.getString(R.string.wireless_connect_no_service))
-        log("连接端点 $endpoint")
-        val established = WirelessAdb.connect(context, endpoint)
-        connection = established
-        log("adb 已连接（TLS + AUTH，用的是配对登记的密钥）")
-        return established
-    }
-
-    /** `id` + `/proc/self/status`: uid 2000 and `Seccomp: 0` are what W1 needs. */
-    private fun verify(context: Context, established: AdbConnection) {
-        val text = WirelessAdb.shell(established, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
-        log("$ $SELF_CHECK_COMMAND\n${text.trim()}")
+            AdbCommand.SELF_CHECK_COMMAND,
+            AdbCommand.SELF_CHECK_TIMEOUT_MS,
+            ::log,
+        )
+        if (result.transportFailure) {
+            throw IllegalStateException("自检没有返回结果（通道失效）")
+        }
+        val text = result.output
         val identity = text.lineSequence()
             .firstOrNull { it.trimStart().startsWith("uid=") }
             ?.trim()
@@ -456,11 +402,6 @@ object WirelessPairingController {
                 context.getString(R.string.wireless_shell_not_ready, identity, seccomp),
             )
         }
-    }
-
-    private fun closeConnection() {
-        WirelessAdb.closeQuietly(connection)
-        connection = null
     }
 
     private fun savePaired(context: Context, endpoint: AdbEndpoint) {

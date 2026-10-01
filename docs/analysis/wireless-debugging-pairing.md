@@ -159,7 +159,24 @@ adb shell id
    （`isConnected && isConnectionEstablished`），必须重连时**先关旧、再连新**；自检失败则丢弃连接、
    自动重连一次再自检，绝不留半死连接在字段里。
 
-## 8. 仍未验证 / 风险
+## 9. 单一入口：`AdbCommand`
+
+设备实测暴露出一类"谁持有 socket"的 bug：自检成功后那条连接被占住，下一次点连接又去建新连接，
+adbd 就 kick 掉一条 transport（`I/adbd: kicking transport ... host-25`）——两边一起死。
+按用户 2026-10-01 的要求，把 libadb 调用封装成**唯一入口** `wireless/AdbCommand.kt`：
+
+* **同一时刻只有一条会话**：`exec()` 先复用活着的连接，只有在会话确实死了才重连（重连前先关旧的）；
+* **命令串行化**（`Mutex`）：链的步骤与界面点击不可能交错成"两条同身份连接"的竞争；
+* **死的会话在这里被关掉**：kicked transport 会让 libadb 的连接标记仍是 connected 而读线程永不返回，
+  于是挂死读 / `Stream closed.` / 探针缺失三种迹象都归到这里处理，下一条命令必然重连；
+* **连接可以重试，命令不可以**：连接失败能证明"什么都没跑"，所以允许 3 次尝试；
+  而一次失败的命令读**可能已经执行过**——`am hang --allow-restart`、`rmmod oplus_security_guard`、
+  `/data/adb/ksud late-load` 重复执行比停下更糟——所以命令层一律不重试，统一返回
+  `ChainSpec.TRANSPORT_FAILURE`，由链的 `NON_IDEMPOTENT` 策略决定能不能重来。
+
+界面自检的重试口径不变：**总共 4 次，只有自检失败才花掉一次，成功立即中断**。
+
+## 10. 仍未验证 / 风险
 
 * **root adbd 是否认配对密钥**：本轮之后必须真机证实（第 ④ 步开门后连 5555）。
   推理上成立（adb_keys 不随 adbd 重启丢失），但**没有实测证据**，属于假设。
