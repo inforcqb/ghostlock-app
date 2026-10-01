@@ -142,7 +142,6 @@ object WirelessPairingController {
 
     fun forget(context: Context) {
         prefs(context).edit().clear().apply()
-        AdbCommand.close()
         mutate {
             it.copy(
                 paired = false,
@@ -211,9 +210,11 @@ object WirelessPairingController {
         return true
     }
 
-    fun close() {
-        AdbCommand.close()
-    }
+    /**
+     * Nothing to release: `adb_command` opens one channel per command and closes it again,
+     * so the app never holds a session between commands.
+     */
+    fun close() = Unit
 
     /**
      * Jump to the system's wireless-debugging page.
@@ -333,14 +334,12 @@ object WirelessPairingController {
                     return
                 } catch (error: Throwable) {
                     log("自检失败 第$attempt/$CONNECT_ATTEMPTS 次：${WirelessAdb.describe(error)}")
-                    AdbCommand.close()
                     if (attempt >= CONNECT_ATTEMPTS) throw error
-                    log("会话已丢弃，重连后再自检 第${attempt + 1}/$CONNECT_ATTEMPTS 次")
+                    log("重新自检 第${attempt + 1}/$CONNECT_ATTEMPTS 次")
                     mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
                 }
             }
         } catch (error: Throwable) {
-            AdbCommand.close()
             markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
         } finally {
             /* Nothing of this flow should stay in the shade: the prompt is cancelled when

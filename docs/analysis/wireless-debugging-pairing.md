@@ -159,22 +159,33 @@ adb shell id
    （`isConnected && isConnectionEstablished`），必须重连时**先关旧、再连新**；自检失败则丢弃连接、
    自动重连一次再自检，绝不留半死连接在字段里。
 
-## 9. 单一入口：`AdbCommand`
+## 9. 单一入口：`AdbCommand`（一条命令 = 一条通道）
 
-设备实测暴露出一类"谁持有 socket"的 bug：自检成功后那条连接被占住，下一次点连接又去建新连接，
-adbd 就 kick 掉一条 transport（`I/adbd: kicking transport ... host-25`）——两边一起死。
-按用户 2026-10-01 的要求，把 libadb 调用封装成**唯一入口** `wireless/AdbCommand.kt`：
+设备上反复出现的失败都指向同一个问题：**会话该不该被保留**。
 
-* **同一时刻只有一条会话**：`exec()` 先复用活着的连接，只有在会话确实死了才重连（重连前先关旧的）；
-* **命令串行化**（`Mutex`）：链的步骤与界面点击不可能交错成"两条同身份连接"的竞争；
-* **死的会话在这里被关掉**：kicked transport 会让 libadb 的连接标记仍是 connected 而读线程永不返回，
-  于是挂死读 / `Stream closed.` / 探针缺失三种迹象都归到这里处理，下一条命令必然重连；
-* **连接可以重试，命令不可以**：连接失败能证明"什么都没跑"，所以允许 3 次尝试；
-  而一次失败的命令读**可能已经执行过**——`am hang --allow-restart`、`rmmod oplus_security_guard`、
-  `/data/adb/ksud late-load` 重复执行比停下更糟——所以命令层一律不重试，统一返回
-  `ChainSpec.TRANSPORT_FAILURE`，由链的 `NON_IDEMPOTENT` 策略决定能不能重来。
+* 保留会话时，adbd 会在同身份的第二条连接出现时 kick 一条 transport
+  （`I/adbd: kicking transport ... host-25`），而被 kick 的连接在 libadb 里**标志仍然是
+  connected**（`isConnected`/`isConnectionEstablished` 都为 true）、读线程却再也不返回 ⇒
+  下一条命令要么卡满看门狗、要么在新开的流上抛 `Stream closed.`；
+* 真机日志把这条链走了一遍：`复用已有连接` → 探针判定会话已死 → 重连 → 新连接的第一条命令又是
+  `Stream closed.`，一条接一条；读 `enforce` 连续失败后链按"不猜"策略停下。
 
-界面自检的重试口径不变：**总共 4 次，只有自检失败才花掉一次，成功立即中断**。
+因此按用户 2026-10-01 的要求改成：**`adb_command` 每执行一条命令就开一条自己的连接，执行完
+完整释放（`close()`），命令之间不保留任何会话**（`adb shell cmd` 本身也是这个模型）。
+释放与下一次连接之间留 [RELEASE_SETTLE_MS] 的间隔，避免 adbd 把新连接当成"还没拆完的重复连接"。
+
+重试口径（也是用户定稿）：
+
+* `adb_command(command)` / `adb_command(command, retries)` —— 第二个参数是**通道失败**的重试次数，默认 3；
+  "通道失败"= 连接没建起来，或流在报出退出码之前就断了；
+* **不可重复的命令永不重试**：命令文本命中 `ChainSpec.NON_IDEMPOTENT`
+  （`am hang --allow-restart`、`rmmod oplus_security_guard`、`/data/adb/ksud late-load`、两条 `setprop`）时，
+  即使还有重试预算也直接停下并返回 `TRANSPORT_FAILURE` —— 一次失败的读可能意味着命令**已经跑过**，
+  重复执行比停下更糟。这条保护做在 `AdbCommand` 里，不依赖调用方自觉；
+* 幂等的自检（`ensure`）则按同一预算整轮重来。
+
+`WirelessPairingController` 不再持有连接：自检、链的 `execChainCommand`/`runW1OnChannel`/`ensureChannel`
+全部走 `AdbCommand`；界面自检的重试口径不变（4 次，失败才花掉一次，成功立即停）。
 
 ## 10. 仍未验证 / 风险
 
