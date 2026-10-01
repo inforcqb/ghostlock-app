@@ -145,6 +145,20 @@ adb shell id
 `adbkey.pk8` 与配对记录** ⇒ 每装一个构建都要重新配对。仓内固定 key 之后，构建之间 `adb install -r`
 直接可用，密钥与配对状态都保留。解析顺序：`local.properties` → 环境变量/secrets → 仓内 key（secrets 优先）。
 
+5. **同一身份的第二条连接会被 adbd kick** ✗
+   第二次点「连接并自检」时，新连接刚建好，自检的第一条命令就抛 `IOException: Stream closed.`。
+   adbd 侧日志（`adb logcat -s adbd`）说明了一切：
+   ```
+   I/adbd: kicking transport 0xb400007c5746d180 host-25
+   E/adbd: [server]: SSL_read failed [invalid library (0)]
+   I/adbd: ADB wifi device disconnected
+   W/System.err: java.io.IOException: Stream closed
+   ```
+   即：**以同一客户端身份再建一条连接，adbd 会 kick 掉一条 transport**，而被 kick 的正是自检刚打开流的
+   那条。原先的实现是"先建新连接、再关旧连接"，等于瞬间存在两条同身份连接。**修法**：能复用就复用
+   （`isConnected && isConnectionEstablished`），必须重连时**先关旧、再连新**；自检失败则丢弃连接、
+   自动重连一次再自检，绝不留半死连接在字段里。
+
 ## 8. 仍未验证 / 风险
 
 * **root adbd 是否认配对密钥**：本轮之后必须真机证实（第 ④ 步开门后连 5555）。

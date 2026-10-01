@@ -132,8 +132,7 @@ object WirelessPairingController {
 
     fun forget(context: Context) {
         prefs(context).edit().clear().apply()
-        WirelessAdb.closeQuietly(connection)
-        connection = null
+        closeConnection()
         mutate {
             it.copy(
                 paired = false,
@@ -155,8 +154,7 @@ object WirelessPairingController {
     }
 
     fun close() {
-        WirelessAdb.closeQuietly(connection)
-        connection = null
+        closeConnection()
     }
 
     /**
@@ -245,6 +243,19 @@ object WirelessPairingController {
         }
     }
 
+    /**
+     * Connect (or reuse a live connection) and prove the channel works.
+     *
+     * Connection discipline, straight from the device log: adbd kicks a transport when a
+     * second connection shows up under the same client identity
+     * (`I/adbd: kicking transport ... host-25`, then `SSL_read failed`, then
+     * `ADB wifi device disconnected`), which killed the stream a self-check had just
+     * opened. So: reuse a live connection whenever there is one, and when a new one is
+     * really needed, close the old one *before* connecting -- never hold two.
+     *
+     * If a reused connection turns out to be dead (its transport was kicked), drop it and
+     * do exactly one fresh attempt before reporting failure.
+     */
     private fun connectFlow(context: Context, alreadyBusy: Boolean = false) {
         if (!alreadyBusy) {
             mutate {
@@ -254,58 +265,23 @@ object WirelessPairingController {
             mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
         }
         try {
-            log("查找 ${WirelessAdb.SERVICE_CONNECT} ...")
-            val endpoint = WirelessAdb.discover(
-                context,
-                WirelessAdb.SERVICE_CONNECT,
-                CONNECT_DISCOVERY_TIMEOUT_MS,
-            )
-            if (endpoint == null) {
-                markFailed(context, context.getString(R.string.wireless_connect_no_service))
-                return
-            }
-            log("连接端点 $endpoint")
-            val established = WirelessAdb.connect(context, endpoint)
-            WirelessAdb.closeQuietly(connection)
-            connection = established
-            log("adb 已连接（TLS + AUTH，用的是配对登记的密钥）")
-
-            val identity = WirelessAdb.shell(established, "id").trim()
-            log("$ id\n$identity")
-            val status = WirelessAdb.shell(established, "cat /proc/self/status")
-            val seccomp = Regex("Seccomp:\\s*(\\d+)").find(status)?.groupValues?.get(1)?.toIntOrNull() ?: -1
-            val uid = Regex("Uid:\\s*(\\d+)").find(status)?.groupValues?.get(1).orEmpty()
-            log("通道身份：uid=$uid Seccomp=$seccomp")
-            val ready = identity.contains("uid=2000") && seccomp == 0
-            mutate {
-                it.copy(
-                    shellReady = ready,
-                    identity = identity,
-                    shellUid = uid,
-                    seccomp = seccomp,
-                    status = if (ready) {
-                        context.getString(R.string.wireless_shell_ready, identity, seccomp)
-                    } else {
-                        context.getString(R.string.wireless_shell_not_ready, identity, seccomp)
-                    },
-                )
-            }
-            if (ready) {
-                log("通道就绪 ✓ uid=2000 且 Seccomp: 0 ⇒ 可用来跑 W1")
-                WirelessNotifications.showStatus(
-                    context,
-                    context.getString(R.string.wireless_ready_title),
-                    context.getString(R.string.wireless_shell_ready, identity, seccomp),
-                )
-            } else {
-                log("通道未达预期 ✗ 需要 uid=2000 且 Seccomp: 0（当前 uid=$uid Seccomp=$seccomp）")
-                WirelessNotifications.showStatus(
-                    context,
-                    context.getString(R.string.wireless_failed_title),
-                    context.getString(R.string.wireless_shell_not_ready, identity, seccomp),
-                )
+            var attempt = 0
+            while (true) {
+                attempt++
+                val established = establish(context, reuse = attempt == 1)
+                try {
+                    verify(context, established)
+                    return
+                } catch (error: Throwable) {
+                    log("自检失败（第 $attempt 次）：${WirelessAdb.describe(error)}")
+                    closeConnection()
+                    if (attempt >= 2) throw error
+                    log("丢弃这条连接，重连一次再自检")
+                    mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
+                }
             }
         } catch (error: Throwable) {
+            closeConnection()
             markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
         } finally {
             /* Nothing of this flow should stay in the shade: the prompt is cancelled when
@@ -313,6 +289,77 @@ object WirelessPairingController {
             WirelessNotifications.cancelCodeInput(context)
             mutate { it.copy(busy = false) }
         }
+    }
+
+    /** A live connection, or a fresh one; keeps [connection] in sync either way. */
+    private fun establish(context: Context, reuse: Boolean): AdbConnection {
+        if (reuse) {
+            val active = connection
+            val alive = active != null &&
+                runCatching { active.isConnected && active.isConnectionEstablished }
+                    .getOrDefault(false)
+            if (alive) {
+                log("复用已有连接（同一身份重复建链会被 adbd kick）")
+                return active!!
+            }
+        }
+        /* Close first, connect second: never two connections under the same identity. */
+        closeConnection()
+        log("查找 ${WirelessAdb.SERVICE_CONNECT} ...")
+        val endpoint = WirelessAdb.discover(
+            context,
+            WirelessAdb.SERVICE_CONNECT,
+            CONNECT_DISCOVERY_TIMEOUT_MS,
+        ) ?: throw IllegalStateException(context.getString(R.string.wireless_connect_no_service))
+        log("连接端点 $endpoint")
+        val established = WirelessAdb.connect(context, endpoint)
+        connection = established
+        log("adb 已连接（TLS + AUTH，用的是配对登记的密钥）")
+        return established
+    }
+
+    /** `id` + `/proc/self/status`: uid 2000 and `Seccomp: 0` are what W1 needs. */
+    private fun verify(context: Context, established: AdbConnection) {
+        val identity = WirelessAdb.shell(established, "id").trim()
+        log("$ id\n$identity")
+        val status = WirelessAdb.shell(established, "cat /proc/self/status")
+        val seccomp = Regex("Seccomp:\\s*(\\d+)").find(status)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        val uid = Regex("Uid:\\s*(\\d+)").find(status)?.groupValues?.get(1).orEmpty()
+        log("通道身份：uid=$uid Seccomp=$seccomp")
+        val ready = identity.contains("uid=2000") && seccomp == 0
+        mutate {
+            it.copy(
+                shellReady = ready,
+                identity = identity,
+                shellUid = uid,
+                seccomp = seccomp,
+                status = if (ready) {
+                    context.getString(R.string.wireless_shell_ready, identity, seccomp)
+                } else {
+                    context.getString(R.string.wireless_shell_not_ready, identity, seccomp)
+                },
+            )
+        }
+        if (ready) {
+            log("通道就绪 ✓ uid=2000 且 Seccomp: 0 ⇒ 可用来跑 W1")
+            WirelessNotifications.showStatus(
+                context,
+                context.getString(R.string.wireless_ready_title),
+                context.getString(R.string.wireless_shell_ready, identity, seccomp),
+            )
+        } else {
+            log("通道未达预期 ✗ 需要 uid=2000 且 Seccomp: 0（当前 uid=$uid Seccomp=$seccomp）")
+            WirelessNotifications.showStatus(
+                context,
+                context.getString(R.string.wireless_failed_title),
+                context.getString(R.string.wireless_shell_not_ready, identity, seccomp),
+            )
+        }
+    }
+
+    private fun closeConnection() {
+        WirelessAdb.closeQuietly(connection)
+        connection = null
     }
 
     private fun savePaired(context: Context, endpoint: AdbEndpoint) {
