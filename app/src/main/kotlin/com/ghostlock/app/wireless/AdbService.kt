@@ -184,7 +184,7 @@ object AdbService {
         val candidates = cli()?.mdnsServices()
             ?.filter { it.serviceType == SERVICE_CONNECT }
             ?.map { it.endpoint }
-            .distinct()
+            ?.distinct()
             .orEmpty()
         if (candidates.isEmpty()) {
             onLog("[!] 还没有发现无线调试端点：请确认「无线调试」已打开，并先在「打开无线调试」里完成配对")
