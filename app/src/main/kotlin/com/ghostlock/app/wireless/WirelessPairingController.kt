@@ -84,6 +84,10 @@ object WirelessPairingController {
         /* Channel diagnostics go to this screen's log unless a caller passes its own sink
          * (the chain does, so its step log gets them instead). */
         AdbCommand.setLogger(::log)
+        /* The channel is kept alive by AdbService; mirror its state so the UI follows. */
+        AdbCommand.setLivenessListener { alive ->
+            if (!alive) mutate { it.copy(shellReady = false) }
+        }
         val prefs = prefs(context)
         val paired = prefs.getBoolean(KEY_PAIRED, false)
         val endpoint = prefs.getString(KEY_ENDPOINT, "").orEmpty()

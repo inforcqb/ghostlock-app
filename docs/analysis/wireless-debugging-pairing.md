@@ -159,33 +159,28 @@ adb shell id
    （`isConnected && isConnectionEstablished`），必须重连时**先关旧、再连新**；自检失败则丢弃连接、
    自动重连一次再自检，绝不留半死连接在字段里。
 
-## 9. 单一入口：`AdbCommand`（一条命令 = 一条通道）
+## 9. 通道管理：`AdbService`（持有连接 + 保活）与 `AdbCommand`（发命令）
 
-设备上反复出现的失败都指向同一个问题：**会话该不该被保留**。
+设备上的失败分两类，而"一条命令一条通道"只解决了一类：
 
-* 保留会话时，adbd 会在同身份的第二条连接出现时 kick 一条 transport
-  （`I/adbd: kicking transport ... host-25`），而被 kick 的连接在 libadb 里**标志仍然是
-  connected**（`isConnected`/`isConnectionEstablished` 都为 true）、读线程却再也不返回 ⇒
-  下一条命令要么卡满看门狗、要么在新开的流上抛 `Stream closed.`；
-* 真机日志把这条链走了一遍：`复用已有连接` → 探针判定会话已死 → 重连 → 新连接的第一条命令又是
-  `Stream closed.`，一条接一条；读 `enforce` 连续失败后链按"不猜"策略停下。
+* 每命令一条通道 ⇒ **连接次数暴增**，而同一客户端身份的每次新连接都有被 adbd kick 的风险（adbd 在
+  同身份出现第二条连接时会 kick 一条 transport），实测约一半的新连接首条命令就 `Stream closed.`；
+* 持有一条会话 ⇒ 不会再撞这个竞争，但会话会**悄悄变成僵尸**：被 kick 的 transport 在 libadb 里
+  `isConnected`/`isConnectionEstablished` 仍然是 true，而读线程再也不返回。
 
-因此按用户 2026-10-01 的要求改成：**`adb_command` 每执行一条命令就开一条自己的连接，执行完
-完整释放（`close()`），命令之间不保留任何会话**（`adb shell cmd` 本身也是这个模型）。
-释放与下一次连接之间留 [RELEASE_SETTLE_MS] 的间隔，避免 adbd 把新连接当成"还没拆完的重复连接"。
+因此按用户 2026-10-01 的定稿改成两层：
 
-重试口径（也是用户定稿）：
+* **`wireless/AdbService.kt`** —— 会话的所有者：开一条连接并**持有**它；每 5s 跑一次往返探针
+  （`true`，5s 预算）**主动**发现僵尸并丢弃/重连（`everConnected` 之后才重连，避免用户还没配对时刷日志）；
+  会话只能有一条，重连前先关旧的；所有操作走同一个 `Mutex`，所以保活探针不会和长命令（例如 W1）打架。
+* **`wireless/AdbCommand.kt`** —— 薄壳：`exec(command)` / `exec(command, retries)`，把命令交给
+  `AdbService`。第二个可选参数 = **通道失败**的重试轮数（默认 3）：一轮 = 拿到可用会话 + 执行一次命令，
+  失败则丢弃会话、等待、换新会话再来；命中 `ChainSpec.NON_IDEMPOTENT` 的命令只跑一轮
+  （验证一次、执行一次、绝不重复）。
 
-* `adb_command(command)` / `adb_command(command, retries)` —— 第二个参数是**通道失败**的重试次数，默认 3；
-  "通道失败"= 连接没建起来，或流在报出退出码之前就断了；
-* **不可重复的命令永不重试**：命令文本命中 `ChainSpec.NON_IDEMPOTENT`
-  （`am hang --allow-restart`、`rmmod oplus_security_guard`、`/data/adb/ksud late-load`、两条 `setprop`）时，
-  即使还有重试预算也直接停下并返回 `TRANSPORT_FAILURE` —— 一次失败的读可能意味着命令**已经跑过**，
-  重复执行比停下更糟。这条保护做在 `AdbCommand` 里，不依赖调用方自觉；
-* 幂等的自检（`ensure`）则按同一预算整轮重来。
-
-`WirelessPairingController` 不再持有连接：自检、链的 `execChainCommand`/`runW1OnChannel`/`ensureChannel`
-全部走 `AdbCommand`；界面自检的重试口径不变（4 次，失败才花掉一次，成功立即停）。
+配套修掉的解析 bug：`cat /sys/fs/selinux/enforce` **输出不带换行**，原来的 `echo MARK$?` 会接在同一行
+（`1__GHOSTLOCK_EXIT__0`），按行解析就找不到标记、把成功的命令判成通道失败。现在先 `echo` 补一个换行，
+并且解析改为**从最后一次出现的标记处取数字**，标记之前的内容全部算命令输出。
 
 ## 10. 仍未验证 / 风险
 
