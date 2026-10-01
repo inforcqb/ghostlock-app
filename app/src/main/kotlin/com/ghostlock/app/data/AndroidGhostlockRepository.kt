@@ -5,7 +5,9 @@ import com.ghostlock.app.chain.DeviceSync
 import com.ghostlock.app.chain.RootAdbRunner
 import com.ghostlock.app.chain.W1Stage
 import com.ghostlock.app.wireless.RootAdbd
+import com.ghostlock.app.wireless.AdbCommand
 import com.ghostlock.app.chain.ChainProgress
+import com.ghostlock.app.chain.ChainSpec
 import com.ghostlock.app.chain.RootChain
 import com.ghostlock.app.root.IsolatedRootShell
 import com.ghostlock.app.root.RootChannel
@@ -18,6 +20,8 @@ import android.system.Os
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.ghostlock.app.domain.model.CpuPair
+import com.ghostlock.app.domain.model.ChainPhase
+import com.ghostlock.app.domain.model.ChainPhaseRule
 import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.KernelOffsets
 import com.ghostlock.app.domain.model.KernelSnapshot
@@ -86,6 +90,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private var pendingParsedEntries: ValueList? = null
 
     /**
+     * Last phase the device reported (SELinux + `Seccomp`, see [chainPhase]).
+     *
+     * It survives a failed read on purpose: after `am hang --allow-restart` the app instance is
+     * brand new and the channel may not be up yet when the first refresh runs, and showing
+     * PART1 at that moment would hide exactly the half the run is about to work in.
+     */
+    @Volatile
+    private var lastChainPhase: ChainPhase = ChainPhase.PART1
+
+    /**
      * Holds the binding to this app's isolated uid-0 root service (`bindIsolatedService`).
      * It is created here and deliberately never released: unbinding destroys the isolated
      * process, and with it the uid-0 shell channel the later chain steps talk to.
@@ -115,7 +129,35 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             selectedCpuPair = selectedCpuPair,
             safeModeEnabled = safeModeEnabled,
             wirelessStatus = wirelessChannelStatus(),
+            chainPhase = chainPhase(),
         )
+    }
+
+    /**
+     * The half of the exploit path this boot is in, from the two live facts that define the
+     * split: SELinux and the shell's `Seccomp` (see [ChainPhaseRule]).
+     *
+     * Read over the same uid-2000 channel the chain's steps use, but only when something is
+     * paired -- a refresh must not sit through the channel's connect/retry budget. A failed
+     * read (or no pairing at all) keeps [lastChainPhase]: the facts only change on a reboot or
+     * when W1 lands, and on a reboot this process is gone anyway, so the last value is the
+     * better answer than falling back to PART1 and hiding the half the device is in.
+     */
+    private suspend fun chainPhase(): ChainPhase {
+        if (!WirelessPairingController.state.paired) return lastChainPhase
+        val enforce = runCatching {
+            AdbCommand.exec(ChainSpec.READ_ENFORCE, retries = 1, timeoutMs = 10_000)
+        }.getOrNull()?.takeIf { !it.transportFailure } ?: return lastChainPhase
+        val seccomp = runCatching {
+            AdbCommand.exec(ChainSpec.READ_STATUS, retries = 1, timeoutMs = 10_000)
+        }.getOrNull()?.takeIf { !it.transportFailure }?.output
+            ?.lineSequence()
+            ?.firstOrNull { it.startsWith("Seccomp:") }
+            ?.substringAfter(':')
+            ?: return lastChainPhase
+        val phase = ChainPhaseRule.of(enforce.output, seccomp)
+        lastChainPhase = phase
+        return phase
     }
 
     /**

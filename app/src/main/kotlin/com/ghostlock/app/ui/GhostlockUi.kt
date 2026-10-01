@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.sp
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.BuildInfo
 import com.ghostlock.app.R
+import com.ghostlock.app.domain.model.ChainPhase
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.WirelessChannelStatus
@@ -148,6 +149,12 @@ data class GhostlockUiState(
      * and then updated in place; empty means no chain run happened in this session.
      */
     val rootChainSteps: List<RootChainStepUi> = emptyList(),
+    /**
+     * Which half of the path is displayed: read from SELinux + `Seccomp`
+     * (`am hang --allow-restart` is the boundary). Steps of the other half are not shown; the
+     * preflight step has no phase and is always shown.
+     */
+    val chainPhase: ChainPhase = ChainPhase.PART1,
 )
 
 enum class DialogType { NONE, LIST, INPUT, CONFIRM }
@@ -159,6 +166,8 @@ data class RootChainStepUi(
     /** String resource id; the UI resolves it so both locales work. */
     val labelRes: Int,
     val detail: String = "",
+    /** Null for the preflight step, which belongs to neither half of the path. */
+    val phase: ChainPhase? = null,
     val state: RootChainStepState = RootChainStepState.PENDING,
 )
 
@@ -437,6 +446,7 @@ private fun GhostlockExecutionSheet(
                 if (state.rootChainSteps.isNotEmpty()) {
                     RootChainStepPanel(
                         steps = state.rootChainSteps,
+                        phase = state.chainPhase,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 12.dp),
@@ -453,12 +463,21 @@ private fun GhostlockExecutionSheet(
     )
 }
 
-/** Chain progress card: one row per step, shown only while a chain run is known. */
+/**
+ * Chain progress card: one row per step **of the current half of the path**.
+ *
+ * The path is split by `am hang --allow-restart` and the device's SELinux/Seccomp state decides
+ * which half this run is in (see [ChainPhaseRule]); showing the other half's steps would only
+ * say "not started" about work that belongs to a different run. [ChainStep.PREFLIGHT] is not
+ * part of the split, so it is always shown.
+ */
 @Composable
 private fun RootChainStepPanel(
     steps: List<RootChainStepUi>,
+    phase: ChainPhase,
     modifier: Modifier = Modifier,
 ) {
+    val visible = steps.filter { it.phase == null || it.phase == phase }
     Card(
         modifier = modifier,
         insideMargin = PaddingValues(16.dp),
@@ -468,12 +487,18 @@ private fun RootChainStepPanel(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = stringResource(R.string.root_chain_steps_title),
+                text = stringResource(R.string.root_chain_steps_title) + " · " + stringResource(
+                    if (phase == ChainPhase.PART2) {
+                        R.string.root_chain_part2
+                    } else {
+                        R.string.root_chain_part1
+                    },
+                ),
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Medium,
                 color = MiuixTheme.colorScheme.onSurface,
             )
-            for (step in steps) {
+            for (step in visible) {
                 RootChainStepRow(step = step)
             }
         }

@@ -18,9 +18,47 @@ data class KernelSnapshot(
      * `Seccomp: 0`) reached by pairing. Shizuku used to play that role and is gone.
      */
     val wirelessStatus: WirelessChannelStatus,
+    /**
+     * Which half of the exploit path this boot is in -- see [ChainPhase] and [ChainPhaseRule].
+     * The screen shows only the steps of that half; the preflight step is not part of the split.
+     */
+    val chainPhase: ChainPhase = ChainPhase.PART1,
 )
 
 enum class WirelessChannelStatus { NOT_PAIRED, PAIRED, READY }
+
+/**
+ * Which half of the exploit path the device is in.
+ *
+ * The path is cut in two by `am hang --allow-restart`: everything before that command runs in
+ * the boot where SELinux is still Enforcing, everything after it runs in the app instance the
+ * watchdog's framework restart produces. The screen shows the half the device is actually in,
+ * instead of the whole path.
+ */
+enum class ChainPhase {
+    /** Before `am hang`: W1 and the framework restart itself. */
+    PART1,
+
+    /** After `am hang`: the uid-0 channel, the adb gate, `rmmod`, `ksud late-load`. */
+    PART2,
+}
+
+/**
+ * The phase, read from the device's own state.
+ *
+ * `enforce == 0` **and** `Seccomp: 0` is the state W1 leaves behind -- permissive, and the
+ * shell uid carrying no seccomp filter -- and the framework restart undoes neither, so that
+ * pair means this boot is already past `am hang`. Anything else (enforcing, unreadable, a
+ * non-zero seccomp) is [ChainPhase.PART1], which is also the safe default: PART1 is the half
+ * whose first action, W1, establishes the state PART2 depends on.
+ */
+object ChainPhaseRule {
+    fun of(enforce: String?, seccomp: String?): ChainPhase {
+        val permissive = enforce?.trim()?.startsWith("0") == true
+        val noSeccomp = seccomp?.trim() == "0"
+        return if (permissive && noSeccomp) ChainPhase.PART2 else ChainPhase.PART1
+    }
+}
 
 enum class LogTone { Default, Error, Success, Warning, Progress }
 

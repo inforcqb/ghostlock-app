@@ -634,6 +634,7 @@ class GhostlockViewModel(
         val entry = RootChainStepUi(
             labelRes = chainStepLabelRes(progress.step),
             detail = progress.detail,
+            phase = progress.step.phase,
             state = when (progress.state) {
                 StepState.RUNNING -> RootChainStepState.RUNNING
                 StepState.OK -> RootChainStepState.OK
@@ -658,11 +659,14 @@ class GhostlockViewModel(
     }
 
     private fun initialRootChainSteps(): List<RootChainStepUi> =
-        ChainStep.entries.map { step -> RootChainStepUi(labelRes = chainStepLabelRes(step)) }
+        ChainStep.entries.map { step ->
+            RootChainStepUi(labelRes = chainStepLabelRes(step), phase = step.phase)
+        }
 
     private fun chainStepLabelRes(step: ChainStep): Int = when (step) {
         ChainStep.PREFLIGHT -> R.string.root_chain_step_preflight
         ChainStep.W1 -> R.string.root_chain_step_w1
+        ChainStep.AM_HANG -> R.string.root_chain_step_am_hang
         ChainStep.MAGICA_ROOT -> R.string.root_chain_step_magica_root
         ChainStep.OPEN_ADB_GATE -> R.string.root_chain_step_open_adb_gate
         ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
@@ -816,9 +820,15 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 wirelessStatus = snapshot.wirelessStatus,
+                chainPhase = snapshot.chainPhase,
                 exportVisible = canExport,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,
+                /* Seed the path for the phase the device is in, so the panel is right the
+                 * moment it opens -- including after `am hang` restarted this app, where the
+                 * in-memory list is gone but the device is now in the other half. A run in
+                 * progress keeps its own list. */
+                rootChainSteps = it.rootChainSteps.ifEmpty { initialRootChainSteps() },
             )
         }
     }

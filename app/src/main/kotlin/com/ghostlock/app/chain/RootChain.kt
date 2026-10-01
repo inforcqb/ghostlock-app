@@ -1,5 +1,6 @@
 package com.ghostlock.app.chain
 
+import com.ghostlock.app.domain.model.ChainPhase
 import com.ghostlock.app.root.RootChannel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -194,14 +195,19 @@ object ChainSpec {
     const val HANG_ATTEMPTS = 3
 }
 
-enum class ChainStep(val label: String) {
-    PREFLIGHT("预检：通道与文件"),
-    W1("W1：SELinux 转宽容"),
-    MAGICA_ROOT("Magica：uid-0 通道"),
-    OPEN_ADB_GATE("打开 adbd 门"),
-    ADB_CONNECT("adb 客户端连 127.0.0.1:5555"),
-    REMOVE_GUARD("rmmod oplus_security_guard"),
-    KSU_LATE_LOAD("ksud late-load"),
+/**
+ * One step of the chain. [phase] is null for the step that is not part of the split
+ * ([PREFLIGHT]): it runs in both halves and is always shown.
+ */
+enum class ChainStep(val label: String, val phase: ChainPhase?) {
+    PREFLIGHT("预检：通道与文件", null),
+    W1("W1：SELinux 转宽容", ChainPhase.PART1),
+    AM_HANG("重启 framework（am hang）", ChainPhase.PART1),
+    MAGICA_ROOT("Magica：uid-0 通道", ChainPhase.PART2),
+    OPEN_ADB_GATE("打开 adbd 门", ChainPhase.PART2),
+    ADB_CONNECT("adb 客户端连 127.0.0.1:5555", ChainPhase.PART2),
+    REMOVE_GUARD("rmmod oplus_security_guard", ChainPhase.PART2),
+    KSU_LATE_LOAD("ksud late-load", ChainPhase.PART2),
 }
 
 enum class StepState { RUNNING, OK, FAILED }
@@ -580,8 +586,11 @@ class RootChain(
         } != null
         if (!ok) return false
 
-        // step 2 + 3: Magica ------------------------------------------------------
-        ok = step(ChainStep.MAGICA_ROOT, "am hang -> 内置 uid-0 服务 -> channel") {
+        // step 2: the end of part 1 -- hang the framework on purpose ---------------
+        /* This is the boundary between the two halves of the path, and it is a step of its
+         * own for exactly that reason: everything above it runs while SELinux is Enforcing,
+         * everything below it runs in the app instance the watchdog's restart produces. */
+        ok = step(ChainStep.AM_HANG, ChainSpec.AM_HANG) {
             /* am hang --allow-restart takes system_server down on purpose and lets
              * the watchdog restart it; zygote -- and therefore THIS APP -- goes
              * with it.  That is expected, not a failure, but the user has to be
@@ -678,6 +687,12 @@ class RootChain(
                 check = { it.contains("package:") },
             )
             }
+            "am hang 已生效（system_server 已重启）"
+        } != null
+        if (!ok) return false
+
+        // step 3: the start of part 2 -- the uid-0 channel -------------------------
+        ok = step(ChainStep.MAGICA_ROOT, "内置 uid-0 服务 -> channel") {
             onLog("[*] ${ChainSpec.CHANNEL_LAUNCH_NOTE}")
             onLog("[*] ${rootShell.launch()}")
             /* Do NOT block here. The root service already reported that its server is
