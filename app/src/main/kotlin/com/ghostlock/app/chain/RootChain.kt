@@ -145,6 +145,9 @@ object ChainSpec {
     /** An engine that dies this early never had a chance to land. */
     const val W1_EARLY_EXIT_MS = 5_000L
 
+    /** How long the engine's log must stand still before a missing pid means "it died". */
+    const val W1_STALL_MS = 5_000L
+
     /** W1 parks a forged waiter and waits for the engine's marker; give it real headroom. */
     const val W1_TIMEOUT_MS = 240_000L
 

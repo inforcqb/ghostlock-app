@@ -1,4 +1,4 @@
-﻿package com.ghostlock.app.chain
+package com.ghostlock.app.chain
 
 import android.content.Context
 import com.ghostlock.app.wireless.AdbCommand
@@ -81,6 +81,8 @@ class W1Stage(private val context: Context) {
         var shown = 0
         var round = 0
         var lastText = ""
+        var lastGrowth = started
+        var lastLength = 0
         while (System.currentTimeMillis() - started < ChainSpec.W1_DEADLINE_MS) {
             round++
             val read = AdbCommand.exec(
@@ -91,15 +93,22 @@ class W1Stage(private val context: Context) {
             )
             val text = if (read.transportFailure) lastText else read.output
             if (!read.transportFailure) lastText = text
+            if (text.length != lastLength) {
+                lastLength = text.length
+                lastGrowth = System.currentTimeMillis()
+            }
             shown = emitNewLines(text, shown, onLog)
             if (text.contains(ChainSpec.W1_LANDED_MARKER)) {
                 onLog("[+] W1 落地：${ChainSpec.W1_LANDED_MARKER}（engine 保持 park，绝不清掉）")
                 return true
             }
             val elapsed = System.currentTimeMillis() - started
-            /* An engine that is gone before it could land (a rejected profile, a failed
-             * spray) must fail the step instead of burning the whole deadline. */
-            if (elapsed >= ChainSpec.W1_EARLY_EXIT_MS && round % 3 == 0) {
+            /* An engine that really is gone -- and whose log has stopped growing too -- must
+             * fail the step instead of burning the whole deadline. Both signals are required:
+             * `pidof` alone would be enough to fail a healthy run if the engine ever renamed
+             * itself, and a stalled-but-alive engine is the chain's normal "spraying" state. */
+            val stalled = System.currentTimeMillis() - lastGrowth >= ChainSpec.W1_STALL_MS
+            if (elapsed >= ChainSpec.W1_EARLY_EXIT_MS && stalled && round % 3 == 0) {
                 val alive = AdbCommand.exec(
                     "pidof ${ChainSpec.W1_ENGINE_COMM}",
                     retries = 1,
@@ -107,7 +116,8 @@ class W1Stage(private val context: Context) {
                     onLog = null,
                 )
                 if (!alive.transportFailure && alive.output.isBlank()) {
-                    onLog("[!] 引擎已退出且没有落地（${elapsed / 1000}s）：${tailOf(text)}")
+                    onLog("[!] 引擎已退出且日志停止增长、没有落地（${elapsed / 1000}s）")
+                    tailOf(text).takeIf { it.isNotEmpty() }?.let { onLog("[!] 引擎日志尾部：$it") }
                     return false
                 }
             }
