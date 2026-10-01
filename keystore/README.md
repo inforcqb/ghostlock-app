@@ -1,34 +1,54 @@
-# keystore/ — 仓内置的开发签名 key
+# keystore/ — 签名 key 已经**不在这个公开仓库里**了
 
-`ghostlock-dev.jks`（PKCS12，alias `ghostlock`，store/key 口令均为 `ghostlock-dev`，RSA 4096，有效期 30 年）
-**是刻意提交进仓库的**，用来替换 AGP 每轮随机生成的 debug key。
+签名材料（`ghostlock-dev.jks`，PKCS12，alias `ghostlock`，store/key 口令均为 `ghostlock-dev`，
+RSA 4096，有效期 30 年）现在放在**私有仓库**：
 
-## 为什么要有它
+```
+inforcqb/ghostlock-keys      （private）
+  ├── ghostlock-dev.jks
+  └── README.md              ← 口令、轮换步骤、历史泄露说明
+```
 
-CI（`.github/workflows/build.yml`）在没有签名 secrets 的情况下走 debug 签名，而 AGP 在**每个 runner 上
-新生成** debug keystore ⇒ 每次构建签名都不同 ⇒ 覆盖安装 `adb install -r` 直接
-`INSTALL_FAILED_UPDATE_INCOMPATIBLE`，必须先卸载；而**卸载会清掉 app 私有目录**，也就是：
+公开仓库的 CI 通过一把**只读 deploy key**（私钥存在本仓库 secret `KEYSTORE_DEPLOY_KEY`）
+在构建时 clone 它，把 `ghostlock-dev.jks` 落到工作区根目录的 `keystore.jks`
+（`KEYSTORE_PATH=../keystore.jks`），并用文档里的口令/alias 签名。
 
-* `adbkey.pk8` / `adbkey.pub.der` / `adbkey.cert.der`（本 app 的配对密钥）；
-* `ghostlock-wireless` 里的"已配对"记录。
+## 为什么不能放公开仓库
 
-结果就是：**每装一个新构建都要重新走一次无线调试配对**。换成仓内固定 key 后，构建之间
-`adb install -r` 直接可用，配对与密钥都保留。
+固定一把 key 是必须的：AGP 在每个 CI runner 上**新生成** debug keystore ⇒ 每次构建签名都不同 ⇒
+`adb install -r` 报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，必须先卸载；而卸载会清掉 app 私有目录
+（配对密钥 + "已配对"记录）⇒ 每装一个新构建都要重新配对。
 
-## 优先级与覆盖方式
+但公开仓库里的私钥等于**公开的私钥**：任何拿到它的人都能签出能覆盖安装的"更新包"。
+所以它被移到私有仓库，公开树只保留"怎么取"的说明。
 
-`app/build.gradle.kts` 的解析顺序：
+## 签名 key 的解析顺序（`app/build.gradle.kts`）
 
 1. `local.properties` 的 `KEYSTORE_PATH` / `KEYSTORE_PASS` / `KEY_ALIAS` / `KEY_PASSWORD`；
-2. 同名环境变量（CI 从 repository secrets 注入：`SIGNING_KEY`(base64) / `KEY_STORE_PASSWORD` / `ALIAS` / `KEY_PASSWORD`）；
-3. 本目录的 `ghostlock-dev.jks`。
+2. 同名环境变量（CI 里由 secrets 注入：`SIGNING_KEY`(base64) / `KEY_STORE_PASSWORD` / `ALIAS` / `KEY_PASSWORD`）；
+3. 都没有时：**没有兜底了** —— 公开树里那份已删除。
 
-也就是说：**如果以后把 secrets 配上，secrets 优先**，这个仓内 key 自动退为本地/PR 构建用的兜底。
+CI 的两个相关步骤：
 
-## 安全提示（请知情）
+* `Decode Android signing key`：`SIGNING_KEY` 配了就解出 keystore.jks（优先级最高）；
+* `Fetch the signing keystore from the private repo`：`SIGNING_KEY` 没配时从私有仓库取，
+  并打印 sha256（`a1b450c0…d4f4c`，与历次发布一致）；
+* `Require the fetched keystore`：非 PR 构建若 `keystore.jks` 为空/缺失就**直接失败** ——
+  用一个随机 key 签出来的 release 会让所有已装设备都得先卸载，比构建失败糟糕得多。
 
-* 仓库是 **public**，所以这把私钥是**公开的**：任何拿到它的人都能签出"更新包"，装到已安装本 app 的设备上
-  （Android 只比对签名证书是否一致）。对本项目当前的用法（自用、内测、CI 产物手动安装）可以接受；
-  **一旦要上应用商店或对外分发，请立刻换掉它**，并把新的 key 放 secrets 而不是仓库。
-* 若要走更干净的路：把 `ghostlock-dev.jks` base64 后填进 secrets `SIGNING_KEY`，其余三个值填进对应 secrets，
-  本文件与 `ghostlock-dev.jks` 即可从仓库删除（Gradle 会自动优先用 secrets）。
+构建日志里会有一行 `signing: keystore=… fallback=…`，用来确认到底用了哪把 key。
+
+## 本地构建怎么办
+
+* 想用**同一把 key**：`git clone git@github.com:inforcqb/ghostlock-keys.git`，然后
+  `local.properties` 里写 `KEYSTORE_PATH=/绝对路径/ghostlock-dev.jks`、`KEYSTORE_PASS=ghostlock-dev`、
+  `KEY_ALIAS=ghostlock`、`KEY_PASSWORD=ghostlock-dev`；
+* 只用 debug 签名：什么都不配即可（debug 构建本来就用 debug key，与 release 无关）。
+
+## 历史与轮换（请知情）
+
+* 这把 key **在 2026-10-01 之前提交在公开仓库里**（`keystore/ghostlock-dev.jks`），所以它已经泄露过；
+  从树里删掉只是停止继续暴露，**git 历史里仍然有它**。
+* 要彻底作废：换一把新 key（新口令/别名，放私有仓库），代价是设备必须**卸载重装一次**
+  （签名变了），卸载会丢无线调试配对，需要重新配对。
+* 在那之前，任何来源可疑的 GhostLock 更新包都应当视为可以用泄露 key 伪造的。
