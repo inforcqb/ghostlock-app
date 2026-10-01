@@ -130,9 +130,16 @@ jobs:
       - name: Fetch the signing keystore from the private repo
         env:
           KEYSTORE_DEPLOY_KEY: ${{ secrets.KEYSTORE_DEPLOY_KEY }}
+          # `Decode Android signing key` above writes keystore.jks from this secret; when it is
+          # configured that key wins (the documented priority) and this step stays out of the way.
+          SIGNING_KEY_SECRET: ${{ secrets.SIGNING_KEY }}
           KEYSTORE_REPO: inforcqb/ghostlock-keys
         run: |
           set -euo pipefail
+          if [ -n "${SIGNING_KEY_SECRET}" ]; then
+            echo "the SIGNING_KEY secret is set -- keeping the keystore it decoded, skipping the private-repo fetch"
+            exit 0
+          fi
           if [ -z "${KEYSTORE_DEPLOY_KEY}" ]; then
             echo "::warning::KEYSTORE_DEPLOY_KEY is not set -- falling back to whatever key the tree has; the signature may differ from previous releases"
             exit 0
