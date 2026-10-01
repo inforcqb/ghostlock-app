@@ -358,3 +358,21 @@ pre 不在规则之内）」。
 
 每条命令的退出码都会打日志；**失败不阻断**后面的 `ksud late-load`（那才是持久 root 的来源），
 只把失败条数与命令名报出来。
+
+### 14.3 ksud 打进 app（2026-10-01 晚，用户定稿）
+
+用户：「要用绝对地址，把 ksud 集成到 app 内，ksud 内置 resetprop，使用方式类似 busybox，`ksud resetprop`」
+——这是对 §14.2 的修正：那一步原来写的是裸 `resetprop`，而**裸 `resetprop` 不在 adb shell 的 PATH 里**
+（设备上只有 `/data/adb/ksu/bin/resetprop -> /data/adb/ksud` 这个符号链接）。
+
+* `app/src/main/jniLibs/arm64-v8a/libksud.so` = 从本机 `/data/adb/ksud` 读出的原样副本，
+  5326360 字节，sha256 `9f57222b06222f461bbb69b24e40a293e34708eeb7b1bbb065110651f7b9c991`，
+  **与原文件逐字节一致**（APK 里也没有被 llvm-strip 动过：`keepDebugSymbols += "**/libksud.so"`）。
+  GPL-3.0，已登记在 `app/src/main/jni/THIRD_PARTY_NOTICES.md`（再分发前需要履行 GPL 义务）。
+* 链开始前 `DeviceSync.pushKsud()` 按 sha256 增量推送到 `/data/local/tmp/gl-w1/ksud`（0755），
+  第 8b 步用**绝对路径**：`$DEVICE_DIR/ksud resetprop …`；推送失败退回 `/data/adb/ksud` 并打日志。
+* 真机验证（PJA110，推送后的副本）：`/data/local/tmp/gl-w1/ksud resetprop ro.secure` → `1`；
+  `… resetprop ro.debuggable` → `0`；`su -c '… resetprop -Z ro.secure'` →
+  `u:object_r:userdebug_or_eng_prop:s0`（与 `HARDEN_CONTEXT` 完全一致）。
+* **`ksud late-load` 仍用设备自己的 `/data/adb/ksud`**：late-load 需要找到那台机器上真正安装的
+  模块负载，而 `resetprop` 与版本无关 —— 这正是内置副本的用途。
