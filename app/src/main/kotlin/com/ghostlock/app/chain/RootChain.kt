@@ -1,6 +1,5 @@
 package com.ghostlock.app.chain
 
-import com.ghostlock.app.adb.LibAdbClient
 import com.ghostlock.app.root.RootChannel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -90,19 +89,57 @@ object ChainSpec {
         KSUD_LATE_LOAD,
         ADBD_SET_TCP_PORT,
         USBD_RESTART_ADBD,
+        W1_START_MARK,
     )
 
     /** step 4: open the channel and check who we are */
     const val CHANNEL_PROBE = "id"
 
     /**
-     * step 1, the frozen device-side driver: the runbook's `sh /data/local/tmp/gl-w1/w1.sh`.
+     * step 1 -- W1, from the app's own engine.
      *
-     * The chain used to reach W1 through the Shizuku user service; the wireless-debugging
-     * channel is the same identity (uid 2000, `Seccomp: 0`) and the script is the frozen
-     * command, so nothing about step 1 is re-invented -- the app just runs it.
+     * The runbook drove the device-side script `$DEVICE_DIR/w1.sh`, which ran whatever
+     * `ghostlock` happened to be sitting in `/data/local/tmp` (measured: the 2026-09-28 push,
+     * whose early-exit gate still said 50%). The app now ships the engine itself
+     * (`libghostlock.so`) and does what the script did -- see [W1Stage]: sync the engine and
+     * the profile into [DEVICE_DIR], start it detached with `setsid`, and watch the log for
+     * the landing marker. The script is kept only as the historical reference.
      */
     const val SCRIPT_W1 = "$DEVICE_DIR/w1.sh"
+
+    /** Where the app's own engine/profile/log live (never the user's manual runbook files). */
+    const val W1_ENGINE = "$DEVICE_DIR/gl-engine"
+    const val W1_PROFILE = "$DEVICE_DIR/gl-profile.bin"
+    const val W1_LOG = "$DEVICE_DIR/gl-w1.log"
+
+    /** The line the engine prints when the forged PI state is in place. */
+    const val W1_LANDED_MARKER = "Write 1 complete"
+
+    /** The process name of the parked engine (`comm` of [W1_ENGINE]). */
+    const val W1_ENGINE_COMM = "gl-engine"
+
+    /**
+     * The start command, verbatim from `w1.sh`'s env/args, with three differences that the
+     * script's own warnings demand: the engine and the profile are the app's files, the log
+     * goes to [W1_LOG], and `setsid` detaches the process so the adb shell session can end
+     * without taking the parked engine with it.
+     */
+    const val W1_START =
+        "cd $DEVICE_DIR; " +
+            "export GHOSTLOCK_HOME=$DEVICE_DIR GHOSTLOCK_W1_ONLY=1 " +
+            "GHOSTLOCK_PARK_AFTER_W1=1 GHOSTLOCK_MCAST_SOCKET=tcp6; " +
+            "rm -f $W1_LOG; " +
+            "setsid $W1_ENGINE --profile $W1_PROFILE >$W1_LOG 2>&1 &"
+
+    /** Marker for [NON_IDEMPOTENT]: starting W1 twice forges a second waiter. */
+    const val W1_START_MARK = "GHOSTLOCK_PARK_AFTER_W1"
+
+    /** The script waited 90 x 1s for the marker; the landing itself takes ~11-17s. */
+    const val W1_DEADLINE_MS = 90_000L
+    const val W1_POLL_MS = 1_000L
+
+    /** An engine that dies this early never had a chance to land. */
+    const val W1_EARLY_EXIT_MS = 5_000L
 
     /** W1 parks a forged waiter and waits for the engine's marker; give it real headroom. */
     const val W1_TIMEOUT_MS = 240_000L
@@ -125,17 +162,29 @@ object ChainSpec {
     const val READ_STATUS = "cat /proc/self/status"
 
     /**
-     * How often the boot facts are read before the chain refuses to guess. The Shizuku
-     * hop fails intermittently (null-message exception), so a single failed read must
-     * not decide anything.
+     * How often the boot facts are read before the chain refuses to guess. The wireless
+     * channel drops connections on its own schedule, so a single failed read must not
+     * decide anything.
      */
-    const val BOOT_FACTS_ATTEMPTS = 4
+    const val BOOT_FACTS_ATTEMPTS = 6
     const val READ_LISTEN = "ss -lnt"
     const val READ_MODULES = "cat /proc/modules"
     const val READ_IDENTITY = "id"
     const val READ_CAPS = "cat /proc/self/status"
 
     const val ADB_PORT = 5555
+
+    /** The root adbd the chain talks to once the gate is open (steps 7-9). */
+    const val ADB_ENDPOINT = "127.0.0.1:$ADB_PORT"
+
+    /** How often a dropped wireless channel is retried for one repeatable command. */
+    const val TRANSPORT_RETRIES = 3
+
+    /** `adb connect 127.0.0.1:5555` rounds: the adbd restart takes a moment to listen. */
+    const val ROOT_CONNECT_ROUNDS = 6
+
+    /** How often `am hang --allow-restart` may be issued (the watchdog needs ~93s). */
+    const val HANG_ATTEMPTS = 3
 }
 
 enum class ChainStep(val label: String) {
@@ -175,6 +224,23 @@ fun interface W1Runner {
 }
 
 /**
+ * The root adbd the chain drives in steps 7-9.
+ *
+ * There is no adb implementation inside this app: the bundled `adb` CLI (see `AdbCli`) is
+ * the client for the wireless-debugging channel (uid 2000) *and*, once the gate is open, for
+ * the root adbd on [ChainSpec.ADB_ENDPOINT]. The adb public-key machinery
+ * (`AdbKey`/`pushAdbKey`/libadb) went away with it -- the wireless pairing already
+ * registered our key with adbd, so nothing has to be appended to `/data/misc/adb/adb_keys`.
+ */
+interface RootAdbRunner {
+    /** Connect to [ChainSpec.ADB_ENDPOINT]; throws when the transport does not come up. */
+    suspend fun connect()
+
+    /** Run one command on that transport and return its output. */
+    suspend fun exec(command: String, timeoutMs: Long = 30_000L): String
+}
+
+/**
  * Starts this app's own uid-0 root service (isolated AppZygote process) and makes sure
  * it really is uid 0 with a listening channel. Implemented by
  * `com.ghostlock.app.root.IsolatedRootShell` in the app process -- an isolated service
@@ -200,7 +266,7 @@ class RootChain(
     private val w1: W1Runner,
     private val rootShell: RootShellLauncher,
     private val channel: RootChannel,
-    private val adb: LibAdbClient,
+    private val adb: RootAdbRunner,
     private val onLog: (String) -> Unit,
     private val onProgress: (ChainProgress) -> Unit,
 ) {
@@ -219,7 +285,7 @@ class RootChain(
     private suspend fun sh(
         command: String,
         timeoutMs: Long = 60_000L,
-        transportRetries: Int = 1,
+        transportRetries: Int = ChainSpec.TRANSPORT_RETRIES,
     ): ShellResult {
         var attempt = 0
         while (true) {
@@ -565,10 +631,10 @@ class RootChain(
             sh("echo done > ${ChainSpec.MARKER_HANG}")
             onLog("[*] 已落标记 ${ChainSpec.MARKER_HANG}（在 am hang 之前写：app 随后被杀也能知道这一步做过）")
             var hangEffective = false
-            for (hangAttempt in 1..2) {
+            for (hangAttempt in 1..ChainSpec.HANG_ATTEMPTS) {
                 val deadline = System.currentTimeMillis() + ChainSpec.HANG_WINDOW_MS
                 val hang = sh(ChainSpec.AM_HANG, timeoutMs = ChainSpec.HANG_WINDOW_MS + 60_000L)
-                onLog("[*] attempt $hangAttempt/2: ${ChainSpec.AM_HANG} -> exit=${hang.exitCode}")
+                onLog("[*] attempt $hangAttempt/${ChainSpec.HANG_ATTEMPTS}: ${ChainSpec.AM_HANG} -> exit=${hang.exitCode}")
                 hang.output.lineSequence().filter { it.isNotBlank() }
                     .forEach { onLog("    $it") }
                 if (hang.output.contains("Broken pipe", ignoreCase = true)) {

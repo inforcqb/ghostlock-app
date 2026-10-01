@@ -245,26 +245,8 @@ object WirelessPairingController {
     }
 
     /**
-     * W1 through the channel: the frozen step-1 command of the device runbook, verbatim
-     * (`sh /data/local/tmp/gl-w1/w1.sh`, which drives the engine with
-     * `GHOSTLOCK_W1_ONLY` + `GHOSTLOCK_PARK_AFTER_W1`).
-     */
-    suspend fun runW1OnChannel(onLog: (String) -> Unit): Boolean {
-        val result = execChainCommand(
-            "sh ${ChainSpec.SCRIPT_W1}",
-            ChainSpec.W1_TIMEOUT_MS,
-            onLog,
-        )
-        if (result.exitCode != 0) {
-            onLog("[!] ${ChainSpec.SCRIPT_W1} 退出码 ${result.exitCode}，W1 未确认落地")
-            return false
-        }
-        return true
-    }
-
-    /**
-     * Nothing to release: `adb_command` opens one channel per command and closes it again,
-     * so the app never holds a session between commands.
+     * Nothing to release: the CLI's server owns the transport and [AdbService] keeps it
+     * alive; this controller holds no session of its own.
      */
     fun close() = Unit
 
@@ -390,7 +372,7 @@ object WirelessPairingController {
         try {
             verify(context)
         } catch (error: Throwable) {
-            markFailed(context, "连接/自检失败：${WirelessAdb.describe(error)}")
+            markFailed(context, "连接/自检失败：${describeThrowable(error)}")
         } finally {
             /* Nothing of this flow should stay in the shade: the prompt is cancelled when
              * the code arrives, and the flow owns exactly one result notification. */
@@ -477,7 +459,7 @@ object WirelessPairingController {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     private fun log(line: String) {
-        Log.d(WirelessAdb.TAG, line)
+        Log.d(WIRELESS_TAG, line)
         mutate { state -> state.copy(log = (state.log + line).takeLast(MAX_LOG_LINES)) }
     }
 

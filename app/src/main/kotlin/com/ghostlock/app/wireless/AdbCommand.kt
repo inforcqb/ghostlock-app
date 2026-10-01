@@ -1,6 +1,7 @@
 package com.ghostlock.app.wireless
 
 import android.content.Context
+import com.ghostlock.app.chain.ChainSpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -20,7 +21,7 @@ import kotlinx.coroutines.withContext
  */
 object AdbCommand {
     /** Channel-failure retries used when a caller does not pass its own count. */
-    const val DEFAULT_RETRIES = 3
+    const val DEFAULT_RETRIES = 5
 
     const val DEFAULT_TIMEOUT_MS = 30_000L
 
@@ -59,4 +60,52 @@ object AdbCommand {
         withContext(Dispatchers.IO) {
             AdbService.ensure(rounds = retries, onLog = onLog ?: AdbService.defaultLogger())
         }
+
+    /**
+     * Send a local file to the device (`adb push`).
+     *
+     * The device-side `cp` is not an option: the app's own files are unreadable by uid 2000
+     * (checked on the PJA110: `/data/app/<pkg>/lib` is not listable by shell).
+     */
+    suspend fun push(
+        localPath: String,
+        remotePath: String,
+        onLog: ((String) -> Unit)? = null,
+    ): Boolean = withContext(Dispatchers.IO) {
+        AdbService.push(localPath, remotePath, onLog ?: AdbService.defaultLogger())
+    }
+
+    /**
+     * Connect to the local root adbd -- chain step 7, `adb connect 127.0.0.1:5555`.
+     *
+     * From here on the service routes commands to that transport; the wireless one died with
+     * the adbd restart of step 6. `adb connect` legitimately fails for the first rounds while
+     * adbd is still coming back up, hence [rounds].
+     */
+    suspend fun connectRoot(
+        endpoint: String,
+        rounds: Int,
+        onLog: ((String) -> Unit)? = null,
+    ): Boolean = withContext(Dispatchers.IO) {
+        AdbService.connectRoot(endpoint, rounds, onLog ?: AdbService.defaultLogger())
+    }
+
+    /** Run one command on the root adbd (steps 7-9). */
+    suspend fun execOnRoot(
+        command: String,
+        retries: Int = DEFAULT_RETRIES,
+        timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+        onLog: ((String) -> Unit)? = null,
+    ): AdbService.Result = withContext(Dispatchers.IO) {
+        /* An explicit serial, never the "whatever is connected" path: after step 6 the
+         * wireless transport is dead, and falling back to it would reconnect the very
+         * session the root adbd replaced. */
+        AdbService.execOn(
+            serial = ChainSpec.ADB_ENDPOINT,
+            command = command,
+            timeoutMs = timeoutMs,
+            rounds = retries,
+            onLog = onLog ?: AdbService.defaultLogger(),
+        )
+    }
 }

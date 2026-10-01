@@ -154,10 +154,10 @@ object WirelessNotifications {
         if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            Log.w(WirelessAdb.TAG, "notifications are not permitted; dropping notification $id")
+            Log.w(WIRELESS_TAG, "notifications are not permitted; dropping notification $id")
             return
         }
         runCatching { manager.notify(id, notification) }
-            .onFailure { Log.w(WirelessAdb.TAG, "notify($id) failed: ${it.message}") }
+            .onFailure { Log.w(WIRELESS_TAG, "notify($id) failed: ${it.message}") }
     }
 }

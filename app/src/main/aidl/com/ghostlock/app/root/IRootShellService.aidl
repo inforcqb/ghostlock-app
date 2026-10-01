@@ -16,6 +16,10 @@
  * Method ids: 1..3 are ours; 16777114 (0xFFFFAA) is the transaction id Shizuku
  * reserves for destroy() in its own AIDL files, and the host's existing
  * IGhostlockUserService.aidl follows the same convention.
+ *
+ * The adb public key is deliberately NOT part of this control plane: the
+ * wireless-debugging pairing already registered the app's key with adbd, so no
+ * /data/misc/adb/adb_keys write exists any more.
  */
 package com.ghostlock.app.root;
 
@@ -31,13 +35,6 @@ interface IRootShellService {
 
     /** ensureRoot() + the adbd root patch (blocking, up to 15 s).  Off the main thread. */
     boolean adbRoot() = 3;
-
-    /**
-     * Append this app's ADB public key to /data/misc/adb/adb_keys (idempotent) so that adbd
-     * accepts our client's AUTH signature. Written from a forked child that drops to uid
-     * 1000 and exits -- it never returns to uid 0.
-     */
-    boolean pushAdbKey(String pubkey) = 4;
 
     /** Ask the service to stop itself. */
     void destroy() = 16777114;

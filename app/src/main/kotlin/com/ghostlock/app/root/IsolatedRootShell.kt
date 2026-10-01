@@ -1,7 +1,6 @@
-package com.ghostlock.app.root
+﻿package com.ghostlock.app.root
 
 import android.content.ComponentName
-import com.ghostlock.app.adb.AdbKey
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
@@ -99,15 +98,7 @@ class IsolatedRootShell(private val context: Context) {
             false
         }
         onLog("[*] Magica adbRoot()（内置 resetprop/adbd 重启逻辑）-> $adbRoot")
-        /* Our own equivalent of db pair: hand adbd the public key it should trust.
-         * The key pair was generated during preflight, precisely so there is something to
-         * push by the time the channel is up. Idempotent on the native side. */
-        val adbKeyLine = AdbKey.load(context.filesDir).publicKeyLine
-        val pushed = runCatching { service.pushAdbKey(adbKeyLine) }.getOrElse { error ->
-            onLog("[!] pushAdbKey() 抛异常：${error::class.simpleName}: ${error.message}")
-            false
-        }
-        onLog("[*] adb 公钥已交给 adbd（adb_keys，幂等）：$pushed fingerprint=${AdbKey.load(context.filesDir).fingerprint}")
+        onLog("[*] adb 公钥相关逻辑已移除：配对时 adbd 已登记本机密钥，无需再写 adb_keys")
         return "uid-0 root service ready: bound, ensureRoot=ok, startChannel=ok, adbRoot=$adbRoot " +
             "(channel ${RootShellService.CHANNEL_SOCK})"
     }

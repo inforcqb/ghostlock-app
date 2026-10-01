@@ -1,7 +1,9 @@
 package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
-import com.ghostlock.app.adb.LibAdbClient
+import com.ghostlock.app.chain.RootAdbRunner
+import com.ghostlock.app.chain.W1Stage
+import com.ghostlock.app.wireless.RootAdbd
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.RootChain
 import com.ghostlock.app.root.IsolatedRootShell
@@ -443,16 +445,22 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             return false
         }
         val channel = RootChannel()
-        val adb = LibAdbClient(appContext)
+        /* Steps 7-9 run on the bundled adb CLI against the root adbd: the app has no adb
+         * client of its own any more (libadb, and with it the whole adb public-key story,
+         * is gone -- the wireless pairing already authorized our key). */
+        val adb: RootAdbRunner = RootAdbd
+        val w1Stage = W1Stage(appContext)
         val chain = RootChain(
             /* The timeout the chain passes in is forwarded: dropping it is how a stalled
              * call hung the whole run forever. */
             shell = { command, timeoutMs ->
                 WirelessPairingController.execChainCommand(command, timeoutMs, onLog)
             },
-            /* W1 is the frozen device-side command (`sh /data/local/tmp/gl-w1/w1.sh`); the
-             * app no longer needs to push a blob or bind a user service to run it. */
-            w1 = { log -> WirelessPairingController.runW1OnChannel(log) },
+            /* W1 is the app's own engine now: [W1Stage] pushes `libghostlock.so` and the
+             * profile the app just composed, starts the engine detached with the runbook's
+             * environment, and watches its log for the landing marker. It no longer depends
+             * on whatever `ghostlock` happens to sit in /data/local/tmp. */
+            w1 = { log -> w1Stage.run(profileBlob, log) },
             /* The uid-0 channel is this app's own service now, started by binding it as an
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user
@@ -466,7 +474,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return try {
             chain.run()
         } finally {
-            adb.close()
             channel.close()
         }
     }

@@ -186,23 +186,12 @@ tasks.named("preBuild") {
 }
 
 dependencies {
-    // ADB client with the full AUTH handshake (token -> SHA1withRSA signature, public-key
-    // fallback) and wireless pairing. Apache-2.0 branch of its dual licence. Replaces the
-    // hand-written AdbClient, which stopped at "adbd asked for AUTH".
-    implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
-    // Wireless pairing needs the TLS exporter (RFC 5705): the handshake binds the SPAKE2
-    // password to the TLS channel with `exportKeyingMaterial`. Android's own
-    // `com.android.org.conscrypt.Conscrypt#exportKeyingMaterial` is a HIDDEN api on
-    // Android 16 -- reflecting on it throws NoSuchMethodException (measured on the
-    // PJA110, 2026-10-01: "配对失败：SSLException: java.lang.NoSuchMethodException:
-    // com.android.org.conscrypt.Conscrypt.exportKeyingMaterial"). Bundling Conscrypt
-    // gives libadb the `org.conscrypt` path it prefers, which is a normal library class
-    // and therefore reachable.
-    implementation("org.conscrypt:conscrypt-android:2.5.3")
-    // Certificate generation for the adb key: libadb requires BOTH a private key and a
-    // certificate on the connection object (the certificate is only used for wireless
-    // pairing, which we do not do, but the check is unconditional).
-    implementation("com.github.MuntashirAkon:sun-security-android:1.1")
+    /* No adb library, no Conscrypt, no key material: the bundled platform-tools `adb`
+     * (app/src/main/jniLibs/arm64-v8a/libadbcli.so) does pairing, the wireless-debugging
+     * channel and the root adbd, all with its own key under `filesDir/adb-home`. libadb plus
+     * its Conscrypt/sun-security companions were removed on 2026-10-01 -- and with them the
+     * whole `AdbKey` / `pushAdbKey` / `/data/misc/adb/adb_keys` story, which the wireless
+     * pairing had already made redundant. */
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.foundation:foundation:1.12.0")
     implementation("androidx.compose.material:material-icons-extended:1.7.8")
