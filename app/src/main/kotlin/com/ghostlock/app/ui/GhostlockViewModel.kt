@@ -670,6 +670,7 @@ class GhostlockViewModel(
         ChainStep.MAGICA_ROOT -> R.string.root_chain_step_magica_root
         ChainStep.OPEN_ADB_GATE -> R.string.root_chain_step_open_adb_gate
         ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
+        ChainStep.INSTALL_MANAGER -> R.string.root_chain_step_install_manager
         ChainStep.REMOVE_GUARD -> R.string.root_chain_step_remove_guard
         ChainStep.SELINUX_REPAIR -> R.string.root_chain_step_selinux_repair
         ChainStep.HARDEN_PROPS -> R.string.root_chain_step_harden_props

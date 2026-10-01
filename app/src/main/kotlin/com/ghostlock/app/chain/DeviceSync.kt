@@ -26,6 +26,9 @@ object DeviceSync {
     val BUNDLED = listOf(
         Bundled("device/kread_min.ko", ChainSpec.KREAD_KO, "644"),
         Bundled("device/fix-selinux.sh", ChainSpec.FIX_SELINUX, "755"),
+        /* The SukiSU-Ultra manager: CI drops the latest upstream release in here on every build,
+         * so the app can still install a manager on a device that cannot reach GitHub. */
+        Bundled("device/sukisu-manager.apk", ChainSpec.KSU_MANAGER_APK, "644"),
     )
 
     /** One `assets/<assetPath>` file and where it belongs on the device. */

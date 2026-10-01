@@ -961,7 +961,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
-        val packages = listOf("me.weishu.kernelsu.pr", "me.weishu.kernelsu", "com.resukisu.resukisu", "com.kowx712.supermanager")
+        val packages = listOf(
+            /* com.sukisu.ultra is the manager the chain installs from the app's bundled copy of
+             * the latest SukiSU-Ultra release; the rest are managers a user may already have. */
+            ChainSpec.KSU_MANAGER_PACKAGE,
+            "me.weishu.kernelsu.pr",
+            "me.weishu.kernelsu",
+            "com.resukisu.resukisu",
+            "com.kowx712.supermanager",
+        )
         var installed = false
         for (packageName in packages) {
             val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: continue

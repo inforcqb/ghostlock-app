@@ -132,6 +132,19 @@ object ChainSpec {
     const val KREAD_KO = "$DEVICE_DIR/kread_min.ko"
     const val FIX_SELINUX = "$DEVICE_DIR/fix-selinux.sh"
 
+    /**
+     * The SukiSU-Ultra manager APK the app carries and installs.
+     *
+     * Bundled on purpose: the device must not have to reach GitHub (国内网络到 GitHub 不稳).
+     * CI copies the **latest** upstream release into `assets/device/sukisu-manager.apk` on every
+     * build, so the copy in the APK is never hardcoded to a version. The chain pushes it here
+     * (see DeviceSync) and installs it with root.
+     */
+    const val KSU_MANAGER_APK = "$DEVICE_DIR/sukisu-manager.apk"
+
+    /** Package id of that manager, used for the log line (and by `prepareKsud`). */
+    const val KSU_MANAGER_PACKAGE = "com.sukisu.ultra"
+
     /** Module name the kernel knows `kread_min.ko` by (`insmod` / `rmmod`). */
     const val KREAD_MODULE = "kread_min"
 
@@ -323,6 +336,7 @@ enum class ChainStep(val label: String, val phase: ChainPhase?) {
     MAGICA_ROOT("Magica：uid-0 通道", ChainPhase.PART2),
     OPEN_ADB_GATE("打开 adbd 门", ChainPhase.PART2),
     ADB_CONNECT("adb 客户端连 127.0.0.1:5555", ChainPhase.PART2),
+    INSTALL_MANAGER("安装管理端：SukiSU-Ultra", ChainPhase.PART2),
     REMOVE_GUARD("rmmod oplus_security_guard", ChainPhase.PART2),
     SELINUX_REPAIR("修复 selinux_state（kread_min + fix-selinux.sh）", ChainPhase.PART2),
     HARDEN_PROPS("恢复属性：ro.secure / ro.debuggable / suid_dumpable", ChainPhase.PART2),
@@ -920,6 +934,29 @@ class RootChain(
                 throw IllegalStateException("adb shell has no full capabilities: $capLine")
             }
             "$identity / $capLine"
+        } != null
+        if (!ok) return false
+
+        // step 7b: the manager app, so the device never has to reach GitHub -------
+        /* The APK is the app's own copy of the latest SukiSU-Ultra release (pushed next to the
+         * engine by DeviceSync). Installing it here means a device that never saw GitHub still
+         * ends up with a manager for `su` prompts and modules. Non-fatal: an already-installed
+         * manager makes `pm install -r` a no-op, and nothing later in the chain depends on it. */
+        ok = step(ChainStep.INSTALL_MANAGER, ChainSpec.KSU_MANAGER_APK) {
+            val result = adb.exec("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
+            val output = result.output.trim()
+            if (output.isNotEmpty()) {
+                output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
+            }
+            if (result.exitCode == 0) {
+                onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
+            } else {
+                onLog(
+                    "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
+                        "不阻断后面的步骤",
+                )
+            }
+            "manager install exit=${result.exitCode}"
         } != null
         if (!ok) return false
 
