@@ -1,4 +1,4 @@
-# 当前可用链（2026-09-26 冻结）与 app 集成的命令白名单
+﻿# 当前可用链（2026-09-26 冻结）与 app 集成的命令白名单
 
 背景：fastboot 阶段注入 SELinux 宽容的那个洞在 **2026.3** 被修；本链用幽灵锁的 **W1**
 补上"宽容"这一环，其余继续走已跑通的旧路径，最终拿到 KernelSU 的持久 root。
@@ -15,7 +15,7 @@
 
 | # | 执行者（身份/域） | 原命令（逐字） | 作用 |
 |---|---|---|---|
-| 1 | adb shell / Shizuku：`uid=2000`，`u:r:shell:s0`，`Seccomp: 0` | `sh /data/local/tmp/gl-w1/w1.sh` | W1：`Enforcing → Permissive`；跑完脚本返回，**exploit 进程 park** |
+| 1 | adb shell / Shizuku：`uid=2000`，`u:r:shell:s0`，`Seccomp: 0` | `sh /data/local/tmp/gl-w1/w1.sh` | W1：`Enforcing → Permissive`；跑完脚本返回，**exploit 进程 park** | **2026-10-01 起 app 不再调这个脚本**：`chain/W1Stage.kt` 用 app 自己的 `libghostlock.so` + 自己合成的 profile 做同样的事（见 `wireless-debugging-pairing.md` §11.1），脚本保留作参考。
 | 2 | adb shell（uid 2000） | `am hang --allow-restart` | 让 system_server 挂掉并允许重启，Magica 的 zygote 才能正常起来。**实测 watchdog 要 ~93 s 才动手**（见下） |
 | 3 | 用户在设备上 | 启动 Magica（`am start -n io.github.vvb2060.puellamagi/.MainActivity`），点"启用 rootshell"。**2026-09-28 起 app 内置等价物**：`bindIsolatedService()` 绑 `.root.RootShellService`（AppZygote 预载 `libmagica2.so`），不再依赖外部 app | 拿到 `u:r:isolated_app:s0` 的 **uid 0 通道**（`CapEff=0x1c0`，**无 caps**） |
 | 4 | 上述 uid 0 通道 | `sh /data/local/tmp/gl-w1/rshell` | 进入根通道 shell（unix socket + token） |

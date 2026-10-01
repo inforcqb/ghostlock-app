@@ -190,3 +190,73 @@ adb shell id
   `id` 会返回 `uid=0`，此时"uid=2000"判据会失败 —— 界面会明确报出来，不会被当成成功。
 * OPPO/ColorOS 上 mDNS 的广播行为（是否在配对对话框期间真的广播 `_adb-tls-pairing`）
   需要在真机上确认；这是本条路唯一"依赖厂商行为"的地方。
+
+## 11. W1 与 adb 公钥：2026-10-01 定稿（app 用自己的引擎与 profile）
+
+### 11.1 W1 不再跑设备上的 `w1.sh`
+
+原先第 1 步是 `sh /data/local/tmp/gl-w1/w1.sh`，也就是**设备上恰好放着的那份 `ghostlock`**。
+2026-10-01 查到证据：那份是 2026-09-28 推的版本，日志里仍然是
+`gate: >=9 colliders, >=50% coverage`，而 app 自己的引擎早已把质量门提到 100%
+（提交 `97276f9`，`KERNELSNITCH_EARLY_MIN_COVERAGE_PCT = 100`）。于是"app 在跑 W1"这句话
+实际上从来没跑过 app 的引擎 —— 这正是用户报的"为什么还是 50%"。
+
+现在由 **`chain/W1Stage.kt`** 做 `w1.sh` 做过的事，但源文件是 app 自己的：
+
+| 步骤 | 命令/文件 |
+|---|---|
+| 1 | 推送 `<nativeLibraryDir>/libghostlock.so` → `/data/local/tmp/gl-w1/gl-engine`（两侧 `sha256sum` 比对，一致就跳过；推完重新读回哈希） |
+| 2 | app 为当前内核合成的 profile → `/data/local/tmp/gl-w1/gl-profile.bin`（同样按 sha256 增量推送） |
+| 3 | `cd /data/local/tmp/gl-w1; export GHOSTLOCK_HOME=… GHOSTLOCK_W1_ONLY=1 GHOSTLOCK_PARK_AFTER_W1=1 GHOSTLOCK_MCAST_SOCKET=tcp6; rm -f gl-w1.log; setsid ./gl-engine --profile /data/local/tmp/gl-w1/gl-profile.bin >gl-w1.log 2>&1 &` |
+| 4 | 轮询 `gl-w1.log`（1s 一次，最长 90s），出现 `Write 1 complete` 即落地；引擎 5s 后就不在了且没有落地 ⇒ 立刻判失败 |
+
+照搬脚本自带的四条约束：`--profile` **必须是绝对路径**；进程必须 `setsid` 分离（否则 adb shell
+会话结束会带走它）；引擎**写文件而不是管道**（这个进程不允许因为 EPIPE/SIGPIPE 死掉）；**park 的进程
+永远不 kill**（只有重启能清掉）。落地的进程名是 `gl-engine`（`pidof` 用它判活）。
+
+推送走 `AdbCommand.push`（`adb push`）而不是设备侧 `cp`：PJA110 上 uid 2000 **列不出**
+`/data/app/<pkg>/lib`（实测 `ls: No such file or directory`），app 的私有目录对 shell 不可见。
+
+### 11.2 adb 公钥相关逻辑整条删除
+
+用户定稿：**"adb 公钥的所有逻辑，当前 adb 已经 pair，不需要这个逻辑"**。于是：
+
+* 删除 `adb/AdbKey.kt`、`adb/AdbClient.kt`、`adb/LibAdbClient.kt`、
+  `io/github/muntashirakon/adb/AdbPubkeyBridge.kt`、`wireless/WirelessAdb.kt`；
+* 删除 `IRootShellService.pushAdbKey()`（AIDL id=4）、`RootShellService.push_adb_key`、
+  以及 `magica.cpp` 里的 `glk_push_adb_key`（`fork → setresgid/setresuid(1000) → 追加
+  /data/misc/adb/adb_keys → _exit`）与它的 JNI 注册；
+* 依赖里移除 `libadb-android`、`conscrypt-android`、`sun-security-android`，proguard 里随之删掉
+  Conscrypt 的 `-keep`/`-dontwarn`（这些只为 libadb 的 TLS exporter 存在）。
+
+理由是配对本身就把密钥交给了 adbd（§1：`adb pair` 会登记公钥并写入 adb_known_hosts），
+第 5/6 步重启 adbd 也不会丢掉 `/data/misc/adb/adb_keys`。
+
+### 11.3 第 7-9 步改用内置 adb CLI（`RootAdbd`）
+
+`chain/RootAdbRunner` 是新的接口，实现 `wireless/RootAdbd`：`adb connect 127.0.0.1:5555`
+（最多 6 轮、1.5s 间隔，因为 adbd 刚重启完还没监听），随后每条命令都用 `-s 127.0.0.1:5555`。
+`AdbService` 记住这个 **root serial**：它优先于无线通道，且保活循环改为看守它 ——
+否则保活会去重连已经死掉的无线 transport，而那会 kick 掉链后面几步正在用的 root 会话。
+
+### 11.4 重试次数上调（全部只作用于通道失败）
+
+| 位置 | 原值 | 现值 |
+|---|---|---|
+| `RootChain.sh` 默认 | 1 | 3（`ChainSpec.TRANSPORT_RETRIES`） |
+| `AdbCommand.DEFAULT_RETRIES` | 3 | 5 |
+| `AdbService.connectAdvertised` 轮数 | 3 | 5 |
+| `ChainSpec.ROOT_CONNECT_ROUNDS` | – | 6 |
+| `ChainSpec.BOOT_FACTS_ATTEMPTS` | 4 | 6 |
+| `ChainSpec.HANG_ATTEMPTS`（am hang） | 2 | 3 |
+
+`NON_IDEMPOTENT`（`am hang`、`rmmod`、`ksud late-load`、`setprop` 两步、以及新增的
+`GHOSTLOCK_PARK_AFTER_W1`）**仍然只执行一次**：重试只发生在"命令很可能没跑"的通道失败上。
+
+### 11.5 本节引入的新假设（必须真机验证）
+
+* **adbd 在 5555 上必须接受配对时登记的那把密钥**。这是 §10 早已列出的未验证项；现在它成了
+  第 7 步能否成功的唯一前提（以前是 libadb 用自签密钥再写一次 adb_keys）。失败时现象是
+  `adb connect` 报 `device unauthorized` / `failed to authenticate`，UI 日志会直接给出该行。
+* W1 用 app 自己的引擎之后，日志里应当出现 **100%** 的质量门（`>=100% coverage`），
+  这是判断"真的换了引擎"的现场证据。
