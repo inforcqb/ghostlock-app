@@ -171,6 +171,34 @@ object ChainSpec {
     /** step 8: the first of the two things this chain actually exists for */
     const val RMMOD_GUARD = "rmmod oplus_security_guard"
 
+    /**
+     * step 8b: the property area, in the window between `rmmod` and `ksud late-load`.
+     *
+     * With `oplus_security_guard` gone -- and before `ksud` reloads the policy -- the bundled
+     * property tool is usable, so the debug-state properties can be put back to their normal
+     * values. Order matters and is the one the tool documents:
+     *
+     *  1. `resetprop -c <context>` **rebuilds the property area** that owns `ro.secure` /
+     *     `ro.debuggable` (`userdebug_or_eng_prop`); without that rebuild the area's state can
+     *     reject or silently drop the writes that follow;
+     *  2. the two `ro.*` writes;
+     *  3. `suid_dumpable` back to 0;
+     *  4. `resetprop -c` with no name, i.e. rebuild **every** property area -- the cleanup.
+     *
+     * Non-fatal on purpose: this is hardening/cleanup, and it must not stop the step that gives
+     * the device persistent root. Every command is logged with its exit code either way.
+     */
+    val HARDEN_COMMANDS = listOf(
+        "resetprop -c $HARDEN_CONTEXT",
+        "resetprop ro.secure 1",
+        "resetprop ro.debuggable 0",
+        "echo 0 > /proc/sys/fs/suid_dumpable",
+        "resetprop -c",
+    )
+
+    /** The property area those `ro.*` values live in. */
+    const val HARDEN_CONTEXT = "u:object_r:userdebug_or_eng_prop:s0"
+
     /** step 9: the second one -- KernelSU late-load gives the persistent root */
     const val KSUD_LATE_LOAD = "/data/adb/ksud late-load"
 
@@ -217,6 +245,7 @@ enum class ChainStep(val label: String, val phase: ChainPhase?) {
     OPEN_ADB_GATE("打开 adbd 门", ChainPhase.PART2),
     ADB_CONNECT("adb 客户端连 127.0.0.1:5555", ChainPhase.PART2),
     REMOVE_GUARD("rmmod oplus_security_guard", ChainPhase.PART2),
+    HARDEN_PROPS("恢复属性：ro.secure / ro.debuggable / suid_dumpable", ChainPhase.PART2),
     KSU_LATE_LOAD("ksud late-load", ChainPhase.PART2),
 }
 
@@ -818,6 +847,34 @@ class RootChain(
                 throw IllegalStateException("oplus_security_guard is still loaded")
             }
             "guard unloaded"
+        } != null
+        if (!ok) return false
+
+        // step 8b: restore the debug properties, in the rmmod -> ksud window ---------
+        /* `resetprop` is usable here and not before: the guard module that would fight the
+         * writes is already unloaded, and `ksud late-load` has not reloaded the policy yet.
+         * See [ChainSpec.HARDEN_COMMANDS] for why the order is what it is. */
+        ok = step(ChainStep.HARDEN_PROPS, ChainSpec.HARDEN_CONTEXT) {
+            val failures = mutableListOf<String>()
+            for (command in ChainSpec.HARDEN_COMMANDS) {
+                val result = adb.exec(command)
+                val output = result.output.trim()
+                if (output.isNotEmpty()) {
+                    output.lineSequence().filter { it.isNotBlank() }.take(4)
+                        .forEach { onLog("    $it") }
+                }
+                onLog("[*] $command -> exit=${result.exitCode}")
+                if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
+            }
+            if (failures.isEmpty()) {
+                onLog("[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0（并重建了属性区）")
+            } else {
+                onLog(
+                    "[!] ${failures.size}/${ChainSpec.HARDEN_COMMANDS.size} 条属性恢复命令没有成功：" +
+                        failures.joinToString() + " —— 不阻断后面的 ksud（它才是持久 root 的来源）",
+                )
+            }
+            "resetprop ×${ChainSpec.HARDEN_COMMANDS.size}（${failures.size} 条失败）"
         } != null
         if (!ok) return false
 
