@@ -41,7 +41,18 @@ set -u
 APPLY=0
 [ "${1:-}" = "--apply" ] && { APPLY=1; shift; }
 
-GL_DIR=${GL_DIR:-/data/local/tmp/gl-w1}
+# /data/local/tmp is NOT guaranteed: some vendor ROMs never create it, and an
+# isolated_app process cannot see every path either.  Resolve a usable work dir:
+# explicit GL_DIR wins, then the app's own data dir (the app can chmod it 0777),
+# then the classic /data/local/tmp, then $TMPDIR.
+pick_dir() {
+    for d in "${GL_DIR:-}" "${APP_DIR:-/data/user/0/com.ghostlock.app}/gl" \
+             /data/data/com.ghostlock.app/gl /data/local/tmp/gl-w1 /data/local/tmp "$TMPDIR"; do
+        [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+GL_DIR=$(pick_dir) || { echo "no writable work dir (set GL_DIR)"; exit 1; }
 GL_LOG=${GL_LOG:-$GL_DIR/w1c-self.log}
 T=${1:-}
 IC=${2:-}
@@ -83,7 +94,7 @@ fi
 # from an ordinary root shell after KernelSU is up.  Loading it needs
 # CAP_SYS_MODULE, so only a full root shell can do it -- try, and print dmesg so
 # the reason (vermagic / disagrees about version / EPERM) is visible.
-GL_KO=${GL_KO:-/data/local/tmp/gl-w1/kread_min.ko}
+GL_KO=${GL_KO:-$GL_DIR/kread_min.ko}
 if [ ! -r /proc/kread ] || [ ! -w /proc/kwrite ]; then
     echo "kread_min not loaded; unloading the OPPO modules first, then insmod $GL_KO"
     for m in oplus_security_guard oplus_secure_harden oplus_security_keventupload; do
