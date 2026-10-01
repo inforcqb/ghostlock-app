@@ -13,14 +13,14 @@ data class KernelSnapshot(
     val cpuPairLabels: List<String>,
     val selectedCpuPair: Int,
     val safeModeEnabled: Boolean,
-    /** Profile/imported offsets force the Shizuku path. */
-    val recommendShizuku: Boolean,
-    /** User-selected Shizuku path for kernels that do not require it. */
-    val shizukuEnabled: Boolean = false,
-    val shizukuStatus: ShizukuStatus,
+    /**
+     * The access channel the chain depends on: the wireless-debugging shell (uid 2000,
+     * `Seccomp: 0`) reached by pairing. Shizuku used to play that role and is gone.
+     */
+    val wirelessStatus: WirelessChannelStatus,
 )
 
-enum class ShizukuStatus { NOT_REQUIRED, NOT_RUNNING, PERMISSION_REQUIRED, READY }
+enum class WirelessChannelStatus { NOT_PAIRED, PAIRED, READY }
 
 enum class LogTone { Default, Error, Success, Warning, Progress }
 

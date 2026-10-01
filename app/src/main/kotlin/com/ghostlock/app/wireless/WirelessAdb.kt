@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.ghostlock.app.adb.AdbKey
+import com.ghostlock.app.chain.ChainSpec
 import io.github.muntashirakon.adb.AdbConnection
 import io.github.muntashirakon.adb.PairingConnectionCtx
 import io.github.muntashirakon.adb.android.AdbMdns
@@ -200,6 +201,33 @@ object WirelessAdb {
                 stream.openInputStream().bufferedReader(Charsets.UTF_8).readText()
             }
         }
+
+    /** A command's exit code plus its combined output. */
+    data class ShellOutcome(val exitCode: Int, val output: String)
+
+    /**
+     * Run one command and report its exit code, the way the chain needs it.
+     *
+     * The `shell:` service does not return an exit code, so the command is followed by an
+     * echo probe. The command text itself is untouched -- it sits inside a `{ ...; }`
+     * group so that a command ending in `&` or containing `;` cannot swallow the probe --
+     * and stderr is merged into the stream, exactly like the Shizuku user service used to
+     * do (`redirectErrorStream(true)`). This is the adb equivalent of "the exit code the
+     * user service reported".
+     *
+     * A missing probe line means the command never finished: that is
+     * [ChainSpec.TRANSPORT_FAILURE], never an empty output.
+     */
+    fun shellWithExitCode(connection: AdbConnection, command: String, timeoutMs: Long): ShellOutcome {
+        val marker = "__GHOSTLOCK_EXIT__"
+        val raw = shell(connection, "{ $command ; } 2>&1; echo $marker\$?", timeoutMs)
+        val lines = raw.split('\n')
+        val index = lines.indexOfLast { it.trim().startsWith(marker) }
+        if (index < 0) return ShellOutcome(ChainSpec.TRANSPORT_FAILURE, raw.trim())
+        val code = lines[index].trim().removePrefix(marker).trim().toIntOrNull()
+            ?: ChainSpec.TRANSPORT_FAILURE
+        return ShellOutcome(code, lines.take(index).joinToString("\n").trim())
+    }
 
     fun closeQuietly(connection: AdbConnection?) {
         if (connection == null) return

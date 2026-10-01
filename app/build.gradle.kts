@@ -200,8 +200,6 @@ dependencies {
     // certificate on the connection object (the certificate is only used for wireless
     // pairing, which we do not do, but the check is unconditional).
     implementation("com.github.MuntashirAkon:sun-security-android:1.1")
-    implementation("dev.rikka.shizuku:api:13.1.5")
-    implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.compose.foundation:foundation:1.12.0")
     implementation("androidx.compose.material:material-icons-extended:1.7.8")

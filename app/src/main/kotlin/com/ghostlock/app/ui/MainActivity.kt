@@ -123,10 +123,6 @@ class MainActivity : ComponentActivity() {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
 
-            GhostlockEffect.OpenShizuku -> packageManager
-                .getLaunchIntentForPackage(SHIZUKU_PACKAGE)
-                ?.let(::startActivity)
-
             GhostlockEffect.OpenWirelessDebugging ->
                 startActivity(Intent(this, WirelessDebuggingActivity::class.java))
         }
@@ -159,10 +155,6 @@ class MainActivity : ComponentActivity() {
                     WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
         )
     }
-
-    private companion object {
-        const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
-    }
 }
 
 @Composable
@@ -192,7 +184,6 @@ private fun GhostlockRoute(
             override fun onExportOffsets() = viewModel.exportOffsets()
             override fun onCpuPairSelected(index: Int) = viewModel.selectCpuPair(index)
             override fun onSafeModeChanged(enabled: Boolean) = viewModel.toggleSafeMode(enabled)
-            override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)
             override fun onDialogConfirm(value: String) = viewModel.onDialogConfirm(value)

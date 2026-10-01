@@ -14,8 +14,6 @@ interface GhostlockRepository {
 
     fun setSafeModeEnabled(enabled: Boolean)
 
-    fun setShizukuEnabled(enabled: Boolean)
-
     suspend fun exportCandidates(): List<OffsetCandidate>
 
     /**
@@ -53,31 +51,23 @@ interface GhostlockRepository {
 
     suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int
 
-    suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int
-
     /**
-     * Run the frozen root chain: W1 (Shizuku user service, shell uid) -> the root service's uid-0
-     * shell channel -> opening the adbd gate -> adb over loopback -> `rmmod oplus_security_guard`
-     * -> `/data/adb/ksud late-load`.
+     * Run the frozen root chain: W1 (wireless-debugging channel, uid 2000) -> the root
+     * service's uid-0 shell channel -> opening the adbd gate -> adb over loopback ->
+     * `rmmod oplus_security_guard` -> `/data/adb/ksud late-load`.
      *
      * Commands are verbatim from `docs/analysis/current-chain-20260926.md` §1; the design and the
      * rejected shortcuts live in `docs/analysis/root-chain-integration.md`.
+     *
+     * The shell-uid steps run over the wireless-debugging channel (paired once, connected on
+     * demand) instead of the removed Shizuku user service -- same identity (uid 2000,
+     * `Seccomp: 0`), see `docs/analysis/wireless-debugging-pairing.md`.
      */
     suspend fun runRootChain(
         pair: CpuPair,
         onLog: (String) -> Unit,
         onProgress: (com.ghostlock.app.chain.ChainProgress) -> Unit,
     ): Boolean
-
-    /**
-     * Start-up hint: the previous in-process run failed at the W3 seccomp
-     * bypass stage, which Shizuku (shell uid, no seccomp) can skip.
-     */
-    suspend fun lastRunW3SeccompHint(): Boolean
-
-    fun requestShizukuPermission()
-
-    fun setShizukuStatusListener(listener: (() -> Unit)?)
 
     fun close()
 }

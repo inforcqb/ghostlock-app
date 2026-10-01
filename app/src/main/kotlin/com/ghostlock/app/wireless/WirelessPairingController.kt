@@ -8,12 +8,15 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import com.ghostlock.app.R
+import com.ghostlock.app.chain.ChainSpec
+import com.ghostlock.app.chain.ShellResult
 import io.github.muntashirakon.adb.AdbConnection
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Everything the wireless-debugging path knows, as one immutable snapshot.
@@ -166,6 +169,82 @@ object WirelessPairingController {
     fun runShell(command: String, timeoutMs: Long = 30_000L): String {
         val active = connection ?: throw IllegalStateException("无线调试通道尚未连接")
         return WirelessAdb.shell(active, command, timeoutMs)
+    }
+
+    /**
+     * Make sure the chain has a live channel, connecting (or reusing) one if needed.
+     *
+     * The chain calls this before its first step: pairing is the standing authorization,
+     * so a connected channel may simply not exist yet when the user taps one-click root.
+     * A cheap probe follows, because "connected" is not the same as "usable".
+     */
+    suspend fun ensureChannel(context: Context, onLog: (String) -> Unit): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val established = establish(context, reuse = true)
+                val probe = WirelessAdb.shell(established, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
+                val identity = probe.lineSequence()
+                    .firstOrNull { it.trimStart().startsWith("uid=") }
+                    ?.trim()
+                    .orEmpty()
+                val seccomp = Regex("Seccomp:\\s*(\\d+)").find(probe)?.groupValues?.get(1)
+                onLog("[*] 无线调试通道就绪：$identity Seccomp=${seccomp ?: "?"}")
+                true
+            } catch (error: Throwable) {
+                closeConnection()
+                onLog("[!] 无线调试通道不可用：${WirelessAdb.describe(error)}")
+                onLog("[!] 请先在「无线调试」里完成配对与连接（一键 root 依赖这条通道）")
+                false
+            }
+        }
+
+    /**
+     * One chain command on the channel.
+     *
+     * `suspend` on purpose: the chain runs on the main dispatcher and a blocking read here
+     * would freeze the UI. A hung or broken read returns [ChainSpec.TRANSPORT_FAILURE] --
+     * "the command may not have run" -- which is exactly the verdict the chain needs to
+     * decide whether repeating a step is safe.
+     */
+    suspend fun execChainCommand(
+        context: Context,
+        command: String,
+        timeoutMs: Long,
+        onLog: (String) -> Unit,
+    ): ShellResult = withContext(Dispatchers.IO) {
+        onLog("$ $command")
+        val active = connection
+        if (active == null) {
+            onLog("[!] 无线调试通道未连接（命令没有运行）：$command")
+            return@withContext ShellResult(ChainSpec.TRANSPORT_FAILURE, "")
+        }
+        try {
+            val outcome = WirelessAdb.shellWithExitCode(active, command, timeoutMs)
+            outcome.output.lineSequence().filter { it.isNotBlank() }.forEach(onLog)
+            ShellResult(outcome.exitCode, outcome.output)
+        } catch (error: Throwable) {
+            onLog("[!] adb 通道执行失败：${WirelessAdb.describe(error)}")
+            ShellResult(ChainSpec.TRANSPORT_FAILURE, "")
+        }
+    }
+
+    /**
+     * W1 through the channel: the frozen step-1 command of the device runbook, verbatim
+     * (`sh /data/local/tmp/gl-w1/w1.sh`, which drives the engine with
+     * `GHOSTLOCK_W1_ONLY` + `GHOSTLOCK_PARK_AFTER_W1`).
+     */
+    suspend fun runW1OnChannel(context: Context, onLog: (String) -> Unit): Boolean {
+        val result = execChainCommand(
+            context,
+            "sh ${ChainSpec.SCRIPT_W1}",
+            ChainSpec.W1_TIMEOUT_MS,
+            onLog,
+        )
+        if (result.exitCode != 0) {
+            onLog("[!] ${ChainSpec.SCRIPT_W1} 退出码 ${result.exitCode}（W1 未确认落地）")
+            return false
+        }
+        return true
     }
 
     fun close() {

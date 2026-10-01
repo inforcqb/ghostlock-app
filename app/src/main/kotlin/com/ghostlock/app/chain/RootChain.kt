@@ -95,6 +95,18 @@ object ChainSpec {
     /** step 4: open the channel and check who we are */
     const val CHANNEL_PROBE = "id"
 
+    /**
+     * step 1, the frozen device-side driver: the runbook's `sh /data/local/tmp/gl-w1/w1.sh`.
+     *
+     * The chain used to reach W1 through the Shizuku user service; the wireless-debugging
+     * channel is the same identity (uid 2000, `Seccomp: 0`) and the script is the frozen
+     * command, so nothing about step 1 is re-invented -- the app just runs it.
+     */
+    const val SCRIPT_W1 = "$DEVICE_DIR/w1.sh"
+
+    /** W1 parks a forged waiter and waits for the engine's marker; give it real headroom. */
+    const val W1_TIMEOUT_MS = 240_000L
+
     /** step 5: `service.adb.tcp.port` is `adbd_config_prop` -- only the adbd domain may set it */
     const val ADBD_SET_TCP_PORT = "runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555"
 
@@ -152,12 +164,12 @@ data class ShellResult(val exitCode: Int, val output: String) {
     val ok: Boolean get() = exitCode == 0
 }
 
-/** Runs a command in the shell-uid context (Shizuku user service). */
+/** Runs a command in the shell-uid context (uid 2000: the wireless-debugging channel). */
 fun interface ShellExec {
     suspend fun exec(command: String, timeoutMs: Long): ShellResult
 }
 
-/** Runs the W1 stage through the exploit binary (Shizuku user service). */
+/** Runs the W1 stage through the exploit binary (uid 2000: the wireless-debugging channel). */
 fun interface W1Runner {
     suspend fun runW1Only(onLog: (String) -> Unit): Boolean
 }
@@ -197,12 +209,12 @@ class RootChain(
     /**
      * Shell-uid command with the chain's default budget (the interface itself has none).
      *
-     * A transport failure (the Shizuku user service call itself failed -- it happens
-     * intermittently, and the exception it throws has a null message, which is how
-     * `error: null` used to get printed) is NOT an empty result: the command never ran,
-     * so no caller may interpret its missing output as a fact. It used to look exactly
-     * like that, and the `am hang` verdict then read "unreadable pid" as "the framework
-     * restarted" and walked on. Fail the step instead.
+     * A transport failure (the channel call itself failed -- the wireless-debugging
+     * connection can drop, and a hung read reports the same sentinel) is NOT an empty
+     * result: the command never ran, so no caller may interpret its missing output as a
+     * fact. It used to look exactly like that with the removed Shizuku hop, and the
+     * `am hang` verdict then read "unreadable pid" as "the framework restarted" and
+     * walked on. Fail the step instead.
      */
     private suspend fun sh(
         command: String,
@@ -225,9 +237,9 @@ class RootChain(
                 } else {
                     "该步骤不允许重复执行"
                 }
-                throw IllegalStateException("Shizuku 执行失败（命令没有真正运行，不是退出码，$why）：$command")
+                throw IllegalStateException("无线调试通道执行失败（命令没有真正运行，不是退出码，$why）：$command")
             }
-            onLog("[*] Shizuku 传输失败（命令没运行），重试 $attempt/$transportRetries：$command")
+            onLog("[*] 通道传输失败（命令没运行），重试 $attempt/$transportRetries：$command")
         }
     }
 
@@ -384,7 +396,7 @@ class RootChain(
     private suspend fun readSystemServerPid(): String? = try {
         lastLineOf(sh("pidof system_server").output)
     } catch (t: Throwable) {
-        onLog("[*] 读 system_server pid 失败（Shizuku 抖动：${t.message}）⇒ 不作证据，继续等")
+        onLog("[*] 读 system_server pid 失败（通道抖动：${t.message}）⇒ 不作证据，继续等")
         null
     }
 
@@ -545,7 +557,7 @@ class RootChain(
             val ssPidBefore = baseline
             if (ssPidBefore.isNullOrEmpty()) {
                 throw IllegalStateException(
-                    "读不到 system_server 的 pid（Shizuku 连续失败 $baselineTries 次）：" +
+                    "读不到 system_server 的 pid（通道连续失败 $baselineTries 次）：" +
                         "没有基线就无法判断 am hang 是否生效，已停止（未落标记，重试即可）",
                 )
             }

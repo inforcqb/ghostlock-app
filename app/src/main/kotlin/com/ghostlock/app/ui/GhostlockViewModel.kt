@@ -15,7 +15,7 @@ import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileFieldNode
-import com.ghostlock.app.domain.model.ShizukuStatus
+import com.ghostlock.app.domain.model.WirelessChannelStatus
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.ExportOffsetsUseCase
@@ -28,6 +28,8 @@ import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
 import com.ghostlock.app.domain.usecase.RunRootChainUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
+import com.ghostlock.app.wireless.WirelessPairingController
+import com.ghostlock.app.wireless.WirelessStateListener
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,7 +52,6 @@ sealed interface GhostlockEffect {
     data class Toast(val resourceId: Int) : GhostlockEffect
     data class Clipboard(val text: String) : GhostlockEffect
     data class KeepScreenAwake(val enabled: Boolean) : GhostlockEffect
-    data object OpenShizuku : GhostlockEffect
 
     /** Opens the wireless-debugging screen (the pairing-based uid-2000 channel). */
     data object OpenWirelessDebugging : GhostlockEffect
@@ -93,48 +94,15 @@ class GhostlockViewModel(
     fun initialize() {
         if (initialized) return
         initialized = true
-        repository.setShizukuStatusListener { refreshAccessStatus() }
+        /* The channel lives in a process-wide controller; refresh the snapshot whenever it
+         * changes state so the status card and the run gating follow pairing/connect. */
+        WirelessPairingController.addListener(wirelessListener)
         viewModelScope.launch {
             refreshSnapshot()
-            applyRecommendedShizuku()
-            maybeSuggestShizukuForW3()
         }
     }
 
-    private var recommendedShizukuApplied = false
-
-    /**
-     * Kernels that recommend Shizuku start with the toggle on at every launch;
-     * a manual switch-off still applies for the rest of the session.
-     */
-    private fun applyRecommendedShizuku() {
-        if (recommendedShizukuApplied) return
-        recommendedShizukuApplied = true
-        val snapshot = kernelSnapshot ?: return
-        if (!snapshot.recommendShizuku || state.value.shizukuEnabled) return
-        toggleShizuku(true)
-    }
-
-    private var w3HintChecked = false
-
-    /**
-     * The previous run's native log survives export settings; when it failed
-     * at the W3 seccomp bypass in-process, suggest switching to Shizuku.
-     */
-    private suspend fun maybeSuggestShizukuForW3() {
-        if (w3HintChecked) return
-        w3HintChecked = true
-        val hint = runCatching { repository.lastRunW3SeccompHint() }.getOrDefault(false)
-        if (!hint || state.value.shizukuEnabled) return
-        mutableState.update {
-            it.copy(
-                dialogVisible = true,
-                dialogType = DialogType.CONFIRM,
-                dialogTitleRes = R.string.w3_shizuku_hint_title,
-                dialogMessageRes = R.string.w3_shizuku_hint_message,
-            )
-        }
-    }
+    private val wirelessListener = WirelessStateListener { refreshAccessStatus() }
 
     fun refreshAccessStatus() {
         if (initialized) viewModelScope.launch { refreshSnapshot() }
@@ -529,17 +497,6 @@ class GhostlockViewModel(
         mutableState.update { it.copy(safeModeEnabled = enabled) }
     }
 
-    fun toggleShizuku(enabled: Boolean) {
-        repository.setShizukuEnabled(enabled)
-        mutableState.update { it.copy(shizukuEnabled = enabled) }
-        if (!enabled && kernelSnapshot?.recommendShizuku == true) {
-            send(GhostlockEffect.Toast(R.string.shizuku_recommended_hint))
-        }
-        // The grant dialog lands in another app, so the status is re-read and
-        // onResume() refreshes it again when the dialog closes.
-        viewModelScope.launch { refreshSnapshot() }
-    }
-
     fun onRun() = runExploit()
 
     /** One-click root: drives the frozen chain, which is already implemented in `chain/`. */
@@ -547,8 +504,8 @@ class GhostlockViewModel(
 
     /**
      * The wireless-debugging channel screen: pair once, then use the uid-2000 shell it
-     * grants. Kept out of the chain state machine until the pairing path is proven on
-     * the device -- it has to be verifiable on its own first.
+     * grants. It is the app's only privileged dependency -- Shizuku used to play that role
+     * and is gone (see `docs/analysis/wireless-debugging-pairing.md`).
      */
     fun onOpenWirelessDebugging() = send(GhostlockEffect.OpenWirelessDebugging)
 
@@ -557,24 +514,24 @@ class GhostlockViewModel(
         val state = state.value
         val messageRes = when {
             !state.executionHasProfile -> R.string.run_blocked_no_profile
-            state.shizukuEnabled && state.shizukuStatus != ShizukuStatus.READY ->
-                R.string.run_blocked_shizuku
+            state.wirelessStatus == WirelessChannelStatus.NOT_PAIRED ->
+                R.string.run_blocked_channel
             else -> R.string.profile_invalid
         }
         send(GhostlockEffect.Toast(messageRes))
     }
 
+    /**
+     * The status card's action: the access channel is the only dependency left, so it
+     * either opens the channel screen (pair/connect) or confirms that it is ready.
+     */
     fun onStatusClick() {
         val snapshot = kernelSnapshot ?: return
-        /* shizukuEnabled already carries the profile suggestion unless the
-         * user overrode it (PROFILE-SUGGEST-01). */
-        if (!snapshot.shizukuEnabled) return
-        when (snapshot.shizukuStatus) {
-            ShizukuStatus.NOT_RUNNING -> send(GhostlockEffect.OpenShizuku)
-            ShizukuStatus.PERMISSION_REQUIRED -> repository.requestShizukuPermission()
-            ShizukuStatus.NOT_REQUIRED,
-            ShizukuStatus.READY,
-            -> Unit
+        when (snapshot.wirelessStatus) {
+            WirelessChannelStatus.READY -> send(GhostlockEffect.Toast(R.string.wireless_ready_title))
+            WirelessChannelStatus.PAIRED,
+            WirelessChannelStatus.NOT_PAIRED,
+            -> send(GhostlockEffect.OpenWirelessDebugging)
         }
     }
 
@@ -587,19 +544,14 @@ class GhostlockViewModel(
             }
             return
         }
-        val useShizuku = snapshot.shizukuEnabled
-        if (useShizuku && snapshot.shizukuStatus != ShizukuStatus.READY) {
-            onStatusClick()
-            return
-        }
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         if (!beginOperation()) return
         send(GhostlockEffect.KeepScreenAwake(true))
-        appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
+        appendLog("==== start exploit ====")
         appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val code = runExploitUseCase(pair, useShizuku, ::appendLog)
+                val code = runExploitUseCase(pair, ::appendLog)
                 appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
                 appendLog("exit code=$code")
             } finally {
@@ -625,7 +577,11 @@ class GhostlockViewModel(
             }
             return
         }
-        if (snapshot.shizukuEnabled && snapshot.shizukuStatus != ShizukuStatus.READY) {
+        if (snapshot.wirelessStatus == WirelessChannelStatus.NOT_PAIRED) {
+            appendLog(
+                "error: 无线调试通道未配对 —— 一键 root 的 uid-2000 步骤跑在这条通道上，" +
+                    "请先在「无线调试」里配对并连接",
+            )
             onStatusClick()
             return
         }
@@ -820,7 +776,8 @@ class GhostlockViewModel(
         dismissDialog(clearConfirmation = false)
         when (dialogType) {
             DialogType.INPUT -> parseUrl(value)
-            DialogType.CONFIRM -> toggleShizuku(true)
+            /* The only remaining confirm dialog is the offsets-overwrite question. */
+            DialogType.CONFIRM -> Unit
             DialogType.NONE, DialogType.LIST -> Unit
         }
     }
@@ -834,6 +791,7 @@ class GhostlockViewModel(
     }
 
     override fun onCleared() {
+        WirelessPairingController.removeListener(wirelessListener)
         repository.close()
         effectChannel.close()
         super.onCleared()
@@ -858,8 +816,7 @@ class GhostlockViewModel(
                 cpuPairLabels = snapshot.cpuPairLabels,
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
-                shizukuEnabled = snapshot.shizukuEnabled,
-                shizukuStatus = snapshot.shizukuStatus,
+                wirelessStatus = snapshot.wirelessStatus,
                 exportVisible = canExport,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,

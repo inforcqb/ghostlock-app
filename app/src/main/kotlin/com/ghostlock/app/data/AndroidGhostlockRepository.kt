@@ -25,7 +25,8 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.OffsetMatching
-import com.ghostlock.app.shizuku.ShizukuExploitRunner
+import com.ghostlock.app.domain.model.WirelessChannelStatus
+import com.ghostlock.app.wireless.WirelessPairingController
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
@@ -79,12 +80,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private val cpuPairLabels = mutableListOf<String>()
     private var selectedCpuPair = 0
     private var safeModeEnabled = false
-    private var shizukuEnabled = false
-    /** True once the user flipped the toggle; only then does it override the
-     * profile suggestion (PROFILE-SUGGEST-01). */
-    private var shizukuPreferenceSet = false
     private var pendingParsedEntries: ValueList? = null
-    private val shizukuRunner = ShizukuExploitRunner(appContext)
 
     /**
      * Holds the binding to this app's isolated uid-0 root service (`bindIsolatedService`).
@@ -96,7 +92,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     init {
         buildCpuPairs()
         restoreCpuPair()
-        restoreShizukuPreference()
         dropLegacyOffsetsCache()
     }
 
@@ -107,12 +102,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun snapshot(): KernelSnapshot {
         val release = System.getProperty("os.version", "unknown").orEmpty()
-        /* PROFILE-SUGGEST-01: recommend_shizuku is a suggestion. It seeds the
-         * toggle until the user makes an explicit choice, which then overrides
-         * it in both directions. */
-        val recommendShizuku = release in builtinProfiles.recommendShizuku ||
-            importedOffsetsRecommendShizuku(release)
-        val shizukuActive = if (shizukuPreferenceSet) shizukuEnabled else recommendShizuku
         return KernelSnapshot(
             deviceName = resolveDeviceName(),
             kernelRelease = release,
@@ -122,11 +111,22 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             cpuPairLabels = cpuPairLabels.toList(),
             selectedCpuPair = selectedCpuPair,
             safeModeEnabled = safeModeEnabled,
-            recommendShizuku = recommendShizuku,
-            shizukuEnabled = shizukuActive,
-            shizukuStatus = if (shizukuActive) shizukuRunner.status()
-            else com.ghostlock.app.domain.model.ShizukuStatus.NOT_REQUIRED,
+            wirelessStatus = wirelessChannelStatus(),
         )
+    }
+
+    /**
+     * The access channel, as the UI shows it: the wireless-debugging shell the chain runs
+     * its uid-2000 steps on. Pairing is the standing dependency; a verified channel only
+     * exists after a successful connect + self-check.
+     */
+    private fun wirelessChannelStatus(): WirelessChannelStatus {
+        val state = WirelessPairingController.state
+        return when {
+            state.shellReady -> WirelessChannelStatus.READY
+            state.paired -> WirelessChannelStatus.PAIRED
+            else -> WirelessChannelStatus.NOT_PAIRED
+        }
     }
 
     override fun selectCpuPair(index: Int) {
@@ -140,17 +140,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override fun setSafeModeEnabled(enabled: Boolean) {
         safeModeEnabled = enabled
-    }
-
-    override fun setShizukuEnabled(enabled: Boolean) {
-        shizukuEnabled = enabled
-        shizukuPreferenceSet = true
-        appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
-            .edit {
-                putBoolean("shizuku_enabled", enabled)
-                putBoolean("shizuku_explicit", true)
-            }
-        if (enabled) shizukuRunner.requestPermission()
     }
 
     override fun profileController(): ProfileConfigController = profileController
@@ -409,37 +398,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
         withDebugAttackLog("direct", onLog) { archivedLog, debugDir ->
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir)
-        }.also { code -> recordLastRun(code, shizuku = false) }
-
-    override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
-        return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir ->
-            val release = System.getProperty("os.version", "").orEmpty()
-            val config = profileController.load(release, pair)
-            val profileBlob = profileController.nativeDocument(config)
-            when {
-                !config.hasProfile || profileBlob == null -> {
-                    archivedLog("error: profile is unavailable for $release")
-                    1
-                }
-
-                config.invalidPaths.isNotEmpty() -> {
-                    archivedLog(
-                        "error: profile has ${config.invalidPaths.size} invalid field(s): " +
-                            config.invalidPaths.take(6).joinToString(),
-                    )
-                    1
-                }
-
-                else -> shizukuRunner.run(pair, safeModeEnabled, profileBlob, debugDir, archivedLog)
-            }
-        }.also { code -> recordLastRun(code, shizuku = true) }
-    }
+        }.also { code -> recordLastRun(code) }
 
     /**
      * Run the frozen root chain -- see `docs/analysis/root-chain-integration.md`.
      *
      * Order, identities and commands are exactly the verified ones:
-     *   W1 (Shizuku user service, uid 2000) -> the root service's uid-0 shell channel ->
+     *   W1 (wireless-debugging channel, uid 2000) -> the root service's uid-0 shell channel ->
      *   `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555` and
      *   `runcon u:r:usbd:s0 setprop ctl.restart adbd` (domain borrows work only while SELinux is
      *   permissive, which is why they sit between W1 and `ksud late-load`) -> adb over loopback
@@ -469,13 +434,25 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             )
             return false
         }
+        /* The chain's uid-2000 steps run over the wireless-debugging channel now. Pairing is
+         * the standing authorization, so the connection may simply not exist yet when the
+         * user taps one-click root: make sure the channel is up before the first step, and
+         * stop with a clear message instead of failing inside step 1. */
+        if (!WirelessPairingController.ensureChannel(appContext, onLog)) {
+            onLog("error: 无线调试通道不可用 —— 请先在「无线调试」里完成配对与连接")
+            return false
+        }
         val channel = RootChannel()
         val adb = LibAdbClient(appContext)
         val chain = RootChain(
             /* The timeout the chain passes in is forwarded: dropping it is how a stalled
-             * Shizuku call hung the whole run forever. */
-            shell = { command, timeoutMs -> shizukuRunner.execShell(command, onLog, timeoutMs) },
-            w1 = { log -> shizukuRunner.runW1Only(profileBlob, null, log) },
+             * call hung the whole run forever. */
+            shell = { command, timeoutMs ->
+                WirelessPairingController.execChainCommand(appContext, command, timeoutMs, onLog)
+            },
+            /* W1 is the frozen device-side command (`sh /data/local/tmp/gl-w1/w1.sh`); the
+             * app no longer needs to push a blob or bind a user service to run it. */
+            w1 = { log -> WirelessPairingController.runW1OnChannel(appContext, log) },
             /* The uid-0 channel is this app's own service now, started by binding it as an
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user
@@ -494,29 +471,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
-    private suspend fun recordLastRun(code: Int, shizuku: Boolean) = withContext(Dispatchers.IO) {
+    private suspend fun recordLastRun(code: Int) = withContext(Dispatchers.IO) {
         runCatching {
             File(filesDir, LastRunFileName).writeText(
-                "$code ${if (shizuku) 1 else 0} ${System.currentTimeMillis()}\n",
+                "$code ${System.currentTimeMillis()}\n",
                 StandardCharsets.UTF_8,
             )
         }
-    }
-
-    override suspend fun lastRunW3SeccompHint(): Boolean = withContext(Dispatchers.IO) {
-        runCatching {
-            val parts = File(filesDir, LastRunFileName)
-                .takeIf { it.isFile }
-                ?.readText()
-                ?.trim()
-                ?.split(' ')
-                ?: return@runCatching false
-            val code = parts.getOrNull(0)?.toIntOrNull() ?: return@runCatching false
-            val ranWithShizuku = parts.getOrNull(1) == "1"
-            if (code == 0 || ranWithShizuku) return@runCatching false
-            val nativeLog = File(filesDir, NativeLogFileName)
-            nativeLog.isFile && nativeLog.readText().contains(W3SeccompFailureMarker)
-        }.getOrDefault(false)
     }
 
     private suspend fun withDebugAttackLog(
@@ -543,11 +504,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             runCatching { archive.close() }
         }
     }
-
-    override fun requestShizukuPermission() = shizukuRunner.requestPermission()
-
-    override fun setShizukuStatusListener(listener: (() -> Unit)?) =
-        shizukuRunner.setStatusListener(listener)
 
     private suspend fun runExploitBinary(
         pair: CpuPair,
@@ -660,7 +616,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     override fun close() {
-        shizukuRunner.close()
         synchronized(processes) {
             processes.forEach(Process::destroyForcibly)
             processes.clear()
@@ -800,14 +755,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return entries.any { (it.asValueMap()?.get("release") as? String) == version }
     }
 
-    private fun importedOffsetsRecommendShizuku(version: String): Boolean {
-        val entries = readOffsetsFile(offsetsFile) ?: return false
-        return entries.any { raw ->
-            val entry = raw.asValueMap() ?: return@any false
-            entry["release"] == version && (entry["recommend_shizuku"] as? Number)?.toInt() == 1
-        }
-    }
-
     private fun buildCpuPairs() {
         cpuPairs.clear()
         cpuPairLabels.clear()
@@ -833,12 +780,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             .getString("cpu_pair", null) ?: return
         val pair = saved.split(',').mapNotNull { it.trim().toIntOrNull() }
         if (pair.size == 2) cpuPairs.indexOf(CpuPair(pair[0], pair[1])).takeIf { it >= 0 }?.let { selectedCpuPair = it }
-    }
-
-    private fun restoreShizukuPreference() {
-        val prefs = appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
-        shizukuPreferenceSet = prefs.getBoolean("shizuku_explicit", false)
-        shizukuEnabled = prefs.getBoolean("shizuku_enabled", false)
     }
 
     private fun parseCpuList(value: String): List<Int> = value.split(',').flatMap { part ->

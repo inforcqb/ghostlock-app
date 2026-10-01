@@ -61,7 +61,7 @@ import com.ghostlock.app.BuildInfo
 import com.ghostlock.app.R
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ProfileFieldNode
-import com.ghostlock.app.domain.model.ShizukuStatus
+import com.ghostlock.app.domain.model.WirelessChannelStatus
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
@@ -95,8 +95,7 @@ data class GhostlockUiState(
     val kernelRelease: String = "",
     val socName: String = "",
     val kernelSupported: Boolean = false,
-    val shizukuEnabled: Boolean = false,
-    val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
+    val wirelessStatus: WirelessChannelStatus = WirelessChannelStatus.NOT_PAIRED,
     val running: Boolean = false,
     val exportVisible: Boolean = false,
     val cpuPairLabels: List<String> = emptyList(),
@@ -180,7 +179,6 @@ interface GhostlockActions {
     fun onExportOffsets()
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
-    fun onShizukuChanged(enabled: Boolean)
     fun onDialogItemSelected(index: Int)
     fun onDialogInputChange(value: String)
     fun onDialogConfirm(value: String)
@@ -631,7 +629,7 @@ private fun GhostlockDialog(
                         Spacer(modifier = Modifier.width(12.dp))
                         TextButton(
                             modifier = Modifier.weight(1f),
-                            text = stringResource(R.string.w3_shizuku_hint_enable),
+                            text = stringResource(R.string.action_confirm),
                             colors = ButtonDefaults.textButtonColorsPrimary(),
                             onClick = { actions.onDialogConfirm("") },
                         )
@@ -754,8 +752,7 @@ private fun ControlPanel(
     Column(modifier = modifier) {
         ActivationStatusCard(
             supported = state.kernelSupported,
-            shizukuEnabled = state.shizukuEnabled,
-            shizukuStatus = state.shizukuStatus,
+            wirelessStatus = state.wirelessStatus,
             showParametersHint = !state.executionHasProfile,
             onParametersClick = actions::onOpenParameters,
             onClick = actions::onStatusClick,
@@ -788,31 +785,19 @@ private fun ControlPanel(
                 summary = stringResource(R.string.safe_mode_summary),
             )
         }
-        /* PROFILE-SUGGEST-01: the profile suggestion seeds the toggle but no
-         * longer hides it; an explicit user choice overrides either way. */
-        Card(modifier = modifier.padding(top = 12.dp)) {
-            SwitchPreference(
-                checked = state.shizukuEnabled,
-                onCheckedChange = actions::onShizukuChanged,
-                title = stringResource(R.string.shizuku_label),
-                summary = stringResource(
-                    when {
-                        !state.shizukuEnabled -> R.string.shizuku_summary_off
-                        state.shizukuStatus == ShizukuStatus.READY ->
-                            R.string.shizuku_summary_on
-                        state.shizukuStatus == ShizukuStatus.PERMISSION_REQUIRED ->
-                            R.string.shizuku_status_permission_required
-                        else -> R.string.shizuku_status_not_running
-                    }
-                ),
-            )
-        }
-        /* The new uid-2000 channel: pair over wireless debugging instead of building a
-         * root channel with Magica. Separate screen, so this row is only the entry. */
+        /* The app's only privileged dependency: the uid-2000 shell from wireless-debugging
+         * pairing. Shizuku played this role before and is gone; this row is the entry to
+         * the channel screen (pair / connect / self-check). */
         Card(modifier = modifier.padding(top = 12.dp)) {
             ArrowPreference(
                 title = stringResource(R.string.wireless_entry),
-                summary = stringResource(R.string.wireless_status_unpaired),
+                summary = stringResource(
+                    when (state.wirelessStatus) {
+                        WirelessChannelStatus.READY -> R.string.wireless_status_ready
+                        WirelessChannelStatus.PAIRED -> R.string.wireless_status_paired
+                        WirelessChannelStatus.NOT_PAIRED -> R.string.wireless_status_unpaired
+                    },
+                ),
                 onClick = actions::onOpenWirelessDebugging,
             )
         }
@@ -830,14 +815,13 @@ private fun ControlPanel(
 @Composable
 private fun ActivationStatusCard(
     supported: Boolean,
-    shizukuEnabled: Boolean,
-    shizukuStatus: ShizukuStatus,
+    wirelessStatus: WirelessChannelStatus,
     showParametersHint: Boolean,
     onParametersClick: () -> Unit,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val accessReady = !shizukuEnabled || shizukuStatus == ShizukuStatus.READY
+    val accessReady = wirelessStatus != WirelessChannelStatus.NOT_PAIRED
     val active = supported && accessReady
     val cardColor = if (isSystemInDarkTheme()) {
         if (active) Color(0xFF173923) else Color(0xFF3B2715)
@@ -855,7 +839,7 @@ private fun ActivationStatusCard(
         if (isSystemInDarkTheme()) Color(0xFFFFC56C) else Color(0xFFF5A623)
     }
     Card(
-        modifier = modifier.clickable(enabled = supported && shizukuEnabled && !accessReady) { onClick() },
+        modifier = modifier.clickable(enabled = supported && !accessReady) { onClick() },
         colors = CardDefaults.defaultColors(color = cardColor),
     ) {
         Box(
@@ -867,10 +851,9 @@ private fun ActivationStatusCard(
                 text = stringResource(
                     when {
                         !supported -> R.string.kernel_unsupported
-                        !shizukuEnabled -> R.string.kernel_supported
-                        shizukuStatus == ShizukuStatus.READY -> R.string.shizuku_ready
-                        shizukuStatus == ShizukuStatus.PERMISSION_REQUIRED -> R.string.shizuku_permission_required
-                        else -> R.string.shizuku_not_running
+                        wirelessStatus == WirelessChannelStatus.READY -> R.string.wireless_status_ready
+                        wirelessStatus == WirelessChannelStatus.PAIRED -> R.string.wireless_status_paired
+                        else -> R.string.wireless_status_unpaired
                     },
                 ),
                 modifier = Modifier
@@ -1043,7 +1026,7 @@ private fun RunActions(
     modifier: Modifier = Modifier,
 ) {
     val supported = state.kernelSupported &&
-        (!state.shizukuEnabled || state.shizukuStatus == ShizukuStatus.READY)
+        state.wirelessStatus != WirelessChannelStatus.NOT_PAIRED
     val profileValid = state.profileInvalidPaths.isEmpty()
     Row(
         modifier = modifier,
