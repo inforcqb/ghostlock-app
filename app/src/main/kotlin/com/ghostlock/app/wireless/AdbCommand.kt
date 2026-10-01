@@ -76,19 +76,19 @@ object AdbCommand {
         val active = try {
             connect(context, onLog)
         } catch (error: Throwable) {
-            onLog("[!] 通道不可用（命令没有运行）：${WirelessAdb.describe(error)}")
+            onLog("[!] 通道不可用，命令没有运行：${WirelessAdb.describe(error)}")
             return@withLock Result(ChainSpec.TRANSPORT_FAILURE, "")
         }
         try {
             val outcome = WirelessAdb.shellWithExitCode(active, command, timeoutMs)
             outcome.output.lineSequence().filter { it.isNotBlank() }.forEach(onLog)
             if (outcome.exitCode == ChainSpec.TRANSPORT_FAILURE) {
-                onLog("[!] 命令没有返回退出码（通道已失效）⇒ 丢弃会话，下一条命令会重连")
+                onLog("[!] 命令没有返回退出码，会话已失效并丢弃")
                 closeLocked()
             }
             Result(outcome.exitCode, outcome.output)
         } catch (error: Throwable) {
-            onLog("[!] 命令执行失败（可能已经运行）：${WirelessAdb.describe(error)}")
+            onLog("[!] 命令执行失败，可能已经运行：${WirelessAdb.describe(error)}")
             closeLocked()
             Result(ChainSpec.TRANSPORT_FAILURE, "")
         }
@@ -106,7 +106,7 @@ object AdbCommand {
             val probe = WirelessAdb.shellWithExitCode(active, SELF_CHECK_COMMAND, SELF_CHECK_TIMEOUT_MS)
             if (probe.exitCode == ChainSpec.TRANSPORT_FAILURE) {
                 closeLocked()
-                onLog("[!] 通道自检没有返回（会话已丢弃）")
+                onLog("[!] 通道自检没有返回，会话已丢弃")
                 return@withLock false
             }
             val identity = probe.output.lineSequence()
@@ -141,7 +141,7 @@ object AdbCommand {
      */
     private suspend fun connect(context: Context, onLog: (String) -> Unit): AdbConnection {
         liveLocked()?.let { active ->
-            onLog("[*] 复用已有连接（同一身份重复建链会被 adbd kick）")
+            onLog("[*] 复用已有连接")
             return active
         }
         var last: Throwable? = null
@@ -153,14 +153,14 @@ object AdbCommand {
             )
             if (endpoint == null) {
                 last = IllegalStateException(
-                    "没有发现 ${WirelessAdb.SERVICE_CONNECT}（无线调试打开了吗？）",
+                    "没有发现 ${WirelessAdb.SERVICE_CONNECT}，无线调试打开了吗",
                 )
             } else {
-                onLog("[*] 连接端点 $endpoint（第 $attempt/$CONNECT_TRIES 次）")
+                onLog("[*] 连接端点 $endpoint 第$attempt/$CONNECT_TRIES 次")
                 try {
                     val fresh = WirelessAdb.connect(context, endpoint)
                     connection = fresh
-                    onLog("[*] adb 已连接（TLS + AUTH，用的是配对登记的密钥）")
+                    onLog("[*] adb 已连接")
                     return fresh
                 } catch (error: Throwable) {
                     last = error
@@ -168,12 +168,12 @@ object AdbCommand {
                 }
             }
             if (attempt < CONNECT_TRIES) {
-                onLog("[*] 连接失败（第 $attempt/$CONNECT_TRIES 次）：${WirelessAdb.describe(last)}")
+                onLog("[*] 连接失败 第$attempt/$CONNECT_TRIES 次：${WirelessAdb.describe(last)}")
                 delay(CONNECT_GAP_MS)
             }
         }
         throw IllegalStateException(
-            "adb 连接失败（$CONNECT_TRIES 次）：${WirelessAdb.describe(last)}",
+            "adb 连接失败 $CONNECT_TRIES 次：${WirelessAdb.describe(last)}",
             last,
         )
     }

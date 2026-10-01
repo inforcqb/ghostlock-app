@@ -114,8 +114,8 @@ class WirelessDebuggingActivity : ComponentActivity() {
     private fun render(state: WirelessState) {
         statusView.text = state.status.ifEmpty {
             getString(
-                if (state.paired) R.string.wireless_status_paired
-                else R.string.wireless_status_unpaired,
+                if (state.paired) R.string.wireless_screen_paired
+                else R.string.wireless_screen_unpaired,
             )
         }
         identityView.text = if (state.identity.isEmpty()) {

@@ -147,7 +147,7 @@ object WirelessAdb {
                     return connection
                 }
                 last = IllegalStateException(
-                    "连接未建立（第 $attempt/$attempts 次，connect()=$established）",
+                    "连接未建立 第$attempt/$attempts 次 connect()=$established",
                 )
             } catch (error: Throwable) {
                 last = error

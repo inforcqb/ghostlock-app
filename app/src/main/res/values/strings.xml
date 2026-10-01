@@ -198,43 +198,50 @@
     <string name="root_chain_step_preflight">Preflight: channel and files</string>
     <string name="root_chain_step_w1">W1: SELinux to permissive</string>
     <string name="root_chain_step_magica_root">Magica: uid-0 channel</string>
-    <string name="root_chain_step_open_adb_gate">Open the adbd gate (adbd/usbd domains)</string>
+    <string name="root_chain_step_open_adb_gate">Open the adbd gate</string>
     <string name="root_chain_step_adb_connect">adb client connects to 127.0.0.1:5555</string>
     <string name="root_chain_step_remove_guard">rmmod oplus_security_guard</string>
     <string name="root_chain_step_ksu_late_load">ksud late-load</string>
     <string name="root_chain_step_verify">Verify KernelSU</string>
     <string name="root_chain_step_generic">Chain step</string>
 
-    <!-- Wireless debugging: the uid-2000 channel obtained by pairing, which replaces
-         Magica / am hang / Shizuku in the chain. -->
-    <string name="wireless_entry">Wireless debugging (uid-2000 channel)</string>
+    <!-- Wireless debugging: the shell channel obtained by pairing, which replaces
+         Magica / am hang / Shizuku in the chain. The 22sp status card only shows a short
+         phrase -- the explanation lives in the small row under it, and no string spells
+         out the internals to the user. -->
+    <string name="wireless_entry">Wireless debugging</string>
+    <string name="wireless_row_unpaired">Not paired · tap to open wireless debugging and pair</string>
+    <string name="wireless_row_paired">Paired · tap to connect and self-check</string>
+    <string name="wireless_row_ready">Channel ready · tap to re-check</string>
     <string name="wireless_screen_title">Wireless debugging</string>
     <string name="wireless_open_wireless_debugging">Open wireless debugging</string>
     <string name="wireless_connect_and_verify">Connect and self-check</string>
     <string name="wireless_forget">Forget pairing</string>
-    <string name="wireless_status_unpaired">Not paired. Tap the button to open wireless debugging, then enter the six-digit code from the notification.</string>
-    <string name="wireless_status_paired">Paired. Tap to connect and self-check the channel.</string>
-    <string name="wireless_status_ready">Supported · channel ready (uid 2000, Seccomp 0)</string>
-    <string name="wireless_waiting_code">Waiting for the pairing code (type it into the notification)</string>
-    <string name="wireless_pairing_busy">Pairing: looking for the pairing service and running the handshake</string>
-    <string name="wireless_connecting_busy">Connecting: looking for the wireless-debugging port and proving the channel</string>
-    <string name="wireless_pair_no_service">No _adb-tls-pairing._tcp within 30s. Is the pairing dialog (\'Pair device with pairing code\') still open?</string>
-    <string name="wireless_connect_no_service">No _adb-tls-connect._tcp within 20s. Is wireless debugging switched on?</string>
+    <string name="wireless_status_unpaired">Not paired</string>
+    <string name="wireless_status_paired">Paired</string>
+    <string name="wireless_status_ready">Channel ready</string>
+    <string name="wireless_screen_unpaired">Not paired yet. Open wireless debugging and pair with the code from the notification.</string>
+    <string name="wireless_screen_paired">Paired. Tap connect and self-check.</string>
+    <string name="wireless_waiting_code">Waiting for the pairing code — type it into the notification</string>
+    <string name="wireless_pairing_busy">Pairing: finding the pairing service</string>
+    <string name="wireless_connecting_busy">Connecting: finding the port and self-checking</string>
+    <string name="wireless_pair_no_service">No pairing service found in 30s. Keep the pairing dialog open.</string>
+    <string name="wireless_connect_no_service">No wireless-debugging port found in 20s. Switch wireless debugging on.</string>
     <string name="wireless_paired_title">Paired</string>
-    <string name="wireless_paired_text">adbd stored this app\'s public key. Opening the channel…</string>
+    <string name="wireless_paired_text">Connecting the channel…</string>
     <string name="wireless_ready_title">Channel ready</string>
     <string name="wireless_failed_title">Wireless debugging</string>
-    <string name="wireless_shell_ready">Channel ready: %1$s (Seccomp=%2$d)</string>
-    <string name="wireless_shell_not_ready">Channel not usable yet: %1$s Seccomp=%2$d (needs uid=2000 and Seccomp: 0)</string>
+    <string name="wireless_shell_ready">Channel ready: %1$s Seccomp=%2$d</string>
+    <string name="wireless_shell_not_ready">Channel not usable: %1$s Seccomp=%2$d</string>
     <string name="wireless_identity_format">%1$s\nSeccomp=%2$d</string>
-    <string name="wireless_manual_code_hint">Notifications are unavailable, so enter the pairing code here instead.</string>
+    <string name="wireless_manual_code_hint">Notifications are unavailable, so enter the pairing code here.</string>
     <string name="wireless_manual_code_submit">Submit code</string>
     <string name="wireless_pairing_code_label">Pairing code</string>
     <string name="wireless_pairing_code_action">Enter pairing code</string>
     <string name="wireless_pairing_code_title">Enter the wireless-debugging pairing code</string>
-    <string name="wireless_pairing_code_hint">Open \'Pair device with pairing code\' in wireless debugging, then type the six-digit code here. The code is valid only while that dialog is open.</string>
-    <string name="wireless_settings_jump_failed">Could not open the wireless-debugging page. Go to Settings - Developer options - Wireless debugging.</string>
-    <string name="wireless_jump_hint">Settings is open. On this ROM the wireless-debugging page lives inside Developer options: scroll to \'Wireless debugging\' - \'Pair device with pairing code\', then type the six-digit code from the notification.</string>
+    <string name="wireless_pairing_code_hint">Open \'Pair device with pairing code\', then type the six-digit code here; it expires once that dialog closes.</string>
+    <string name="wireless_settings_jump_failed">Could not open the page. Go to Settings - Developer options - Wireless debugging.</string>
+    <string name="wireless_jump_hint">Settings is open: find Wireless debugging in Developer options, choose Pair device with pairing code, then type the code into the notification.</string>
     <string name="wireless_channel_name">Wireless debugging channel</string>
     <string name="wireless_channel_description">Pairing-code input and channel state</string>
     <string name="wireless_log_title">Log</string>

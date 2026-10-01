@@ -142,7 +142,7 @@ enum class ChainStep(val label: String) {
     PREFLIGHT("预检：通道与文件"),
     W1("W1：SELinux 转宽容"),
     MAGICA_ROOT("Magica：uid-0 通道"),
-    OPEN_ADB_GATE("打开 adbd 门（借 adbd/usbd 域）"),
+    OPEN_ADB_GATE("打开 adbd 门"),
     ADB_CONNECT("adb 客户端连 127.0.0.1:5555"),
     REMOVE_GUARD("rmmod oplus_security_guard"),
     KSU_LATE_LOAD("ksud late-load"),
@@ -396,7 +396,7 @@ class RootChain(
     private suspend fun readSystemServerPid(): String? = try {
         lastLineOf(sh("pidof system_server").output)
     } catch (t: Throwable) {
-        onLog("[*] 读 system_server pid 失败（通道抖动：${t.message}）⇒ 不作证据，继续等")
+        onLog("[*] 读 system_server pid 失败，通道抖动：${t.message}，不作证据，继续等")
         null
     }
 
@@ -557,7 +557,7 @@ class RootChain(
             val ssPidBefore = baseline
             if (ssPidBefore.isNullOrEmpty()) {
                 throw IllegalStateException(
-                    "读不到 system_server 的 pid（通道连续失败 $baselineTries 次）：" +
+                    "读不到 system_server 的 pid，通道连续失败 $baselineTries 次：" +
                         "没有基线就无法判断 am hang 是否生效，已停止（未落标记，重试即可）",
                 )
             }

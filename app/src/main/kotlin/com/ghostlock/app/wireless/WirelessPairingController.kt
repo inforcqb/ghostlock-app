@@ -122,7 +122,7 @@ object WirelessPairingController {
             return
         }
         WirelessNotifications.cancelCodeInput(context)
-        log("收到配对码（${code.trim().length} 位）")
+        log("收到配对码，${code.trim().length} 位")
         val app = context.applicationContext
         scope.launch { pairFlow(app, code) }
     }
@@ -151,7 +151,7 @@ object WirelessPairingController {
                 status = "",
             )
         }
-        log("已清除本机的配对记录（adbd 侧的密钥仍在）")
+        log("已清除本机配对记录")
     }
 
     /**
@@ -167,7 +167,7 @@ object WirelessPairingController {
         if (ready) {
             mutate { it.copy(shellReady = true, status = context.getString(R.string.wireless_status_ready)) }
         } else {
-            onLog("[!] 请先在「无线调试」里完成配对与连接（一键 root 依赖这条通道）")
+            onLog("[!] 请先在「无线调试」里完成配对与连接")
             mutate { it.copy(shellReady = false) }
         }
         return ready
@@ -204,7 +204,7 @@ object WirelessPairingController {
             onLog,
         )
         if (result.exitCode != 0) {
-            onLog("[!] ${ChainSpec.SCRIPT_W1} 退出码 ${result.exitCode}（W1 未确认落地）")
+            onLog("[!] ${ChainSpec.SCRIPT_W1} 退出码 ${result.exitCode}，W1 未确认落地")
             return false
         }
         return true
@@ -286,7 +286,7 @@ object WirelessPairingController {
             WirelessAdb.pair(context, endpoint, code, PAIRING_TIMEOUT_MS)
             savePaired(context, endpoint)
             mutate { it.copy(paired = true, endpoint = endpoint.toString()) }
-            log("配对成功：adbd 已登记本应用的公钥（无需 setuid 写 adb_keys）")
+            log("配对成功")
             /* Release the code-input notification the moment the pairing is done: it is
              * the prompt for a code that no longer matters, and leaving it in the shade
              * was reported as "pair succeeded but the notification was never released".
@@ -323,7 +323,7 @@ object WirelessPairingController {
             mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
         }
         try {
-            log("自检最多 $CONNECT_ATTEMPTS 次：只有自检失败才重试，自检成功立刻停止")
+            log("自检最多 $CONNECT_ATTEMPTS 次，失败才重试")
             var attempt = 0
             while (true) {
                 attempt++
@@ -331,10 +331,10 @@ object WirelessPairingController {
                     verify(context)
                     return
                 } catch (error: Throwable) {
-                    log("自检失败（第 $attempt/$CONNECT_ATTEMPTS 次）：${WirelessAdb.describe(error)}")
+                    log("自检失败 第$attempt/$CONNECT_ATTEMPTS 次：${WirelessAdb.describe(error)}")
                     AdbCommand.close()
                     if (attempt >= CONNECT_ATTEMPTS) throw error
-                    log("会话已丢弃，重连后再自检（第 ${attempt + 1}/$CONNECT_ATTEMPTS 次）")
+                    log("会话已丢弃，重连后再自检 第${attempt + 1}/$CONNECT_ATTEMPTS 次")
                     mutate { it.copy(status = context.getString(R.string.wireless_connecting_busy)) }
                 }
             }
@@ -363,7 +363,7 @@ object WirelessPairingController {
             ::log,
         )
         if (result.transportFailure) {
-            throw IllegalStateException("自检没有返回结果（通道失效）")
+            throw IllegalStateException("自检没有返回结果，通道失效")
         }
         val text = result.output
         val identity = text.lineSequence()
@@ -388,14 +388,14 @@ object WirelessPairingController {
             )
         }
         if (ready) {
-            log("通道就绪 ✓ uid=2000 且 Seccomp: 0 ⇒ 可用来跑 W1")
+            log("通道就绪：uid=2000 Seccomp=0")
             WirelessNotifications.showStatus(
                 context,
                 context.getString(R.string.wireless_ready_title),
                 context.getString(R.string.wireless_shell_ready, identity, seccomp),
             )
         } else {
-            log("通道未达预期 ✗ 需要 uid=2000 且 Seccomp: 0（当前 uid=$uid Seccomp=$seccomp）")
+            log("通道未达预期：uid=$uid Seccomp=$seccomp")
             WirelessNotifications.showStatus(
                 context,
                 context.getString(R.string.wireless_failed_title),

@@ -63,7 +63,9 @@ class LibAdbClient(
                     kept = true
                     return
                 }
-                last = IllegalStateException("连接未建立（第 $attempt/$attempts 次，connect()=$established）")
+                last = IllegalStateException(
+                    "连接未建立 第$attempt/$attempts 次 connect()=$established",
+                )
             } catch (error: Throwable) {
                 last = error
             } finally {

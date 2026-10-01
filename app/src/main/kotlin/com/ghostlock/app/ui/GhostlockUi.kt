@@ -793,9 +793,9 @@ private fun ControlPanel(
                 title = stringResource(R.string.wireless_entry),
                 summary = stringResource(
                     when (state.wirelessStatus) {
-                        WirelessChannelStatus.READY -> R.string.wireless_status_ready
-                        WirelessChannelStatus.PAIRED -> R.string.wireless_status_paired
-                        WirelessChannelStatus.NOT_PAIRED -> R.string.wireless_status_unpaired
+                        WirelessChannelStatus.READY -> R.string.wireless_row_ready
+                        WirelessChannelStatus.PAIRED -> R.string.wireless_row_paired
+                        WirelessChannelStatus.NOT_PAIRED -> R.string.wireless_row_unpaired
                     },
                 ),
                 onClick = actions::onOpenWirelessDebugging,

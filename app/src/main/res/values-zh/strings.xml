@@ -198,42 +198,48 @@
     <string name="root_chain_step_preflight">预检：通道与文件</string>
     <string name="root_chain_step_w1">W1：SELinux 转宽容</string>
     <string name="root_chain_step_magica_root">Magica：uid-0 通道</string>
-    <string name="root_chain_step_open_adb_gate">打开 adbd 门（借 adbd/usbd 域）</string>
+    <string name="root_chain_step_open_adb_gate">打开 adbd 门</string>
     <string name="root_chain_step_adb_connect">adb 客户端连 127.0.0.1:5555</string>
     <string name="root_chain_step_remove_guard">rmmod oplus_security_guard</string>
     <string name="root_chain_step_ksu_late_load">ksud late-load</string>
     <string name="root_chain_step_verify">校验 KernelSU</string>
     <string name="root_chain_step_generic">链路步骤</string>
 
-    <!-- 无线调试：靠配对拿到的 uid-2000 通道，用来取代链里的 Magica / am hang / Shizuku。 -->
-    <string name="wireless_entry">无线调试（uid-2000 通道）</string>
-    <string name="wireless_screen_title">无线调试通道</string>
+    <!-- 无线调试：靠配对拿到的 shell 通道，用来取代链里的 Magica / am hang / Shizuku。
+         大字号（状态卡 22sp）只放短语，说明放小字那行；文案里不写内部细节。 -->
+    <string name="wireless_entry">无线调试</string>
+    <string name="wireless_row_unpaired">未配对 · 点这里打开无线调试并配对</string>
+    <string name="wireless_row_paired">已配对 · 点这里连接并自检</string>
+    <string name="wireless_row_ready">通道就绪 · 点这里重新自检</string>
+    <string name="wireless_screen_title">无线调试</string>
     <string name="wireless_open_wireless_debugging">打开无线调试</string>
     <string name="wireless_connect_and_verify">连接并自检</string>
     <string name="wireless_forget">忘掉配对</string>
-    <string name="wireless_status_unpaired">未配对：点上面的按钮打开无线调试，再在通知里填 6 位配对码。</string>
-    <string name="wireless_status_paired">已配对：点一下连接并自检这条通道。</string>
-    <string name="wireless_status_ready">受支持 · 通道就绪（uid 2000，Seccomp 0）</string>
-    <string name="wireless_waiting_code">等待配对码（在通知里输入）</string>
-    <string name="wireless_pairing_busy">配对中：查找配对服务并做握手</string>
-    <string name="wireless_connecting_busy">连接中：查找无线调试端口并验证通道</string>
-    <string name="wireless_pair_no_service">30 秒内没有发现 _adb-tls-pairing._tcp：配对对话框（“使用配对码配对设备”）还开着吗？</string>
-    <string name="wireless_connect_no_service">20 秒内没有发现 _adb-tls-connect._tcp：无线调试打开了吗？</string>
+    <string name="wireless_status_unpaired">未配对</string>
+    <string name="wireless_status_paired">已配对</string>
+    <string name="wireless_status_ready">通道就绪</string>
+    <string name="wireless_screen_unpaired">还没配对。打开无线调试，用通知里的配对码完成配对。</string>
+    <string name="wireless_screen_paired">已配对。点「连接并自检」。</string>
+    <string name="wireless_waiting_code">等待配对码，请在通知里输入</string>
+    <string name="wireless_pairing_busy">配对中，正在查找配对服务</string>
+    <string name="wireless_connecting_busy">连接中，正在查找端口并自检</string>
+    <string name="wireless_pair_no_service">30 秒内没有发现配对服务，请保持配对对话框打开。</string>
+    <string name="wireless_connect_no_service">20 秒内没有发现无线调试端口，请确认无线调试已开启。</string>
     <string name="wireless_paired_title">配对成功</string>
-    <string name="wireless_paired_text">adbd 已登记本应用的公钥，正在打开通道…</string>
+    <string name="wireless_paired_text">正在连接无线调试通道…</string>
     <string name="wireless_ready_title">通道就绪</string>
     <string name="wireless_failed_title">无线调试</string>
-    <string name="wireless_shell_ready">通道就绪：%1$s（Seccomp=%2$d）</string>
-    <string name="wireless_shell_not_ready">通道未达预期：%1$s Seccomp=%2$d（需要 uid=2000 且 Seccomp: 0）</string>
+    <string name="wireless_shell_ready">通道就绪：%1$s Seccomp=%2$d</string>
+    <string name="wireless_shell_not_ready">通道未达预期：%1$s Seccomp=%2$d</string>
     <string name="wireless_identity_format">%1$s\nSeccomp=%2$d</string>
-    <string name="wireless_manual_code_hint">通知不可用，改为在下面直接输入配对码。</string>
+    <string name="wireless_manual_code_hint">通知不可用，请在这里输入配对码。</string>
     <string name="wireless_manual_code_submit">提交配对码</string>
     <string name="wireless_pairing_code_label">配对码</string>
     <string name="wireless_pairing_code_action">输入配对码</string>
     <string name="wireless_pairing_code_title">输入无线调试配对码</string>
-    <string name="wireless_pairing_code_hint">先在无线调试里打开“使用配对码配对设备”，再把 6 位配对码填在这里（只在该对话框打开时有效）。</string>
-    <string name="wireless_settings_jump_failed">跳转无线调试失败，请手动进 设置 → 开发者选项 → 无线调试。</string>
-    <string name="wireless_jump_hint">已打开设置。本机（ColorOS）无线调试页在开发者选项里：下滑找到「无线调试」→「使用配对码配对设备」，然后在下拉通知里输入 6 位配对码。</string>
+    <string name="wireless_pairing_code_hint">先打开「使用配对码配对设备」，再把 6 位配对码填在这里；该对话框关闭后配对码失效。</string>
+    <string name="wireless_settings_jump_failed">跳转失败，请手动进 设置 → 开发者选项 → 无线调试。</string>
+    <string name="wireless_jump_hint">已打开设置：在开发者选项里找到「无线调试」→「使用配对码配对设备」，然后把配对码填进通知。</string>
     <string name="wireless_channel_name">无线调试通道</string>
     <string name="wireless_channel_description">配对码输入与通道状态</string>
     <string name="wireless_log_title">日志</string>
