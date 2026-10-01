@@ -1,5 +1,8 @@
 @file:Suppress("UnstableApiUsage")
 
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.Properties
 
 plugins {
@@ -8,7 +11,7 @@ plugins {
 }
 
 val appName = "GhostLock"
-val appVersionName = "1.1"
+val appVersionName = "1.2"
 
 val gitVersionCode = runCatching {
     providers.exec {
@@ -19,67 +22,41 @@ val gitVersionCode = runCatching {
     1
 }
 
-val supportedKernelsSrc = layout.buildDirectory.dir("generated/source/supportedKernels")
-val sharedOffsetsHeader = rootProject.file("src/kernels/offsets.h")
-val offsetFieldRe = Regex("\\.([A-Za-z0-9_]+)\\s*=\\s*(0[xX][0-9A-Fa-f]+|-?\\d+)")
+val buildInfoSrc = layout.buildDirectory.dir("generated/source/buildInfo")
 
-fun parseOffsetValue(text: String): Long = if (text.length > 2 && text.startsWith("0x", ignoreCase = true)) {
-    text.substring(2).toLong(16)
-} else {
-    text.toLong()
-}
+/* Ported Magica: libmagica2.so is produced by the root project's Makefile
+ * (`make magica2jni` -> .build/jni/libmagica2.so) and copied here by the root task
+ * prepareMagica2JniLibs, exactly like the app's own native binary.  It lives in a
+ * generated directory so no build output can end up in the source tree. */
+val magica2JniLibs = layout.buildDirectory.dir("generated/magica2JniLibs")
 
-fun formatOffsetValue(value: Long): String = if (value < 0) "${value}L" else "0x${value.toString(16)}L"
-
-fun escapeKotlinString(value: String): String = value.replace("\\", "\\\\").replace("\"", "\\\"")
-
-fun parseStructMacros(text: String): Map<String, Map<String, Long>> {
-    val macros = mutableMapOf<String, Map<String, Long>>()
-    val lines = text.lines()
-    var index = 0
-    while (index < lines.size) {
-        val match = Regex("#define\\s+(STRUCT_OFFSETS_[A-Za-z0-9_]+)\\s*(.*)").matchEntire(lines[index])
-        if (match == null) {
-            index++
-            continue
-        }
-        val name = match.groupValues[1]
-        var body = match.groupValues[2]
-        while (lines[index].trimEnd().endsWith("\\") && index + 1 < lines.size) {
-            index++
-            body += " ${lines[index]}"
-        }
-        macros[name] = offsetFieldRe.findAll(body).associate { it.groupValues[1] to parseOffsetValue(it.groupValues[2]) }
-        index++
+val generateBuildInfo = tasks.register("generateBuildInfo") {
+    description = "generateBuildInfo"
+    val outputDirectory = buildInfoSrc
+    outputs.dir(outputDirectory)
+    // Always rewrite so the debug UI shows the timestamp of the installed build.
+    outputs.upToDateWhen { false }
+    doLast {
+        val directory = outputDirectory.get().asFile.resolve("com/ghostlock/app")
+        directory.mkdirs()
+        // CPP-BUILD-02: this task is the only writer of the directory, so any
+        // other file is a stale duplicate that must not reach the Kotlin build.
+        directory.listFiles()?.forEach { stale -> if (stale.isFile) stale.delete() }
+        val timeMillis = System.currentTimeMillis()
+        val label = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT)
+            .format(Date(timeMillis))
+        directory.resolve("BuildInfo.kt").writeText(
+            buildString {
+                appendLine("package com.ghostlock.app")
+                appendLine()
+                appendLine("/** Generated per build; shown only by debug builds. */")
+                appendLine("object BuildInfo {")
+                appendLine("    const val BUILD_TIME_EPOCH_MILLIS: Long = ${timeMillis}L")
+                appendLine("    const val BUILD_TIME_LABEL: String = \"$label\"")
+                appendLine("}")
+            },
+        )
     }
-    return macros
-}
-
-data class ParsedKernelEntries(val names: List<String>, val entries: Map<String, Map<String, Long>>)
-
-fun parseKernelEntries(header: File, macros: Map<String, Map<String, Long>>): ParsedKernelEntries {
-    val text = header.readText()
-    val names = mutableListOf<String>()
-    val entries = linkedMapOf<String, Map<String, Long>>()
-    val matcher = Regex("OFFSETS_ENTRY\\(\\s*\"([^\"]+)\"").findAll(text)
-    for (match in matcher) {
-        val release = match.groupValues[1]
-        val tail = text.substring(match.range.last + 1)
-        val body = tail.substringBefore("\n),")
-        val fields = linkedMapOf<String, Long>()
-        Regex("STRUCT_OFFSETS_[A-Za-z0-9_]+").find(body)?.value?.let { macros[it]?.let(fields::putAll) }
-        offsetFieldRe.findAll(body).forEach { fields[it.groupValues[1]] = parseOffsetValue(it.groupValues[2]) }
-        names += release
-        entries[release] = fields
-    }
-    return ParsedKernelEntries(names, entries)
-}
-
-tasks.register<GenerateSupportedKernelsTask>("generateSupportedKernels") {
-    description = "generateSupportedKernels"
-    offsetHeaders.from(fileTree(rootProject.projectDir) { include("src/kernels/*/offsets.h") })
-    sharedHeader.set(rootProject.layout.projectDirectory.file("src/kernels/offsets.h"))
-    generatedFile.set(supportedKernelsSrc.map { it.file("com/ghostlock/app/domain/model/SupportedKernels.kt") })
 }
 
 android {
@@ -101,7 +78,11 @@ android {
     }
     sourceSets {
         named("main") {
-            kotlin.directories.add(supportedKernelsSrc.get().asFile.absolutePath)
+            kotlin.directories.add(buildInfoSrc.get().asFile.absolutePath)
+            // arm64-v8a/libmagica2.so, the ported Magica JNI library (see the root
+            // build.gradle.kts task buildMagica2Jni).  Added to the default
+            // src/main/jniLibs, it is not a replacement for it.
+            jniLibs.srcDir(magica2JniLibs.get().asFile.absolutePath)
         }
     }
     val properties = Properties()
@@ -110,14 +91,32 @@ android {
     val keystorePwd = properties.getProperty("KEYSTORE_PASS") ?: System.getenv("KEYSTORE_PASS")
     val alias = properties.getProperty("KEY_ALIAS") ?: System.getenv("KEY_ALIAS")
     val pwd = properties.getProperty("KEY_PASSWORD") ?: System.getenv("KEY_PASSWORD")
-    val keystoreFile = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    /* Signing key resolution: local.properties / environment win -- CI fills those from
+     * repository secrets -- and when they are absent the key committed in keystore/ is
+     * used instead of AGP's debug key (see keystore/README.md).
+     *
+     * Why: AGP generates the debug keystore fresh on every CI runner, so every build had
+     * a different signature, every update needed an uninstall, and an uninstall drops the
+     * app's adb key pair together with its pairing record -- which means the wireless
+     * debugging channel has to be paired again from scratch on every single build. A
+     * committed key makes `adb install -r` work between builds. */
+    val secretsKeystore = keystorePath?.let(::file)?.takeIf { it.isFile && it.length() > 0L }
+    val repoKeystore = rootProject.file("keystore/ghostlock-dev.jks").takeIf { it.isFile && it.length() > 0L }
+    val keystoreFile = secretsKeystore ?: repoKeystore
+    val fallbackSigning = secretsKeystore == null && repoKeystore != null
+    val storePasswordResolved = keystorePwd?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock-dev" else keystorePwd
+    val aliasResolved = alias?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock" else alias
+    val keyPasswordResolved = pwd?.takeIf { it.isNotEmpty() }
+        ?: if (fallbackSigning) "ghostlock-dev" else pwd
     if (keystoreFile != null) {
         signingConfigs {
             create("release") {
                 storeFile = keystoreFile
-                storePassword = keystorePwd
-                keyAlias = alias
-                keyPassword = pwd
+                storePassword = storePasswordResolved
+                keyAlias = aliasResolved
+                keyPassword = keyPasswordResolved
                 enableV2Signing = true
                 enableV3Signing = true
             }
@@ -136,6 +135,7 @@ android {
     }
     buildFeatures {
         buildConfig = true
+        aidl = true
     }
     dependenciesInfo {
         includeInApk = false
@@ -145,6 +145,11 @@ android {
         jniLibs {
             useLegacyPackaging = true
             excludes += "lib/*/libandroidx.graphics.path.so"
+            /* libadbcli.so is the bundled platform-tools `adb` executable, not a shared
+             * library: keep the NDK's llvm-strip away from it. Same for libksud.so, which is
+             * KernelSU's `ksud` -- its built-in `resetprop` is what the chain calls. */
+            keepDebugSymbols += "**/libadbcli.so"
+            keepDebugSymbols += "**/libksud.so"
         }
         dex {
             useLegacyPackaging = true
@@ -178,15 +183,25 @@ kotlin {
 tasks.named("preBuild") {
     dependsOn(rootProject.tasks.named("prepareGhostlockJniLibs"))
     dependsOn(rootProject.tasks.named("prepareGhostlockExtractJniLibs"))
-    dependsOn(tasks.named("generateSupportedKernels"))
+    dependsOn(rootProject.tasks.named("prepareMagica2JniLibs"))
+    dependsOn(generateBuildInfo)
 }
 
 dependencies {
+    /* No adb library, no Conscrypt, no key material: the bundled platform-tools `adb`
+     * (app/src/main/jniLibs/arm64-v8a/libadbcli.so) does pairing, the wireless-debugging
+     * channel and the root adbd, all with its own key under `filesDir/adb-home`. libadb plus
+     * its Conscrypt/sun-security companions were removed on 2026-10-01 -- and with them the
+     * whole `AdbKey` / `pushAdbKey` / `/data/misc/adb/adb_keys` story, which the wireless
+     * pairing had already made redundant. */
     implementation("androidx.activity:activity-compose:1.13.0")
-    implementation("androidx.compose.foundation:foundation:1.12.1")
+    implementation("androidx.compose.foundation:foundation:1.12.0")
     implementation("androidx.compose.material:material-icons-extended:1.7.8")
     implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4-rc01")
     implementation("top.yukonga.miuix.kmp:miuix-icons:0.9.4-rc01")
     implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4-rc01")
     implementation("org.apache.commons:commons-compress:1.26.0")
+    implementation("com.typesafe:config:1.4.3")
+
+    testImplementation("junit:junit:4.13.2")
 }

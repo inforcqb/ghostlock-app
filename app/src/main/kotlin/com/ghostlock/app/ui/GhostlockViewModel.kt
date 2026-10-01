@@ -1,14 +1,23 @@
 package com.ghostlock.app.ui
 
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
+import com.ghostlock.app.chain.ChainProgress
+import com.ghostlock.app.chain.ChainStateStore
+import com.ghostlock.app.chain.ChainStep
+import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LogTone
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.ProfileFieldNode
+import com.ghostlock.app.domain.model.WirelessChannelStatus
 import com.ghostlock.app.domain.repository.GhostlockRepository
+import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.ExportOffsetsUseCase
 import com.ghostlock.app.domain.usecase.FormatLogUseCase
 import com.ghostlock.app.domain.usecase.ImportOffsetsUseCase
@@ -17,26 +26,40 @@ import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.PublishOffsetsUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
+import com.ghostlock.app.domain.usecase.RunRootChainUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
+import com.ghostlock.app.wireless.WirelessPairingController
+import com.ghostlock.app.wireless.WirelessStateListener
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.core.net.toUri
+import kotlin.time.Duration.Companion.milliseconds
 
 sealed interface GhostlockEffect {
     data class PickDocument(val request: DocumentRequest) : GhostlockEffect
+    data object PickDebugFolder : GhostlockEffect
+    data object PickProfileExportFolder : GhostlockEffect
     data class Share(val uri: String) : GhostlockEffect
     data class Toast(val resourceId: Int) : GhostlockEffect
     data class Clipboard(val text: String) : GhostlockEffect
     data class KeepScreenAwake(val enabled: Boolean) : GhostlockEffect
+
+    /** Opens the wireless-debugging screen (the pairing-based uid-2000 channel). */
+    data object OpenWirelessDebugging : GhostlockEffect
 }
 
-enum class DocumentRequest { ImportOffsets, BootImage, XblImage }
+private const val AutoSaveDelayMillis = 600L
+
+enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, XblImage }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -53,7 +76,9 @@ class GhostlockViewModel(
     private val publishOffsetsUseCase = PublishOffsetsUseCase(repository)
     private val readDocumentUseCase = ReadDocumentUseCase(repository)
     private val runExploitUseCase = RunExploitUseCase(repository)
+    private val runRootChainUseCase = RunRootChainUseCase(repository)
     private val formatLog = FormatLogUseCase()
+    private val profileController get() = repository.profileController()
 
     val state = mutableState.asStateFlow()
     val effects = effectChannel.receiveAsFlow()
@@ -63,14 +88,401 @@ class GhostlockViewModel(
     private var pendingBootPath: String? = null
     private var exportCandidates: List<OffsetCandidate> = emptyList()
     private var pendingConfirmation: PendingConfirmation? = null
+    private var executionSaveJob: Job? = null
+    private var profileSaveJob: Job? = null
 
     fun initialize() {
         if (initialized) return
         initialized = true
-        viewModelScope.launch { refreshSnapshot() }
+        /* The channel lives in a process-wide controller; refresh the snapshot whenever it
+         * changes state so the status card and the run gating follow pairing/connect. */
+        WirelessPairingController.addListener(wirelessListener)
+        viewModelScope.launch {
+            refreshSnapshot()
+        }
     }
 
-    fun toggleAdvanced() = mutableState.update { it.copy(advancedVisible = !it.advancedVisible) }
+    private val wirelessListener = WirelessStateListener { refreshAccessStatus() }
+
+    fun refreshAccessStatus() {
+        if (initialized) viewModelScope.launch { refreshSnapshot() }
+    }
+
+    /* profile-ui: the controller owns loading, merging and persistence. */
+    fun loadExecutionProfile(preserveEditing: Boolean = false) {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            applyExecutionConfig(profileController.load(snapshot.kernelRelease, pair), preserveEditing)
+        }
+    }
+
+    private fun applyExecutionConfig(config: ProfileConfig, preserveEditing: Boolean) {
+        mutableState.update { state ->
+            state.copy(
+                executionRelease = config.release,
+                executionHasProfile = config.hasProfile,
+                executionFields = config.general,
+                executionEditing = if (preserveEditing) state.executionEditing
+                else config.general.associate { field -> field.path to field.value.toString() },
+                profileInvalidPaths = config.invalidPaths,
+                profileRoute = config.route,
+                profileFallback = config.fallbackTo,
+                activeBuiltinProfile = profileController.activeBuiltinRelease(),
+            )
+        }
+    }
+
+    /** Switches the explicit route; index 0 restores geometry inference. */
+    fun onRouteChanged(index: Int) {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        val route = ProfileConfig.Routes.getOrNull(index - 1)
+        /* Re-confirming the current value must not rewrite overrides. */
+        if (route == state.value.profileRoute) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                profileController.updateRoute(snapshot.kernelRelease, pair, route)
+            }
+            val config = result.getOrNull()
+            if (config == null) {
+                android.util.Log.e("GhostLock", "updateRoute failed", result.exceptionOrNull())
+                send(GhostlockEffect.Toast(R.string.execution_save_failed))
+                return@launch
+            }
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+        }
+    }
+
+    /** index 0 disables the fallback; the rest map to ProfileConfig.Routes. */
+    fun onFallbackChanged(index: Int) {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        val fallback = if (index <= 0) "none" else ProfileConfig.Routes.getOrNull(index - 1)
+        val current = state.value.profileFallback
+        if (fallback == current || (fallback == "none" && current == null)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                profileController.updateFallback(snapshot.kernelRelease, pair, fallback)
+            }
+            val config = result.getOrNull()
+            if (config == null) {
+                android.util.Log.e("GhostLock", "updateFallback failed", result.exceptionOrNull())
+                send(GhostlockEffect.Toast(R.string.execution_save_failed))
+                return@launch
+            }
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+        }
+    }
+
+    /** General overrides auto-save shortly after the last keystroke. */
+    fun updateExecutionField(path: String, value: String) {
+        mutableState.update {
+            it.copy(
+                executionEditing = it.executionEditing + (path to value),
+            )
+        }
+        scheduleExecutionSave()
+    }
+
+    private fun scheduleExecutionSave() {
+        executionSaveJob?.cancel()
+        executionSaveJob = viewModelScope.launch {
+            delay(AutoSaveDelayMillis.milliseconds)
+            val snapshot = kernelSnapshot ?: return@launch
+            val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return@launch
+            val values = mutableState.value.executionEditing.mapNotNull { (path, text) ->
+                text.trim().toLongOrNull()?.let { value -> path to value }
+            }.toMap()
+            val ok = runCatching {
+                profileController.updateGeneral(snapshot.kernelRelease, pair, values)
+            }.onSuccess { config -> applyExecutionConfig(config, preserveEditing = true) }.isSuccess
+            if (!ok) send(GhostlockEffect.Toast(R.string.execution_save_failed))
+        }
+    }
+
+    /* advanced-ui: the merged screen loads its editors and debug prefs. */
+    fun onOpenAdvanced() {
+        mutableState.update {
+            it.copy(
+                advancedScreenVisible = true,
+                parametersVisible = false,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+        loadExecutionProfile()
+        viewModelScope.launch(Dispatchers.IO) {
+            val settings = repository.debugSettings()
+            mutableState.update {
+                it.copy(
+                    debugExportEnabled = settings.exportEnabled,
+                    debugExportLocation = settings.exportLocation,
+                    debugKernelLogEnabled = settings.kernelLogEnabled,
+                )
+            }
+        }
+    }
+
+    fun onCloseAdvanced() {
+        mutableState.update {
+            it.copy(
+                advancedScreenVisible = false,
+                parametersVisible = false,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+    }
+
+    fun onOpenParameters() {
+        mutableState.update {
+            it.copy(
+                parametersVisible = true,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+        loadExecutionProfile()
+    }
+
+    fun onCloseParameters() {
+        mutableState.update {
+            it.copy(
+                parametersVisible = false,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+    }
+
+    fun onShowAbout() {
+        mutableState.update { it.copy(aboutVisible = true) }
+    }
+
+    fun onCloseAbout() {
+        mutableState.update { it.copy(aboutVisible = false) }
+    }
+
+    fun onDebugExportChanged(enabled: Boolean) {
+        repository.setDebugExportEnabled(enabled)
+        mutableState.update { it.copy(debugExportEnabled = enabled) }
+    }
+
+    fun onDebugExportLocationPick() = send(GhostlockEffect.PickDebugFolder)
+
+    fun onDebugExportLocationPicked(location: String?) {
+        if (location.isNullOrBlank()) {
+            send(GhostlockEffect.Toast(R.string.debug_export_location_unsupported))
+            return
+        }
+        repository.setDebugExportLocation(location)
+        mutableState.update { it.copy(debugExportLocation = location) }
+    }
+
+    fun onDebugKernelLogChanged(enabled: Boolean) {
+        repository.setDebugKernelLogEnabled(enabled)
+        mutableState.update { it.copy(debugKernelLogEnabled = enabled) }
+    }
+
+    /** Copies the merged profile (HOCON) into a folder the user picks. */
+    fun onExportProfile() = send(GhostlockEffect.PickProfileExportFolder)
+
+    fun onExportProfileFolderPicked(folderUri: String?) {
+        if (folderUri.isNullOrBlank()) return
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = profileController.export(snapshot.kernelRelease, pair, folderUri)
+            send(
+                GhostlockEffect.Toast(
+                    if (ok) R.string.override_export_done else R.string.export_failed,
+                ),
+            )
+        }
+    }
+
+    /** Drops every general and advanced override back to the resolved defaults. */
+    fun onResetParameters() {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val config = runCatching {
+                profileController.reset(snapshot.kernelRelease, pair)
+            }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.execution_save_failed))
+            } else {
+                applyExecutionConfig(config, preserveEditing = false)
+                applyAdvancedConfig(config, preserveEditing = false)
+                send(GhostlockEffect.Toast(R.string.override_reset_done))
+            }
+        }
+    }
+
+    /** Opens the builtin picker; overrides stay keyed to the device kernel. */
+    fun onOpenBuiltinProfiles() {
+        val snapshot = kernelSnapshot ?: return
+        mutableState.update { it.copy(builtinScreenVisible = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val releases = runCatching { profileController.builtinReleases() }
+                .getOrDefault(emptyList())
+            val templates = releases.filter {
+                it.endsWith(ProfileConfigController.TemplateSuffix)
+            }
+            val kernels = releases.filterNot {
+                it.endsWith(ProfileConfigController.TemplateSuffix)
+            }
+            if (templates.isEmpty() && kernels.isEmpty()) {
+                send(GhostlockEffect.Toast(R.string.load_builtin_failed))
+                return@launch
+            }
+            mutableState.update {
+                it.copy(
+                    builtinTemplates = sortByKernelSimilarity(
+                        snapshot.kernelRelease, templates,
+                    ),
+                    builtinProfiles = sortByKernelSimilarity(
+                        snapshot.kernelRelease, kernels,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun onCloseBuiltinProfiles() {
+        mutableState.update { it.copy(builtinScreenVisible = false) }
+    }
+
+    fun onSelectBuiltinProfile(release: String?) {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val config = runCatching {
+                profileController.selectBuiltin(release, snapshot.kernelRelease, pair)
+            }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.load_builtin_failed))
+                return@launch
+            }
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+            send(GhostlockEffect.Toast(R.string.load_builtin_done))
+        }
+    }
+
+    /** Orders releases by absolute major/minor/fix/android distance to device. */
+    private fun sortByKernelSimilarity(deviceRelease: String, releases: List<String>): List<String> {
+        val device = kernelVersionKey(deviceRelease)
+        return releases.sortedWith(Comparator { a, b ->
+            compareIntLists(
+                similarityKey(device, kernelVersionKey(a)),
+                similarityKey(device, kernelVersionKey(b)),
+            )
+        })
+    }
+
+    private fun kernelVersionKey(release: String): List<Int> {
+        val version = release.substringBefore('-').split('.')
+            .mapNotNull { it.toIntOrNull() }
+        val android = Regex("-android(\\d+)").find(release)
+            ?.groupValues?.get(1)?.toIntOrNull()
+        return if (android == null) version else version + android
+    }
+
+    private fun similarityKey(device: List<Int>, candidate: List<Int>): List<Int> =
+        (0 until maxOf(device.size, candidate.size)).map { index ->
+            kotlin.math.abs((device.getOrNull(index) ?: 0) - (candidate.getOrNull(index) ?: 0))
+        }
+
+    private fun compareIntLists(a: List<Int>, b: List<Int>): Int {
+        for (index in 0 until maxOf(a.size, b.size)) {
+            val result = (a.getOrNull(index) ?: 0).compareTo(b.getOrNull(index) ?: 0)
+            if (result != 0) return result
+        }
+        return 0
+    }
+
+    fun onOpenProfileOverrides() {
+        mutableState.update {
+            it.copy(profileOverrideVisible = true, advancedOverrideVisible = false)
+        }
+        loadExecutionProfile()
+    }
+
+    fun onCloseProfileOverrides() {
+        mutableState.update {
+            it.copy(profileOverrideVisible = false, advancedOverrideVisible = false)
+        }
+    }
+
+    fun onOpenAdvancedOverrides() {
+        mutableState.update { it.copy(advancedOverrideVisible = true) }
+        loadProfileOverrides()
+    }
+
+    fun onCloseAdvancedOverrides() {
+        mutableState.update { it.copy(advancedOverrideVisible = false) }
+    }
+
+    fun onProfileOverrideChanged(path: String, value: String) {
+        mutableState.update {
+            it.copy(
+                profileOverrideEditing = it.profileOverrideEditing + (path to value),
+            )
+        }
+        scheduleProfileSave()
+    }
+
+    private fun scheduleProfileSave() {
+        profileSaveJob?.cancel()
+        profileSaveJob = viewModelScope.launch {
+            delay(AutoSaveDelayMillis.milliseconds)
+            val snapshot = kernelSnapshot ?: return@launch
+            val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return@launch
+            val values = mutableState.value.profileOverrideEditing.mapNotNull { (path, text) ->
+                text.trim().toLongOrNull()?.let { value -> path to value }
+            }.toMap()
+            val ok = runCatching {
+                profileController.updateAdvanced(snapshot.kernelRelease, pair, values)
+            }.onSuccess { config -> applyAdvancedConfig(config, preserveEditing = true) }.isSuccess
+            if (!ok) send(GhostlockEffect.Toast(R.string.execution_save_failed))
+        }
+    }
+
+    private fun loadProfileOverrides(preserveEditing: Boolean = false) {
+        val snapshot = kernelSnapshot ?: return
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            applyAdvancedConfig(profileController.load(snapshot.kernelRelease, pair), preserveEditing)
+        }
+    }
+
+    private fun applyAdvancedConfig(config: ProfileConfig, preserveEditing: Boolean) {
+        mutableState.update { state ->
+            state.copy(
+                profileOverrideRelease = config.release,
+                profileOverrideRoots = config.roots,
+                profileOverrideEditing = if (preserveEditing) state.profileOverrideEditing
+                else flattenLeaves(config.roots).associate { field ->
+                    field.path to (field.value?.toString() ?: "")
+                },
+                profileInvalidPaths = config.invalidPaths,
+                profileRoute = config.route,
+                profileFallback = config.fallbackTo,
+                activeBuiltinProfile = profileController.activeBuiltinRelease(),
+            )
+        }
+    }
+
+    private fun flattenLeaves(nodes: List<ProfileFieldNode>): List<ProfileFieldNode> =
+        nodes.flatMap { node -> if (node.isGroup) flattenLeaves(node.children) else listOf(node) }
 
     fun selectCpuPair(index: Int) {
         val snapshot = kernelSnapshot ?: return
@@ -85,12 +497,45 @@ class GhostlockViewModel(
         mutableState.update { it.copy(safeModeEnabled = enabled) }
     }
 
-    fun toggleTcpRoute(enabled: Boolean) {
-        repository.setTcpRouteEnabled(enabled)
-        mutableState.update { it.copy(tcpRouteEnabled = enabled) }
+    fun onRun() = runExploit()
+
+    /** One-click root: drives the frozen chain, which is already implemented in `chain/`. */
+    fun onRunRootChain() = runRootChain()
+
+    /**
+     * The wireless-debugging channel screen: pair once, then use the uid-2000 shell it
+     * grants. It is the app's only privileged dependency -- Shizuku used to play that role
+     * and is gone (see `docs/analysis/wireless-debugging-pairing.md`).
+     */
+    fun onOpenWirelessDebugging() = send(GhostlockEffect.OpenWirelessDebugging)
+
+    /** Explains why the run button is greyed out. */
+    fun onProfileInvalid() {
+        val state = state.value
+        val messageRes = when {
+            !state.executionHasProfile -> R.string.run_blocked_no_profile
+            state.wirelessStatus == WirelessChannelStatus.NOT_PAIRED ->
+                R.string.run_blocked_channel
+            else -> R.string.profile_invalid
+        }
+        send(GhostlockEffect.Toast(messageRes))
     }
 
-    fun onRun() {
+    /**
+     * The status card's action: the access channel is the only dependency left, so it
+     * either opens the channel screen (pair/connect) or confirms that it is ready.
+     */
+    fun onStatusClick() {
+        val snapshot = kernelSnapshot ?: return
+        when (snapshot.wirelessStatus) {
+            WirelessChannelStatus.READY -> send(GhostlockEffect.Toast(R.string.wireless_ready_title))
+            WirelessChannelStatus.PAIRED,
+            WirelessChannelStatus.NOT_PAIRED,
+            -> send(GhostlockEffect.OpenWirelessDebugging)
+        }
+    }
+
+    private fun runExploit() {
         val snapshot = kernelSnapshot ?: return
         if (!snapshot.kernelSupported) {
             if (beginOperation()) {
@@ -102,7 +547,7 @@ class GhostlockViewModel(
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         if (!beginOperation()) return
         send(GhostlockEffect.KeepScreenAwake(true))
-        appendLog("==== start ====")
+        appendLog("==== start exploit ====")
         appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -116,6 +561,122 @@ class GhostlockViewModel(
         }
     }
 
+    /**
+     * Mirror of [runExploit] for the frozen root chain: same guards, same operation
+     * lifecycle, same header log lines. The chain itself (`W1 -> Magica -> adbd gate ->
+     * rmmod guard -> ksud late-load`) lives in `chain/RootChain.kt` and reports its
+     * steps through [onChainProgress]; its commands must stay verbatim, see
+     * `docs/analysis/root-chain-integration.md`.
+     */
+    private fun runRootChain() {
+        val snapshot = kernelSnapshot ?: return
+        if (!snapshot.kernelSupported) {
+            if (beginOperation()) {
+                appendLog("result: root chain unsupported by this kernel")
+                endOperation()
+            }
+            return
+        }
+        if (snapshot.wirelessStatus == WirelessChannelStatus.NOT_PAIRED) {
+            appendLog(
+                "error: 无线调试通道未配对 —— 一键 root 的 uid-2000 步骤跑在这条通道上，" +
+                    "请先在「无线调试」里配对并连接",
+            )
+            onStatusClick()
+            return
+        }
+        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        if (!beginOperation()) return
+        /* A new run resets the step list, so no row of the previous run survives. */
+        mutableState.update { it.copy(rootChainSteps = initialRootChainSteps()) }
+        send(GhostlockEffect.KeepScreenAwake(true))
+        appendLog("==== start one-click root chain ====")
+        appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
+        appendLog("chain: W1 -> Magica uid-0 channel -> adbd gate -> rmmod guard -> ksud late-load")
+        appendLog("commands are verbatim: docs/analysis/root-chain-integration.md")
+        /* Tell the user where the previous run stopped, if it was interrupted by the
+         * zygote restart that the am hang step causes (same boot only). */
+        ChainStateStore.load()?.let { previous ->
+            if (!previous.finished && ChainStateStore.belongsToThisBoot(previous)) {
+                appendLog("[!] 本次开机内上一次运行未完成：${previous.summary()}")
+                appendLog(
+                    "[!] 若它是被 am hang 之后的 zygote 重启打断的（本 app 一起重启属预期），" +
+                        "再点一次即可；W1 那一步检测到已是 permissive 会自动跳过。",
+                )
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val ok = runRootChainUseCase(pair, ::appendLog, ::onChainProgress)
+                appendLog(if (ok) "result: root chain completed" else "result: root chain failed")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                appendLog("root chain failed: ${error.message}")
+                appendLog("result: root chain failed")
+            } finally {
+                endOperation()
+                send(GhostlockEffect.KeepScreenAwake(false))
+                ChainStateStore.markFinished()
+            }
+        }
+    }
+
+    /**
+     * Index-based upsert: [ChainProgress.index] is the 1-based [ChainStep] ordinal, so the
+     * row is replaced in place instead of appended and one step never gets two rows.
+     * The list is seeded by [initialRootChainSteps]; if it is not (for example when the
+     * process state was restored), it is re-seeded from the enum before the update.
+     */
+    private fun onChainProgress(progress: ChainProgress) {
+        val index = progress.index - 1
+        if (index < 0) return
+        val entry = RootChainStepUi(
+            labelRes = chainStepLabelRes(progress.step),
+            detail = progress.detail,
+            phase = progress.step.phase,
+            state = when (progress.state) {
+                StepState.RUNNING -> RootChainStepState.RUNNING
+                StepState.OK -> RootChainStepState.OK
+                StepState.FAILED -> RootChainStepState.FAILED
+            },
+        )
+        mutableState.update { state ->
+            val steps = if (state.rootChainSteps.size == ChainStep.entries.size) {
+                state.rootChainSteps.toMutableList()
+            } else {
+                initialRootChainSteps().toMutableList()
+            }
+            if (index >= steps.size) return@update state
+            val previous = steps[index]
+            /* An OK event without an outcome keeps the detail of its RUNNING event. */
+            steps[index] = entry.copy(detail = entry.detail.ifBlank { previous.detail })
+            state.copy(rootChainSteps = steps)
+        }
+        /* Persist every transition: `am hang --allow-restart` restarts zygote and
+         * this app with it, so the in-memory list alone would lose the place. */
+        ChainStateStore.save(progress)
+    }
+
+    private fun initialRootChainSteps(): List<RootChainStepUi> =
+        ChainStep.entries.map { step ->
+            RootChainStepUi(labelRes = chainStepLabelRes(step), phase = step.phase)
+        }
+
+    private fun chainStepLabelRes(step: ChainStep): Int = when (step) {
+        ChainStep.PREFLIGHT -> R.string.root_chain_step_preflight
+        ChainStep.W1 -> R.string.root_chain_step_w1
+        ChainStep.AM_HANG -> R.string.root_chain_step_am_hang
+        ChainStep.MAGICA_ROOT -> R.string.root_chain_step_magica_root
+        ChainStep.OPEN_ADB_GATE -> R.string.root_chain_step_open_adb_gate
+        ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
+        ChainStep.REMOVE_GUARD -> R.string.root_chain_step_remove_guard
+        ChainStep.SELINUX_REPAIR -> R.string.root_chain_step_selinux_repair
+        ChainStep.HARDEN_PROPS -> R.string.root_chain_step_harden_props
+        ChainStep.KSU_LATE_LOAD -> R.string.root_chain_step_ksu_late_load
+        else -> R.string.root_chain_step_generic
+    }
+
     fun onCloseExecutionSheet() {
         if (running && !state.value.executionSheetDismissible) return
         mutableState.update { it.copy(executionSheetVisible = false) }
@@ -127,7 +688,11 @@ class GhostlockViewModel(
         send(GhostlockEffect.Toast(R.string.copied))
     }
 
-    fun importOffsets() = send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsets))
+    fun importOffsetsHocon() =
+        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsHocon))
+
+    fun importOffsetsJson() =
+        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsJson))
 
     fun parseOffsets() {
         exportCandidates = emptyList()
@@ -170,7 +735,7 @@ class GhostlockViewModel(
                         dialogCurrentItemIndex = exportCandidates.indexOfFirst { offsetCandidate ->
                             offsetCandidate.release == kernelSnapshot?.kernelRelease
                         },
-                    )
+                            )
                 }
             }
         }
@@ -178,9 +743,20 @@ class GhostlockViewModel(
 
     fun onDocumentResult(request: DocumentRequest, uri: String) {
         when (request) {
-            DocumentRequest.ImportOffsets -> importDocument(uri)
             DocumentRequest.BootImage -> stageBoot(uri)
             DocumentRequest.XblImage -> stageXbl(uri)
+            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson -> Unit
+        }
+    }
+
+    /** Multi-picked documents (a profile plus any include dependencies). */
+    fun onDocumentsResult(request: DocumentRequest, uris: List<String>) {
+        when (request) {
+            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson ->
+                importDocuments(uris)
+
+            DocumentRequest.BootImage -> uris.firstOrNull()?.let(::stageBoot)
+            DocumentRequest.XblImage -> uris.firstOrNull()?.let(::stageXbl)
         }
     }
 
@@ -205,6 +781,8 @@ class GhostlockViewModel(
         dismissDialog(clearConfirmation = false)
         when (dialogType) {
             DialogType.INPUT -> parseUrl(value)
+            /* The only remaining confirm dialog is the offsets-overwrite question. */
+            DialogType.CONFIRM -> Unit
             DialogType.NONE, DialogType.LIST -> Unit
         }
     }
@@ -218,6 +796,7 @@ class GhostlockViewModel(
     }
 
     override fun onCleared() {
+        WirelessPairingController.removeListener(wirelessListener)
         repository.close()
         effectChannel.close()
         super.onCleared()
@@ -226,6 +805,12 @@ class GhostlockViewModel(
     private suspend fun refreshSnapshot() {
         val snapshot = withContext(Dispatchers.IO) { loadKernelSnapshot() }
         val canExport = withContext(Dispatchers.IO) { exportOffsetsUseCase().isNotEmpty() }
+        /* Validate the resolved profile here so the run button can grey out. */
+        val loaded = withContext(Dispatchers.IO) {
+            val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
+                ?: return@withContext null
+            runCatching { profileController.load(snapshot.kernelRelease, pair) }.getOrNull()
+        }
         kernelSnapshot = snapshot
         mutableState.update {
             it.copy(
@@ -236,19 +821,31 @@ class GhostlockViewModel(
                 cpuPairLabels = snapshot.cpuPairLabels,
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
-                tcpRouteEnabled = snapshot.tcpRouteEnabled,
-                compact = snapshot.compact,
+                wirelessStatus = snapshot.wirelessStatus,
+                chainPhase = snapshot.chainPhase,
                 exportVisible = canExport,
+                profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
+                executionHasProfile = loaded?.hasProfile ?: false,
+                /* Seed the path for the phase the device is in, so the panel is right the
+                 * moment it opens -- including after `am hang` restarted this app, where the
+                 * in-memory list is gone but the device is now in the other half. A run in
+                 * progress keeps its own list. */
+                rootChainSteps = it.rootChainSteps.ifEmpty { initialRootChainSteps() },
             )
         }
     }
 
-    private fun importDocument(uri: String) {
-        if (!beginOperation()) return
+    private fun importDocuments(uris: List<String>) {
+        if (uris.isEmpty() || !beginOperation()) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val json = readDocumentUseCase(uri)
-                handleImportResult(importOffsetsUseCase(json), json)
+                val documents = linkedMapOf<String, String>()
+                uris.forEach { uri ->
+                    val name = uri.toUri().lastPathSegment?.let(Uri::decode)
+                        ?: uri.substringAfterLast('/')
+                    documents[name] = readDocumentUseCase(uri)
+                }
+                handleImportResult(importOffsetsUseCase(documents), documents)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -261,24 +858,40 @@ class GhostlockViewModel(
         }
     }
 
-    private suspend fun handleImportResult(result: OffsetImportResult, json: String) {
+    private suspend fun handleImportResult(
+        result: OffsetImportResult,
+        documents: Map<String, String>,
+    ) {
         when (result) {
             is OffsetImportResult.RequiresOverwrite -> {
-                pendingConfirmation = PendingConfirmation.Import(json)
+                pendingConfirmation = PendingConfirmation.Import(documents)
                 showOverwriteDialog(result.releases)
             }
 
             is OffsetImportResult.Imported -> {
                 refreshSnapshot()
-                appendLog("offsets.json imported: ${result.releases.joinToString()}")
+                appendLog("profile imported: ${result.releases.joinToString()}")
                 appendLog("result: offsets imported successfully")
-                send(GhostlockEffect.Toast(R.string.import_success))
+                val deviceRelease = state.value.kernelRelease
+                val matchesDevice = deviceRelease.isEmpty() ||
+                    result.releases.any { it == deviceRelease }
+                send(
+                    GhostlockEffect.Toast(
+                        if (matchesDevice) R.string.import_success else R.string.import_no_match,
+                    ),
+                )
             }
 
             OffsetImportResult.AlreadyPresent -> {
                 appendLog("result: offsets already present")
                 send(GhostlockEffect.Toast(R.string.offsets_already_exist))
             }
+            is OffsetImportResult.MissingIncludes -> {
+                appendLog("import offsets missing includes: ${result.files.joinToString()}")
+                appendLog("result: import failed")
+                send(GhostlockEffect.Toast(R.string.import_missing_includes))
+            }
+
             is OffsetImportResult.Failed -> {
                 appendLog("import offsets failed: ${result.reason}")
                 appendLog("result: import failed")
@@ -355,7 +968,7 @@ class GhostlockViewModel(
 
                 is ParseResult.Parsed -> {
                     refreshSnapshot()
-                    appendLog("offsets.json written: ${result.releases.joinToString()}")
+                    appendLog("offsets exported: ${result.releases.joinToString()}")
                     appendLog("result: offsets parsed successfully")
                     send(GhostlockEffect.Toast(R.string.parse_success))
                 }
@@ -402,7 +1015,10 @@ class GhostlockViewModel(
                 if (!beginOperation()) return
                 viewModelScope.launch(Dispatchers.IO) {
                     try {
-                        handleImportResult(importOffsetsUseCase.overwrite(confirmation.json), confirmation.json)
+                        handleImportResult(
+                            importOffsetsUseCase.overwrite(confirmation.documents),
+                            confirmation.documents,
+                        )
                     } finally {
                         endOperation()
                     }
@@ -419,7 +1035,7 @@ class GhostlockViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val uri = publishOffsetsUseCase(candidate)
-                appendLog("exported offsets: offsets-${candidate.release}.json")
+                appendLog("exported offsets: offsets-${candidate.release}.conf")
                 send(GhostlockEffect.Share(uri))
             } catch (error: CancellationException) {
                 throw error
@@ -517,7 +1133,7 @@ class GhostlockViewModel(
     }
 
     private sealed interface PendingConfirmation {
-        data class Import(val json: String) : PendingConfirmation
+        data class Import(val documents: Map<String, String>) : PendingConfirmation
         data class Parse(val input: String, val xblPath: String?) : PendingConfirmation
     }
 }

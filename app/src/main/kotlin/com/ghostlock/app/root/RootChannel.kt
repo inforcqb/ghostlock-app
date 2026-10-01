@@ -1,0 +1,127 @@
+package com.ghostlock.app.root
+
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
+import java.io.File
+import java.net.SocketTimeoutException
+
+/**
+ * Client for the uid-0 shell channel that the root service leaves behind.
+ *
+ * ## Wire protocol (from the ported `magica.cpp` `rsh_*` / `start_shell_server()`)
+ *
+ * * socket `$deviceDir/rshell.sock`, `AF_UNIX`/`SOCK_STREAM`, mode 0666
+ * * token `$deviceDir/rshell.token`, 32 hex chars + `\n`, mode 0644
+ * * handshake: the client writes the token followed by `\n`; a mismatch answers `bad token\n`
+ * * after a successful handshake the server forks a **pty-backed `sh -i`** and pumps raw bytes
+ *   between the socket and the pty master, so the session is an interactive shell, not a
+ *   length-framed request/response protocol.
+ *
+ * ## How one-shot commands work
+ *
+ * There is no "execute and exit" request: the host-side wrapper (`rshell '<cmd>'`) simply feeds
+ * the command and then closes its stdout, which makes the pty child exit. This client does the
+ * same -- write the command, `shutdownOutput()`, then read until EOF. That is why [exec] must
+ * only be used for short commands (all channel steps of the root chain are `setprop`/`runcon`
+ * calls); a long-running command would be cut off when the pty gets EOF.
+ *
+ * The directory is shared on purpose: the server runs in an isolated process (a different uid
+ * with no access to the app's private data dir) while the adb shell (uid 2000) must be able to
+ * read the token -- `/data/local/tmp` plus 0644/0666 is what makes the design work.
+ */
+class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
+
+    val socketPath: String get() = File(deviceDir, "rshell.sock").absolutePath
+    val tokenPath: String get() = File(deviceDir, "rshell.token").absolutePath
+
+    /** True when both the socket and the token are visible from this process. */
+    fun available(): Boolean = File(socketPath).exists() && File(tokenPath).exists()
+
+    /** Read the token; it is world-readable by design (see the class note). */
+    private fun token(): String {
+        val file = File(tokenPath)
+        if (!file.isFile) throw IllegalStateException("channel token missing: $tokenPath")
+        return file.readText().trim()
+    }
+
+    /**
+     * Verification step: connect, hand over the token, run `id` and require `uid=0`.
+     * Called by the chain right after the root service reports that its channel is up.
+     */
+    fun open() {
+        val identity = exec("id")
+        if (!identity.contains("uid=0")) {
+            throw IllegalStateException("channel is not uid 0: ${identity.trim()}")
+        }
+    }
+
+    /**
+     * Run one short command in the channel as uid 0 and return its (combined) output,
+     * with the pty's echo of the command itself removed.
+     *
+     * The timing follows the verified device-side `rshell` wrapper (`echo "$T"; sleep 1;
+     * echo "$*"; sleep 3; echo exit; | nc -U $SOCK`): token first, a pause for the server
+     * to consume it, then the command, then `exit`. Writing token+command back to back and
+     * half-closing immediately -- what this used to do -- does not work against the pty.
+     *
+     * This is the transport the chain uses from step 3 on, because it does NOT depend on
+     * uid 2000: `runcon u:r:usbd:s0 setprop ctl.restart adbd` restarts adbd, which kills
+     * every shell-uid process including Shizuku, so Shizuku may only be used up to (and
+     * including) W1.
+     */
+    fun exec(command: String, timeoutMs: Int = 30_000): String {
+        val raw = StringBuilder()
+        val socket = LocalSocket()
+        try {
+            socket.connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
+            socket.soTimeout = timeoutMs
+            val out = socket.outputStream
+            out.write((token() + "\n").toByteArray(Charsets.UTF_8))
+            out.flush()
+            Thread.sleep(TOKEN_SETTLE_MS)
+            out.write((command + "\n").toByteArray(Charsets.UTF_8))
+            out.flush()
+            Thread.sleep(COMMAND_SETTLE_MS)
+            out.write("exit\n".toByteArray(Charsets.UTF_8))
+            out.flush()
+            try {
+                socket.inputStream.bufferedReader(Charsets.UTF_8).forEachLine { line ->
+                    raw.appendLine(line)
+                }
+            } catch (_: SocketTimeoutException) {
+                // Partial output is still useful; the caller decides from its content.
+            } catch (_: Exception) {
+                // EOF / reset after the child exited: same treatment.
+            }
+        } finally {
+            runCatching { socket.close() }
+        }
+        return stripEcho(command, raw.toString())
+    }
+
+    fun close() = Unit // each exec owns its own connection
+
+    private fun stripEcho(command: String, raw: String): String {
+        val commandLine = command.trim()
+        /* "bad token" is deliberately NOT filtered away: it is the server saying that the
+         * token we read does not belong to the instance currently holding the socket --
+         * exactly what happens while root services from earlier runs are still alive,
+         * each having re-created the socket and rewritten the token on its own onBind().
+         * Swallowing it made the chain see an empty result and hid the whole story. */
+        return raw.lineSequence()
+            .filterNot { it.trim() == commandLine }
+            .joinToString("\n")
+            .trim()
+    }
+
+    companion object {
+        /** The shared directory used by the device-side tooling (`w1.sh`, `rshell`, cleaners). */
+        const val DEFAULT_DEVICE_DIR = "/data/local/tmp/gl-w1"
+
+        /** Pause after the token line, before the command (the wrapper sleeps 1s too). */
+        const val TOKEN_SETTLE_MS = 1_000L
+
+        /** Pause after the command, before `exit`, so the pty has time to print. */
+        const val COMMAND_SETTLE_MS = 2_000L
+    }
+}

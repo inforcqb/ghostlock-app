@@ -1,7 +1,17 @@
 package com.ghostlock.app.domain.usecase
 
+import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.repository.GhostlockRepository
+
+/** The frozen root chain -- see `docs/analysis/root-chain-integration.md`. */
+class RunRootChainUseCase(private val repository: GhostlockRepository) {
+    suspend operator fun invoke(
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+        onProgress: (ChainProgress) -> Unit,
+    ): Boolean = repository.runRootChain(pair, onLog, onProgress)
+}
 
 class LoadKernelSnapshotUseCase(private val repository: GhostlockRepository) {
     suspend operator fun invoke() = repository.snapshot()
@@ -12,8 +22,8 @@ class SelectCpuPairUseCase(private val repository: GhostlockRepository) {
 }
 
 class ImportOffsetsUseCase(private val repository: GhostlockRepository) {
-    suspend operator fun invoke(json: String) = repository.importOffsets(json)
-    suspend fun overwrite(json: String) = repository.confirmImport(json)
+    suspend operator fun invoke(documents: Map<String, String>) = repository.importOffsets(documents)
+    suspend fun overwrite(documents: Map<String, String>) = repository.confirmImport(documents)
 }
 
 class ParseSourceUseCase(private val repository: GhostlockRepository) {
@@ -30,7 +40,8 @@ class ExportOffsetsUseCase(private val repository: GhostlockRepository) {
 }
 
 class RunExploitUseCase(private val repository: GhostlockRepository) {
-    suspend operator fun invoke(pair: CpuPair, onLog: (String) -> Unit) = repository.runExploit(pair, onLog)
+    suspend operator fun invoke(pair: CpuPair, onLog: (String) -> Unit) =
+        repository.runExploit(pair, onLog)
 }
 
 class ReadDocumentUseCase(private val repository: GhostlockRepository) {
@@ -39,5 +50,6 @@ class ReadDocumentUseCase(private val repository: GhostlockRepository) {
 }
 
 class PublishOffsetsUseCase(private val repository: GhostlockRepository) {
-    suspend operator fun invoke(candidate: com.ghostlock.app.domain.model.OffsetCandidate) = repository.publishOffsets(candidate)
+    suspend operator fun invoke(candidate: com.ghostlock.app.domain.model.OffsetCandidate) =
+        repository.publishOffsets(candidate)
 }

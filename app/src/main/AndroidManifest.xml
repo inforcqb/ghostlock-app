@@ -1,20 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The pairing code is entered in a notification (the code only exists while the
+         system's pairing dialog is open, so the user must not have to switch back to
+         the app). API 33+ requires this runtime permission to post it. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <queries>
         <package android:name="me.weishu.kernelsu.pr" />
         <package android:name="me.weishu.kernelsu" />
         <package android:name="com.resukisu.resukisu" />
         <package android:name="com.kowx712.supermanager" />
+        <!-- Needed so resolveActivity() can validate the wireless-debugging jump
+             targets before we start them (package visibility on API 30+). -->
+        <intent>
+            <action android:name="android.settings.WIRELESS_DEBUGGING_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.APPLICATION_DEVELOPMENT_SETTINGS" />
+        </intent>
     </queries>
+    <!-- android:zygotePreloadName is part of the ported Magica chain: AppZygote
+         loads libmagica2.so in the APP ZYGOTE, which installs the capset hook of
+         libandroid_runtime.so there so that every isolated process forked from the
+         zygote inherits it.  The load must happen in the zygote, not in the
+         service (see com.ghostlock.app.root.AppZygote). -->
     <application
         android:name=".GhostlockApplication"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.GhostLock">
+        android:theme="@style/Theme.GhostLock"
+        android:zygotePreloadName="com.ghostlock.app.root.AppZygote">
+        <!-- No Shizuku provider/service any more: the app's privileged dependency is the
+             wireless-debugging channel it pairs itself (see
+             docs/analysis/wireless-debugging-pairing.md). -->
+        <!-- Ported MagicaService: an isolated uid-0 process, forked from the app
+             zygote.  Bind it with Context.bindIsolatedService(); it exposes
+             IRootShellService (control) and the AF_UNIX root shell under
+             /data/local/tmp/gl-w1 (command plane, used by RootChannel). -->
+        <service
+            android:name=".root.RootShellService"
+            android:exported="false"
+            android:isolatedProcess="true"
+            android:useAppZygote="true"
+            tools:ignore="Instantiatable" />
         <activity
             android:name=".ui.MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|mnc|colorMode|density|fontScale|fontWeightAdjustment|keyboard|layoutDirection|locale|mcc|navigation|smallestScreenSize|touchscreen|uiMode"
@@ -25,5 +57,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- The wireless-debugging path: pair (mDNS + the six-digit code), then use the
+             uid-2000 shell it grants instead of Magica / am hang / Shizuku. -->
+        <activity
+            android:name=".ui.wireless.WirelessDebuggingActivity"
+            android:exported="false"
+            android:label="@string/wireless_screen_title"
+            android:windowSoftInputMode="adjustResize" />
+        <!-- Receives the pairing code typed into the notification's reply field.
+             Not exported: the reply is delivered through our own PendingIntent, which
+             carries this app's identity. -->
+        <receiver
+            android:name=".wireless.PairingCodeReceiver"
+            android:exported="false" />
     </application>
 </manifest>

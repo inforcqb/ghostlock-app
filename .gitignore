@@ -7,9 +7,17 @@ app/build/
 libghostlock.so
 libextract.so
 build/
+/.build/
 .DS_Store
 __pycache__
 /devices
 target/
 *.jks
 *.keystore
+# The one keystore that IS tracked on purpose: the shared development key that CI
+# signs with, so builds of different runs can be installed over each other (see
+# keystore/README.md). Secrets still take precedence when they are configured.
+!keystore/ghostlock-dev.jks
+/.codex/
+/src/.codex/config.toml
+/ghostlock *

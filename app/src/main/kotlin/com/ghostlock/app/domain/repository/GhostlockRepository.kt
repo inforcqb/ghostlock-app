@@ -1,6 +1,7 @@
 package com.ghostlock.app.domain.repository
 
 import com.ghostlock.app.domain.model.CpuPair
+import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.domain.model.OffsetImportResult
@@ -13,13 +14,16 @@ interface GhostlockRepository {
 
     fun setSafeModeEnabled(enabled: Boolean)
 
-    fun setTcpRouteEnabled(enabled: Boolean)
-
     suspend fun exportCandidates(): List<OffsetCandidate>
 
-    suspend fun importOffsets(json: String): OffsetImportResult
+    /**
+     * Imports one or more picked documents (file name -> text). Includes are
+     * resolved against the picked files first, then the bundled assets; a
+     * missing include fails the import so the user can pick it too.
+     */
+    suspend fun importOffsets(documents: Map<String, String>): OffsetImportResult
 
-    suspend fun confirmImport(json: String): OffsetImportResult
+    suspend fun confirmImport(documents: Map<String, String>): OffsetImportResult
 
     suspend fun parseSource(
         input: String,
@@ -34,7 +38,36 @@ interface GhostlockRepository {
 
     suspend fun publishOffsets(candidate: OffsetCandidate): String
 
+    /** Single authority for loading, editing and exporting profile config. */
+    fun profileController(): ProfileConfigController
+
+    suspend fun debugSettings(): DebugSettings
+
+    fun setDebugExportEnabled(enabled: Boolean)
+
+    fun setDebugExportLocation(location: String)
+
+    fun setDebugKernelLogEnabled(enabled: Boolean)
+
     suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int
+
+    /**
+     * Run the frozen root chain: W1 (wireless-debugging channel, uid 2000) -> the root
+     * service's uid-0 shell channel -> opening the adbd gate -> adb over loopback ->
+     * `rmmod oplus_security_guard` -> `/data/adb/ksud late-load`.
+     *
+     * Commands are verbatim from `docs/analysis/current-chain-20260926.md` §1; the design and the
+     * rejected shortcuts live in `docs/analysis/root-chain-integration.md`.
+     *
+     * The shell-uid steps run over the wireless-debugging channel (paired once, connected on
+     * demand) instead of the removed Shizuku user service -- same identity (uid 2000,
+     * `Seccomp: 0`), see `docs/analysis/wireless-debugging-pairing.md`.
+     */
+    suspend fun runRootChain(
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+        onProgress: (com.ghostlock.app.chain.ChainProgress) -> Unit,
+    ): Boolean
 
     fun close()
 }
