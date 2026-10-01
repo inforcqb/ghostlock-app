@@ -1,4 +1,4 @@
-﻿name: Build
+name: Build
 
 on:
   push:
@@ -244,11 +244,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download the APK
+      - name: Download the artifacts
         uses: actions/download-artifact@v8
         with:
-          name: GhostLock-release
-          path: release-files
+          path: artifacts
+
+      # The APK is uploaded with `archive: false`, which names the artifact after the FILE
+      # (`GhostLock-release.apk`), so it is found by pattern rather than by name -- looking it
+      # up as `GhostLock-release` failed the whole job ("Artifact not found for name").
+      # Only the APK lands in release-files, and only release-files is published.
+      - name: Keep only the APK
+        run: |
+          mkdir -p release-files
+          APK=$(find artifacts -type f -name '*.apk' | head -n1)
+          test -n "$APK"
+          cp "$APK" release-files/GhostLock-release.apk
+          sha256sum release-files/GhostLock-release.apk
 
       - name: Build the release notes
         run: |
