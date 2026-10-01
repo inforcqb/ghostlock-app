@@ -376,3 +376,23 @@ pre 不在规则之内）」。
   `u:object_r:userdebug_or_eng_prop:s0`（与 `HARDEN_CONTEXT` 完全一致）。
 * **`ksud late-load` 仍用设备自己的 `/data/adb/ksud`**：late-load 需要找到那台机器上真正安装的
   模块负载，而 `resetprop` 与版本无关 —— 这正是内置副本的用途。
+
+### 14.4 教训：显示路径上的读取不能用无线 logger（2026-10-01）
+
+用户报「配对完成后一直在 cat selinux 状态」。原因是我在 §13 加的 `chainPhase()`：
+
+`WirelessPairingController` 里 `AdbCommand.setLogger(::log)` 把 adb 的**默认日志 sink 指向无线状态的
+log 列表**；而 ViewModel 的 `wirelessListener` 在每次无线状态变化时调用 `refreshAccessStatus() →
+snapshot() → chainPhase()`。于是 `chainPhase()` 里一次 `AdbCommand.exec(..., onLog = null)` 的
+`$ cat /sys/fs/selinux/enforce` 会写进无线日志 → 又一次状态变化 → 又一次 snapshot → **自持循环**。
+
+现在的三条约束（写在 `chainPhase()` 的 KDoc 里）：
+
+1. 显式传 `onLog = {}`，**绝不**用默认 sink —— 显示路径上的命令不进任何日志列表；
+2. 两个事实合并成**一条**命令 `ChainSpec.READ_PHASE`
+   （`cat /sys/fs/selinux/enforce; echo; grep -m1 '^Seccomp:' /proc/self/status`，
+   `enforce` 文件没有结尾换行，所以要显式 `echo`）；
+3. 20s 节流 + `Mutex`，`snapshot()` 再频繁也不会跟着刷。
+
+真机实测的 `READ_PHASE` 输出（uid 2000）：第一行 `1`，第二行 `Seccomp:\t0`。
+`versionCode 534` 已装机。
