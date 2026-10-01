@@ -229,6 +229,14 @@ object ChainSpec {
 
     /** verification only (never a substitute for the commands above) */
     const val READ_ENFORCE = "cat /sys/fs/selinux/enforce"
+
+    /**
+     * Both phase facts in ONE command: SELinux and the shell's `Seccomp`.
+     *
+     * `/sys/fs/selinux/enforce` has no trailing newline (measured: `1` arrives glued to the
+     * next output), hence the explicit `echo` between the two reads.
+     */
+    const val READ_PHASE = "cat /sys/fs/selinux/enforce; echo; grep -m1 '^Seccomp:' /proc/self/status"
     /** Same file as [READ_CAPS]; the `Seccomp:` line is what the boot-fact check reads. */
     const val READ_STATUS = "cat /proc/self/status"
 

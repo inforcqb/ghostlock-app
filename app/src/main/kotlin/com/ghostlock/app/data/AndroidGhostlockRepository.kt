@@ -16,6 +16,7 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.system.Os
@@ -40,6 +41,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -52,6 +55,15 @@ import java.util.concurrent.atomic.AtomicLong
 class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private companion object {
         const val OffsetsFileName = "offsets.conf"
+
+        /**
+         * How often the display may re-read the phase facts.
+         *
+         * `snapshot()` runs on every resume and on every wireless state change, while the two
+         * facts it needs only change when W1 lands or the device reboots -- so the read is
+         * throttled instead of following the UI.
+         */
+        const val PHASE_REFRESH_MS = 20_000L
         const val LegacyOffsetsFileName = "offsets.json"
         const val ExtractBinaryName = "libextract.so"
         const val DefaultDebugLocation = "Download/ghostlock-debug-log"
@@ -101,6 +113,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     @Volatile
     private var lastChainPhase: ChainPhase = ChainPhase.PART1
 
+    /** Serialises the phase read and remembers when it last ran; see [chainPhase]. */
+    private val phaseGate = Mutex()
+
+    @Volatile
+    private var lastPhaseReadAt = 0L
+
     /**
      * Holds the binding to this app's isolated uid-0 root service (`bindIsolatedService`).
      * It is created here and deliberately never released: unbinding destroys the isolated
@@ -139,36 +157,53 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * The half of the exploit path this boot is in, from the two live facts that define the
      * split: SELinux and the shell's `Seccomp` (see [ChainPhaseRule]).
      *
-     * Read over the same uid-2000 channel the chain's steps use, but only when something is
-     * paired -- a refresh must not sit through the channel's connect/retry budget. A failed
-     * read (or no pairing at all) keeps [lastChainPhase]: the facts only change on a reboot or
-     * when W1 lands, and on a reboot this process is gone anyway, so the last value is the
-     * better answer than falling back to PART1 and hiding the half the device is in.
+     * This runs on the **display** path (`snapshot()` on every resume and on every wireless
+     * state change), which dictates all three of its properties:
+     *
+     *  * it **never** logs through the default sink. `AdbCommand.setLogger(::log)` points that
+     *    sink at the wireless state's log list, and the wireless listener calls
+     *    `refreshAccessStatus()` -- so a logged read here re-enters `snapshot()` and the app
+     *    spams `cat /sys/fs/selinux/enforce` forever (measured after a pairing on 2026-10-01);
+     *  * it reads both facts in **one** command ([ChainSpec.READ_PHASE]) and at most once per
+     *    [PHASE_REFRESH_MS];
+     *  * a failed read (or no pairing at all) keeps [lastChainPhase]: the facts only change on
+     *    a reboot or when W1 lands, and on a reboot this process is gone anyway.
      */
     private suspend fun chainPhase(): ChainPhase {
         if (!WirelessPairingController.state.paired) return lastChainPhase
-        val enforce = runCatching {
-            AdbCommand.exec(ChainSpec.READ_ENFORCE, retries = 1, timeoutMs = 10_000)
-        }.getOrNull()?.takeIf { !it.transportFailure } ?: return lastChainPhase
-        val seccomp = runCatching {
-            AdbCommand.exec(ChainSpec.READ_STATUS, retries = 1, timeoutMs = 10_000)
-        }.getOrNull()?.takeIf { !it.transportFailure }?.output
-            ?.lineSequence()
-            ?.firstOrNull { it.startsWith("Seccomp:") }
-            ?.substringAfter(':')
-            ?: return lastChainPhase
-        val phase = ChainPhaseRule.of(enforce.output, seccomp)
-        /* One line per transition, on the same tag as the rest of the wireless flow: the phase
-         * is a display decision, but "why is it showing Part 1?" is exactly the question a log
-         * should answer -- with the two facts it was derived from. */
-        if (phase != lastChainPhase) {
-            Log.i(
-                WIRELESS_TAG,
-                "chain phase -> $phase（enforce=${enforce.output.trim()}, Seccomp=${seccomp.trim()}）",
-            )
+        if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) return lastChainPhase
+        return phaseGate.withLock {
+            if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) {
+                return@withLock lastChainPhase
+            }
+            lastPhaseReadAt = SystemClock.elapsedRealtime()
+            val read = runCatching {
+                AdbCommand.exec(
+                    ChainSpec.READ_PHASE,
+                    retries = 1,
+                    timeoutMs = 10_000,
+                    onLog = {},
+                )
+            }.getOrNull()?.takeIf { !it.transportFailure } ?: return@withLock lastChainPhase
+            val lines = read.output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+            val enforce = lines.firstOrNull().orEmpty()
+            val seccomp = lines.firstOrNull { it.startsWith("Seccomp:") }
+                ?.substringAfter(':')
+                ?.trim()
+                .orEmpty()
+            val phase = ChainPhaseRule.of(enforce, seccomp)
+            /* One line per transition, on the logcat tag of the wireless flow: the phase is a
+             * display decision, but "why does it say Part 1?" is a question a log should
+             * answer -- with the two facts it was derived from. */
+            if (phase != lastChainPhase) {
+                Log.i(
+                    WIRELESS_TAG,
+                    "chain phase -> $phase（enforce=$enforce, Seccomp=$seccomp）",
+                )
+            }
+            lastChainPhase = phase
+            phase
         }
-        lastChainPhase = phase
-        return phase
     }
 
     /**
