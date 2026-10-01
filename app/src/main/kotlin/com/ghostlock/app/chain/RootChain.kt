@@ -920,7 +920,7 @@ class RootChain(
          * run the repair (it only writes bytes +1..+10, enforcing is untouched), then unload
          * the module again -- nothing stays behind. The guard is already gone at this point,
          * which is what lets a module be loaded at all. */
-        ok = step(ChainStep.SELINUX_REPAIR, "$KREAD_KO → $FIX_SELINUX → rmmod") {
+        ok = step(ChainStep.SELINUX_REPAIR, "${ChainSpec.KREAD_KO} → ${ChainSpec.FIX_SELINUX} → rmmod") {
             val failures = mutableListOf<String>()
             for (command in ChainSpec.selinuxRepairCommands()) {
                 val result = adb.exec(command)
