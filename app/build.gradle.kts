@@ -146,8 +146,10 @@ android {
             useLegacyPackaging = true
             excludes += "lib/*/libandroidx.graphics.path.so"
             /* libadbcli.so is the bundled platform-tools `adb` executable, not a shared
-             * library: keep the NDK's llvm-strip away from it. */
+             * library: keep the NDK's llvm-strip away from it. Same for libksud.so, which is
+             * KernelSU's `ksud` -- its built-in `resetprop` is what the chain calls. */
             keepDebugSymbols += "**/libadbcli.so"
+            keepDebugSymbols += "**/libksud.so"
         }
         dex {
             useLegacyPackaging = true

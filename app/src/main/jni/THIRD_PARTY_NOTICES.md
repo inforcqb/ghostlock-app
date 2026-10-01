@@ -29,6 +29,17 @@ Keep-this-in-mind facts about the vendored copies:
   (read the ELF, find the `.rela.plt` entry for `capset`, mprotect the page
   writable, store the replacement address, flush the instruction cache).
 
+## Also shipped in the APK: `jniLibs/arm64-v8a/libksud.so`
+
+That file is **not** compiled here — it is KernelSU's `ksud` (GPL-3.0), pulled verbatim from the
+test device's `/data/adb/ksud` on 2026-10-01 (sha256
+`9f57222b06222f461bbb69b24e40a293e34708eeb7b1bbb065110651f7b9c991`, 5326360 bytes) and invoked by
+the chain as `ksud resetprop …`. See `app/src/main/jniLibs/README.md` for why it is bundled and
+what it is used for. **GPL-3.0 is a copyleft licence**: redistributing an APK that contains this
+binary obliges the distributor to the GPL's terms (source offer and licence text). It is recorded
+here so that decision is made on purpose, not by accident — the same reason the LSPlt item below
+is still open.
+
 ## TODO(licence) — must be settled before redistribution
 
 **LSPlt (`app/src/main/jni/lsplt/**`, excluding `syscall.hpp`) is vendored with no

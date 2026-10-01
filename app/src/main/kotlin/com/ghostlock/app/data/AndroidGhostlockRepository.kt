@@ -503,6 +503,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * `assets/device/` now (sha256-compared, so repeat runs are silent). Non-fatal: a
          * missing tool must not stop W1 -> Magica -> adbd gate -> ksud. */
         DeviceSync.pushBundled(appContext, onLog)
+        /* The app's own `ksud` (GPL-3.0, from the installed KernelSU/ReSukiSU/KowSU) goes to
+         * the device next to the engine: step 8b calls it by absolute path as
+         * `ksud resetprop …`, so nothing depends on the shell's PATH. When the push fails the
+         * chain falls back to the device's own installation. */
+        val ksud = if (DeviceSync.pushKsud(appContext, onLog)) {
+            ChainSpec.KSUD
+        } else {
+            onLog("[*] 用设备上的 ${ChainSpec.KSUD_FALLBACK}（内置 ksud 没能推送）")
+            ChainSpec.KSUD_FALLBACK
+        }
         val channel = RootChannel()
         /* Steps 7-9 run on the bundled adb CLI against the root adbd: the app has no adb
          * client of its own any more (libadb, and with it the whole adb public-key story,
@@ -527,6 +537,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             rootShell = { isolatedRootShell.launch(onLog) },
             channel = channel,
             adb = adb,
+            ksud = ksud,
             onLog = onLog,
             onProgress = onProgress,
         )

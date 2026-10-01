@@ -32,6 +32,41 @@ object DeviceSync {
     data class Bundled(val assetPath: String, val remotePath: String, val mode: String)
 
     /**
+     * Push the bundled `ksud` (`jniLibs/arm64-v8a/libksud.so`, i.e. [ChainSpec.KSUD_LIB]) to
+     * [ChainSpec.KSUD].
+     *
+     * The chain's property step calls it by absolute path as `ksud resetprop …` -- `ksud`
+     * carries `resetprop` the way busybox carries its applets -- so the app does not depend on
+     * a `resetprop` being on the shell's PATH (measured 2026-10-01: a bare `resetprop` is not
+     * resolvable in a plain `adb shell`, and the device only has it as a symlink inside the
+     * KernelSU installation). Returns false when the push did not work, so the caller can fall
+     * back to the device's own [ChainSpec.KSUD_FALLBACK].
+     */
+    suspend fun pushKsud(context: Context, onLog: (String) -> Unit): Boolean =
+        pushNative(context, ChainSpec.KSUD_LIB, ChainSpec.KSUD, "755", onLog)
+
+    /**
+     * Push one of the app's own binaries (`nativeLibraryDir/<libName>`) to [remote].
+     *
+     * `nativeLibraryDir` is where the APK's `jniLibs` end up; `adb push` is the transport,
+     * because uid 2000 cannot read `/data/app/<pkg>/lib` (see the class note).
+     */
+    suspend fun pushNative(
+        context: Context,
+        libName: String,
+        remote: String,
+        mode: String,
+        onLog: (String) -> Unit,
+    ): Boolean {
+        val source = File(context.applicationInfo.nativeLibraryDir, libName)
+        if (!source.isFile) {
+            onLog("[!] 内置二进制缺失：${source.absolutePath}")
+            return false
+        }
+        return pushIfChanged(source, remote, mode, onLog)
+    }
+
+    /**
      * Push every [BUNDLED] file that the device does not already have.
      *
      * Deliberately non-fatal for the chain: these files are tools for the later cleanup /

@@ -172,11 +172,30 @@ object ChainSpec {
     const val RMMOD_GUARD = "rmmod oplus_security_guard"
 
     /**
+     * The bundled `ksud` the chain calls for the property work -- pushed to the device first
+     * (`assets`-style push from `jniLibs`, see DeviceSync), and always by **absolute path**:
+     * a bare `resetprop` depends on the shell's PATH, which is exactly what broke the first
+     * version of step 8b.
+     *
+     * `ksud` carries `resetprop` the way busybox carries its applets, so the invocation is
+     * `ksud resetprop …` (verified on the PJA110 2026-10-01, from a copy in /data/local/tmp:
+     * `…/ksud resetprop ro.secure` -> `1`, `su -c '… -Z ro.secure'` ->
+     * `u:object_r:userdebug_or_eng_prop:s0`).
+     */
+    const val KSUD = "$DEVICE_DIR/ksud"
+
+    /** The device's own installation, used when the bundled copy could not be pushed. */
+    const val KSUD_FALLBACK = "/data/adb/ksud"
+
+    /** Local name of the bundled ksud inside the APK (`jniLibs/arm64-v8a`). */
+    const val KSUD_LIB = "libksud.so"
+
+    /**
      * step 8b: the property area, in the window between `rmmod` and `ksud late-load`.
      *
-     * With `oplus_security_guard` gone -- and before `ksud` reloads the policy -- the bundled
-     * property tool is usable, so the debug-state properties can be put back to their normal
-     * values. Order matters and is the one the tool documents:
+     * With `oplus_security_guard` gone -- and before `ksud` reloads the policy -- the property
+     * tool is usable, so the debug-state properties can be put back to their normal values.
+     * Order matters and is the one the tool documents:
      *
      *  1. `resetprop -c <context>` **rebuilds the property area** that owns `ro.secure` /
      *     `ro.debuggable` (`userdebug_or_eng_prop`); without that rebuild the area's state can
@@ -188,19 +207,25 @@ object ChainSpec {
      * Non-fatal on purpose: this is hardening/cleanup, and it must not stop the step that gives
      * the device persistent root. Every command is logged with its exit code either way.
      */
-    val HARDEN_COMMANDS = listOf(
-        "resetprop -c $HARDEN_CONTEXT",
-        "resetprop ro.secure 1",
-        "resetprop ro.debuggable 0",
+    fun hardenCommands(ksud: String): List<String> = listOf(
+        "$ksud resetprop -c $HARDEN_CONTEXT",
+        "$ksud resetprop ro.secure 1",
+        "$ksud resetprop ro.debuggable 0",
         "echo 0 > /proc/sys/fs/suid_dumpable",
-        "resetprop -c",
+        "$ksud resetprop -c",
     )
 
     /** The property area those `ro.*` values live in. */
     const val HARDEN_CONTEXT = "u:object_r:userdebug_or_eng_prop:s0"
 
-    /** step 9: the second one -- KernelSU late-load gives the persistent root */
-    const val KSUD_LATE_LOAD = "/data/adb/ksud late-load"
+    /**
+     * step 9: the second one -- KernelSU late-load gives the persistent root
+     *
+     * Deliberately the **device's** ksud and not the bundled one: `late-load` has to find the
+     * module payload of the KernelSU installation that is actually there, while `resetprop`
+     * (step 8b) is version-independent and is what the bundled copy is for.
+     */
+    const val KSUD_LATE_LOAD = "$KSUD_FALLBACK late-load"
 
     /** verification only (never a substitute for the commands above) */
     const val READ_ENFORCE = "cat /sys/fs/selinux/enforce"
@@ -326,6 +351,11 @@ class RootChain(
     private val rootShell: RootShellLauncher,
     private val channel: RootChannel,
     private val adb: RootAdbRunner,
+    /**
+     * Absolute path of the `ksud` the property step (8b) must use: the app's own copy in
+     * [ChainSpec.KSUD] when it was pushed, else the device's [ChainSpec.KSUD_FALLBACK].
+     */
+    private val ksud: String,
     private val onLog: (String) -> Unit,
     private val onProgress: (ChainProgress) -> Unit,
 ) {
@@ -855,8 +885,10 @@ class RootChain(
          * writes is already unloaded, and `ksud late-load` has not reloaded the policy yet.
          * See [ChainSpec.HARDEN_COMMANDS] for why the order is what it is. */
         ok = step(ChainStep.HARDEN_PROPS, ChainSpec.HARDEN_CONTEXT) {
+            val commands = ChainSpec.hardenCommands(ksud)
             val failures = mutableListOf<String>()
-            for (command in ChainSpec.HARDEN_COMMANDS) {
+            onLog("[*] 属性恢复用 $ksud（内置 ksud，busybox 式调用 ksud resetprop）")
+            for (command in commands) {
                 val result = adb.exec(command)
                 val output = result.output.trim()
                 if (output.isNotEmpty()) {
@@ -870,11 +902,11 @@ class RootChain(
                 onLog("[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0（并重建了属性区）")
             } else {
                 onLog(
-                    "[!] ${failures.size}/${ChainSpec.HARDEN_COMMANDS.size} 条属性恢复命令没有成功：" +
+                    "[!] ${failures.size}/${commands.size} 条属性恢复命令没有成功：" +
                         failures.joinToString() + " —— 不阻断后面的 ksud（它才是持久 root 的来源）",
                 )
             }
-            "resetprop ×${ChainSpec.HARDEN_COMMANDS.size}（${failures.size} 条失败）"
+            "ksud resetprop ×${commands.size}（${failures.size} 条失败）"
         } != null
         if (!ok) return false
 
