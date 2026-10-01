@@ -3,12 +3,24 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The pairing code is entered in a notification (the code only exists while the
+         system's pairing dialog is open, so the user must not have to switch back to
+         the app). API 33+ requires this runtime permission to post it. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="me.weishu.kernelsu.pr" />
         <package android:name="me.weishu.kernelsu" />
         <package android:name="com.resukisu.resukisu" />
         <package android:name="com.kowx712.supermanager" />
+        <!-- Needed so resolveActivity() can validate the wireless-debugging jump
+             targets before we start them (package visibility on API 30+). -->
+        <intent>
+            <action android:name="android.settings.WIRELESS_DEBUGGING_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.APPLICATION_DEVELOPMENT_SETTINGS" />
+        </intent>
     </queries>
     <!-- android:zygotePreloadName is part of the ported Magica chain: AppZygote
          loads libmagica2.so in the APP ZYGOTE, which installs the capset hook of
@@ -54,5 +66,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- The wireless-debugging path: pair (mDNS + the six-digit code), then use the
+             uid-2000 shell it grants instead of Magica / am hang / Shizuku. -->
+        <activity
+            android:name=".ui.wireless.WirelessDebuggingActivity"
+            android:exported="false"
+            android:label="@string/wireless_screen_title"
+            android:windowSoftInputMode="adjustResize" />
+        <!-- Receives the pairing code typed into the notification's reply field.
+             Not exported: the reply is delivered through our own PendingIntent, which
+             carries this app's identity. -->
+        <receiver
+            android:name=".wireless.PairingCodeReceiver"
+            android:exported="false" />
     </application>
 </manifest>

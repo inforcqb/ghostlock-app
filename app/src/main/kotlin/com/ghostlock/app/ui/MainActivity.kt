@@ -22,6 +22,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.ghostlock.app.GhostlockApplication
 import com.ghostlock.app.R
+import com.ghostlock.app.ui.wireless.WirelessDebuggingActivity
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<GhostlockViewModel> {
@@ -125,6 +126,9 @@ class MainActivity : ComponentActivity() {
             GhostlockEffect.OpenShizuku -> packageManager
                 .getLaunchIntentForPackage(SHIZUKU_PACKAGE)
                 ?.let(::startActivity)
+
+            GhostlockEffect.OpenWirelessDebugging ->
+                startActivity(Intent(this, WirelessDebuggingActivity::class.java))
         }
     }
 
@@ -203,6 +207,7 @@ private fun GhostlockRoute(
             override fun onExportProfile() = viewModel.onExportProfile()
             override fun onResetParameters() = viewModel.onResetParameters()
             override fun onOpenAdvanced() = viewModel.onOpenAdvanced()
+            override fun onOpenWirelessDebugging() = viewModel.onOpenWirelessDebugging()
             override fun onCloseAdvanced() = viewModel.onCloseAdvanced()
             override fun onShowAbout() = viewModel.onShowAbout()
             override fun onCloseAbout() = viewModel.onCloseAbout()

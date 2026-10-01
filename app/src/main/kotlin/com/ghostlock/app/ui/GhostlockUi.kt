@@ -194,6 +194,7 @@ interface GhostlockActions {
     fun onExportProfile()
     fun onResetParameters()
     fun onOpenAdvanced()
+    fun onOpenWirelessDebugging()
     fun onCloseAdvanced()
     fun onShowAbout()
     fun onCloseAbout()
@@ -804,6 +805,15 @@ private fun ControlPanel(
                         else -> R.string.shizuku_status_not_running
                     }
                 ),
+            )
+        }
+        /* The new uid-2000 channel: pair over wireless debugging instead of building a
+         * root channel with Magica. Separate screen, so this row is only the entry. */
+        Card(modifier = modifier.padding(top = 12.dp)) {
+            ArrowPreference(
+                title = stringResource(R.string.wireless_entry),
+                summary = stringResource(R.string.wireless_status_unpaired),
+                onClick = actions::onOpenWirelessDebugging,
             )
         }
         Card(modifier = modifier.padding(top = 12.dp)) {

@@ -51,6 +51,9 @@ sealed interface GhostlockEffect {
     data class Clipboard(val text: String) : GhostlockEffect
     data class KeepScreenAwake(val enabled: Boolean) : GhostlockEffect
     data object OpenShizuku : GhostlockEffect
+
+    /** Opens the wireless-debugging screen (the pairing-based uid-2000 channel). */
+    data object OpenWirelessDebugging : GhostlockEffect
 }
 
 private const val AutoSaveDelayMillis = 600L
@@ -541,6 +544,13 @@ class GhostlockViewModel(
 
     /** One-click root: drives the frozen chain, which is already implemented in `chain/`. */
     fun onRunRootChain() = runRootChain()
+
+    /**
+     * The wireless-debugging channel screen: pair once, then use the uid-2000 shell it
+     * grants. Kept out of the chain state machine until the pairing path is proven on
+     * the device -- it has to be verifiable on its own first.
+     */
+    fun onOpenWirelessDebugging() = send(GhostlockEffect.OpenWirelessDebugging)
 
     /** Explains why the run button is greyed out. */
     fun onProfileInvalid() {
