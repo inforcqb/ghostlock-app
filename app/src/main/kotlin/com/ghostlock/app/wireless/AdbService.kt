@@ -123,10 +123,9 @@ object AdbService {
                     if (round < attempts) delay(GAP_MS)
                     continue
                 }
-                val result = cli()?.shell(target, command, timeoutMs)
+                val result = cli()?.shell(target, command, timeoutMs) { line -> onLog(line) }
                     ?: return@withLock Result(ChainSpec.TRANSPORT_FAILURE, "")
                 if (result.exitCode >= 0 && !result.transportFailure) {
-                    logOutput(result.output, onLog)
                     return@withLock Result(result.exitCode, result.output)
                 }
                 last = if (result.transportFailure) {
@@ -134,7 +133,6 @@ object AdbService {
                 } else {
                     "命令没有返回（超时或被中断）"
                 }
-                logOutput(result.output, onLog)
                 /* The transport is suspect: drop it so the next round (or the keep-alive
                  * tick) connects again instead of reusing a dead session. */
                 dropTransport("命令期间传输失败", onLog)
@@ -258,13 +256,6 @@ object AdbService {
         }
     }
 
-    private fun logOutput(output: String, onLog: (String) -> Unit) {
-        val lines = output.lineSequence().filter { it.isNotBlank() }.toList()
-        lines.take(MAX_LOGGED_OUTPUT_LINES).forEach(onLog)
-        if (lines.size > MAX_LOGGED_OUTPUT_LINES) {
-            onLog("[*] 其余 ${lines.size - MAX_LOGGED_OUTPUT_LINES} 行未展开")
-        }
-    }
 
     // ---------------------------------------------------------------- keep-alive
 
@@ -302,5 +293,4 @@ object AdbService {
         if (connectAdvertised(logger)) logger("[*] 保活：通道已恢复")
     }
 
-    private const val MAX_LOGGED_OUTPUT_LINES = 24
 }

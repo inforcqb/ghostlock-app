@@ -52,8 +52,18 @@ class AdbCli(context: Context) {
 
     val available: Boolean get() = binary.isFile
 
-    /** Run the CLI and collect its output; kills it when [timeoutMs] elapses. */
-    fun run(args: List<String>, timeoutMs: Long = DEFAULT_TIMEOUT_MS): Result {
+    /**
+     * Run the CLI and collect its output; kills it when [timeoutMs] elapses.
+     *
+     * [onLine] is called for every line as it arrives, so a long command (W1 runs for
+     * minutes) shows up in the log panel while it is still running instead of only at the
+     * end.
+     */
+    fun run(
+        args: List<String>,
+        timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+        onLine: ((String) -> Unit)? = null,
+    ): Result {
         if (!available) {
             return Result(127, "", "bundled adb is missing at ${binary.absolutePath}")
         }
@@ -73,8 +83,8 @@ class AdbCli(context: Context) {
         val stdout = StringBuilder()
         val stderr = StringBuilder()
         val done = CountDownLatch(2)
-        Thread({ copy(process.inputStream, stdout, done) }, "adb-cli-out").apply { isDaemon = true }.start()
-        Thread({ copy(process.errorStream, stderr, done) }, "adb-cli-err").apply { isDaemon = true }.start()
+        Thread({ copy(process.inputStream, stdout, done, onLine) }, "adb-cli-out").apply { isDaemon = true }.start()
+        Thread({ copy(process.errorStream, stderr, done, onLine) }, "adb-cli-err").apply { isDaemon = true }.start()
         val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
         if (!finished) {
             runCatching { process.destroyForcibly() }
@@ -126,17 +136,23 @@ class AdbCli(context: Context) {
         .toList()
 
     /** Run one command on [serial]; the returned exit code is the command's own. */
-    fun shell(serial: String, command: String, timeoutMs: Long): Result =
-        run(listOf("-s", serial, "shell", command), timeoutMs)
+    fun shell(
+        serial: String,
+        command: String,
+        timeoutMs: Long,
+        onLine: ((String) -> Unit)? = null,
+    ): Result = run(listOf("-s", serial, "shell", command), timeoutMs, onLine)
 
     private fun copy(
         stream: java.io.InputStream,
         sink: StringBuilder,
         done: CountDownLatch,
+        onLine: ((String) -> Unit)?,
     ) {
         try {
             stream.bufferedReader().forEachLine { line ->
                 synchronized(sink) { sink.append(line).append('\n') }
+                onLine?.invoke(line)
             }
         } catch (_: Throwable) {
             // The process was killed or the pipe closed: whatever was read is what we have.
