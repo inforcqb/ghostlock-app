@@ -168,6 +168,10 @@ object AdbService {
         ?.map { it.endpoint }
         ?: emptyList()
 
+    /** The CLI's mDNS listing verbatim -- diagnostics for "it found nothing". */
+    fun rawMdnsServices(): String =
+        cli()?.run(listOf("mdns", "services"), 20_000)?.output?.trim().orEmpty()
+
     /** Pair with the code from the system dialog. Returns the CLI's message. */
     fun pair(endpoint: String, code: String): String {
         val result = cli()?.pair(endpoint, code)

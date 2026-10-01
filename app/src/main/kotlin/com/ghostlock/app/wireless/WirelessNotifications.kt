@@ -86,6 +86,24 @@ object WirelessNotifications {
         notify(context, ID_CODE_INPUT, notification)
     }
 
+    /**
+     * Progress while the pairing endpoint is still being looked for.
+     *
+     * Uses the same slot as the code input, so the prompt replaces it in place instead of
+     * leaving two notifications behind.
+     */
+    fun showSearching(context: Context, text: String) {
+        ensureChannel(context)
+        val notification = Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_monochrome)
+            .setContentTitle(context.getString(R.string.wireless_screen_title))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setOngoing(true)
+            .build()
+        notify(context, ID_CODE_INPUT, notification)
+    }
+
     /** Plain progress/result notification; tapping it opens the wireless screen. */
     fun showStatus(context: Context, title: String, text: String) {
         ensureChannel(context)

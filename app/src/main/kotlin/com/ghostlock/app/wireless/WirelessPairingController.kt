@@ -63,6 +63,7 @@ object WirelessPairingController {
     /** How long to keep looking for the pairing service while the dialog is open. */
     private const val PAIRING_WATCH_MS = 300_000L
     private const val PAIRING_POLL_MS = 1_500L
+    private const val NSD_FIND_TIMEOUT_MS = 8_000L
 
     private var pairingWatch: Job? = null
 
@@ -130,10 +131,27 @@ object WirelessPairingController {
         }
         if (pairingWatch?.isActive == true) return true
         mutate { it.copy(status = app.getString(R.string.wireless_waiting_service)) }
+        /* A notification while we look: the user has just opened the pairing dialog and
+         * otherwise sees nothing at all until the code prompt appears. */
+        WirelessNotifications.showSearching(app, app.getString(R.string.wireless_searching_service))
         pairingWatch = scope.launch {
             val deadline = System.currentTimeMillis() + PAIRING_WATCH_MS
+            var round = 0
+            var nsdTried = false
             while (isActive && System.currentTimeMillis() < deadline) {
-                val endpoints = AdbService.pairingEndpoints().distinct()
+                round++
+                var endpoints = AdbService.pairingEndpoints().distinct()
+                if (endpoints.isEmpty() && round == 1) {
+                    log("adb mdns 没有列出配对服务，原始输出：")
+                    AdbService.rawMdnsServices().ifBlank { "（空）" }.lines().forEach(::log)
+                }
+                /* Fallback: the CLI's mDNS cache fills asynchronously, the platform resolver
+                 * does not. If the CLI still has nothing after ~6s, ask NsdManager. */
+                if (endpoints.isEmpty() && !nsdTried && round >= 4) {
+                    nsdTried = true
+                    log("改用系统 mDNS 查找配对端口 ...")
+                    NsdPairingFinder.find(app, NSD_FIND_TIMEOUT_MS)?.let { endpoints = listOf(it) }
+                }
                 if (endpoints.isNotEmpty()) {
                     pairingEndpoint = endpoints.first()
                     log("发现配对服务：$pairingEndpoint")
