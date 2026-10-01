@@ -34,9 +34,9 @@ import kotlinx.coroutines.withTimeout
 object ChainSpec {
     const val DEVICE_DIR = "/data/local/tmp/gl-w1"
 
-    /** The uid-0 shell channel Magica leaves behind (`sh <DEVICE_DIR>/rshell` uses these). */
-    const val CHANNEL_SOCK = "$DEVICE_DIR/rshell.sock"
-    const val CHANNEL_TOKEN = "$DEVICE_DIR/rshell.token"
+    /* The uid-0 shell channel is NOT here any more: it lives in the app's own data directory
+     * (see `com.ghostlock.app.root.ChannelPaths`), because `/data/local/tmp/gl-w1` had to be
+     * created by hand and a missing parent directory made the server's `bind/listen` fail. */
 
     /** step 2: make system_server hang, so Magica's zygote can come up */
     const val AM_HANG = "am hang --allow-restart"
@@ -328,18 +328,18 @@ object ChainSpec {
 /**
  * One step of the chain. [phase] is null for the step that is not part of the split
  * ([PREFLIGHT]): it runs in both halves and is always shown.
+ *
+ * Everything between the uid-0 channel and `ksud late-load` is a single step, [PRIV_ENV]
+ * 「提权环境恢复」: opening the adb gate, connecting to the root adbd, removing the security
+ * module, installing the manager, repairing `selinux_state` and putting the debug properties
+ * back are one phase, and six rows of the same phase told the user nothing extra.
  */
 enum class ChainStep(val label: String, val phase: ChainPhase?) {
     PREFLIGHT("预检：通道与文件", null),
     W1("W1：SELinux 转宽容", ChainPhase.PART1),
     AM_HANG("重启 framework（am hang）", ChainPhase.PART1),
     MAGICA_ROOT("Magica：uid-0 通道", ChainPhase.PART2),
-    OPEN_ADB_GATE("打开 adbd 门", ChainPhase.PART2),
-    ADB_CONNECT("adb 客户端连 127.0.0.1:5555", ChainPhase.PART2),
-    INSTALL_MANAGER("安装管理端：SukiSU-Ultra", ChainPhase.PART2),
-    REMOVE_GUARD("rmmod oplus_security_guard", ChainPhase.PART2),
-    SELINUX_REPAIR("修复 selinux_state（kread_min + fix-selinux.sh）", ChainPhase.PART2),
-    HARDEN_PROPS("恢复属性：ro.secure / ro.debuggable / suid_dumpable", ChainPhase.PART2),
+    PRIV_ENV("提权环境恢复", ChainPhase.PART2),
     KSU_LATE_LOAD("ksud late-load", ChainPhase.PART2),
 }
 
@@ -699,12 +699,10 @@ class RootChain(
          * system_server and reboots adbd -- all of it pointless, and not harmless, when the
          * goal (root) is already there. */
         var alreadyRooted = false
-        var ok = step(ChainStep.PREFLIGHT, "channel socket + su") {
-            val listing = sh("ls -l ${ChainSpec.CHANNEL_SOCK} ${ChainSpec.CHANNEL_TOKEN}").output
-            onLog("[*] $listing")
-            if (!listing.contains("rshell.sock")) {
-                onLog("[*] channel not up yet -- Magica has to run once (step 3)")
-            }
+        var ok = step(ChainStep.PREFLIGHT, "channel + su") {
+            /* The channel lives in the app's own data directory now, so there is nothing to list
+             * from the shell side -- the client object answers for itself. */
+            onLog("[*] 通道 ${channel.socketPath}（当前可用=${channel.available()}）")
             alreadyRooted = suGrantsRoot()
             if (alreadyRooted) {
                 onLog("[+] 预检：`${ChainSpec.SU_PROBE}` 拿到了 uid=0 ⇒ 本机已有 root，不必执行利用链")
@@ -904,8 +902,23 @@ class RootChain(
         } != null
         if (!ok) return false
 
-        // step 5 + 6: open the adb gate (domain borrows, permissive only) --------
-        ok = step(ChainStep.OPEN_ADB_GATE, "runcon adbd + usbd") {
+        // step 4 +: turn the device into a usable root environment -------------------
+        /* ONE step on purpose (the user's call, 2026-10-01): opening the adb gate, becoming an
+         * adb client, removing the security module, installing the manager, repairing
+         * selinux_state and putting the debug properties back are one *phase* --
+         * 「提权环境恢复」. The order inside it is the verified one, with two changes:
+         *
+         *  * the manager install moved **after** `rmmod oplus_security_guard`: the guard fights
+         *    both module loading and property writes, so everything privileged happens after it
+         *    is gone;
+         *  * the manager install no longer precedes the guard (it used to sit right after the
+         *    adb connect).
+         *
+         * A throw inside aborts the whole step (and with it the chain) -- the sub-phases that may
+         * legitimately fail (manager install, selinux repair, property restore) only log loudly.
+         */
+        ok = step(ChainStep.PRIV_ENV, "adb 门 → 5555 → rmmod → 管理端 → selinux 修复 → 属性恢复") {
+            // (1) open the adb gate (domain borrows; permissive only) -------------
             chan(ChainSpec.ADBD_SET_TCP_PORT).let {
                 onLog("[*] adbd domain: ${ChainSpec.ADBD_SET_TCP_PORT}")
                 if (it.contains("Failed to set property")) {
@@ -915,21 +928,17 @@ class RootChain(
             chan(ChainSpec.USBD_RESTART_ADBD).let {
                 onLog("[*] usbd domain: ${ChainSpec.USBD_RESTART_ADBD}")
             }
-            val listen = await(
+            await(
                 "adbd listening on ${ChainSpec.ADB_PORT}",
                 timeoutMs = 60_000L,
-                /* Through the channel, not Shizuku: the setprop above just restarted adbd,
-                 * which takes the whole shell uid (and therefore Shizuku) with it. The
-                 * uid-0 channel is unaffected. */
+                /* Through the channel, not the shell uid: the setprop above just restarted adbd,
+                 * which takes the whole shell uid with it. The uid-0 channel is unaffected. */
                 read = { chan(ChainSpec.READ_LISTEN) },
                 check = { it.contains(":${ChainSpec.ADB_PORT}") },
             )
-            "listening"
-        } != null
-        if (!ok) return false
+            onLog("[+] adbd 已在 ${ChainSpec.ADB_PORT} 上监听")
 
-        // step 7: the app becomes an adb client ----------------------------------
-        ok = step(ChainStep.ADB_CONNECT, "127.0.0.1:${ChainSpec.ADB_PORT}") {
+            // (2) the app becomes an adb client ----------------------------------
             adb.connect()
             val identity = adb.exec(ChainSpec.READ_IDENTITY).output
             val caps = adb.exec(ChainSpec.READ_CAPS).output
@@ -940,106 +949,98 @@ class RootChain(
             if (!capLine.contains("000001ffffffffff")) {
                 throw IllegalStateException("adb shell has no full capabilities: $capLine")
             }
-            "$identity / $capLine"
-        } != null
-        if (!ok) return false
 
-        // step 7b: the manager app, so the device never has to reach GitHub -------
-        /* The APK is the app's own copy of the latest SukiSU-Ultra release (pushed next to the
-         * engine by DeviceSync). Installing it here means a device that never saw GitHub still
-         * ends up with a manager for `su` prompts and modules. Non-fatal: an already-installed
-         * manager makes `pm install -r` a no-op, and nothing later in the chain depends on it. */
-        ok = step(ChainStep.INSTALL_MANAGER, ChainSpec.KSU_MANAGER_APK) {
-            val result = adb.exec("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
-            val output = result.output.trim()
-            if (output.isNotEmpty()) {
-                output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
-            }
-            if (result.exitCode == 0) {
-                onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
-            } else {
-                onLog(
-                    "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
-                        "不阻断后面的步骤",
-                )
-            }
-            "manager install exit=${result.exitCode}"
-        } != null
-        if (!ok) return false
-
-        // step 8: the goal, part one ---------------------------------------------
-        ok = step(ChainStep.REMOVE_GUARD, ChainSpec.RMMOD_GUARD) {
-            val out = adb.exec(ChainSpec.RMMOD_GUARD).output
-            if (out.isNotBlank()) onLog("[*] rmmod: ${out.trim()}")
+            // (3) the goal, part one: drop the security module -------------------
+            val rmmod = adb.exec(ChainSpec.RMMOD_GUARD).output
+            if (rmmod.isNotBlank()) onLog("[*] rmmod: ${rmmod.trim()}")
             val modules = adb.exec(ChainSpec.READ_MODULES).output
             if (modules.contains("oplus_security_guard")) {
                 throw IllegalStateException("oplus_security_guard is still loaded")
             }
-            "guard unloaded"
+            onLog("[+] oplus_security_guard 已卸载")
+
+            // (4) the manager, now that the guard is gone ------------------------
+            /* The APK is the app's own copy of the latest SukiSU-Ultra release (pushed next to
+             * the engine by DeviceSync), so a device that never saw GitHub still ends up with a
+             * manager for `su` prompts and modules. Non-fatal: `pm install -r` on an installed
+             * manager is a no-op and nothing later depends on it. */
+            run {
+                val result = adb.exec("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
+                val output = result.output.trim()
+                if (output.isNotEmpty()) {
+                    output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
+                }
+                if (result.exitCode == 0) {
+                    onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
+                } else {
+                    onLog(
+                        "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
+                            "不阻断后面的步骤",
+                    )
+                }
+            }
+
+            // (5) repair selinux_state (kread_min + fix-selinux.sh + rmmod) ------
+            /* Order inside is the script's: load the module that provides /proc/kwrite, run the
+             * repair (it only writes bytes +1..+10, enforcing is untouched), then unload the
+             * module again -- nothing stays behind. */
+            run {
+                val commands = ChainSpec.selinuxRepairCommands()
+                val failures = mutableListOf<String>()
+                for (command in commands) {
+                    val result = adb.exec(command)
+                    val output = result.output.trim()
+                    onLog("[*] $command -> exit=${result.exitCode}")
+                    if (output.isNotEmpty()) {
+                        output.lineSequence().filter { it.isNotBlank() }.take(12)
+                            .forEach { onLog("    $it") }
+                    }
+                    if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
+                }
+                if (failures.isEmpty()) {
+                    onLog("[+] selinux_state 已修复（+1..+10 回填，enforcing 未动），kread_min 已卸载")
+                } else {
+                    onLog(
+                        "[!] ${failures.size}/${ChainSpec.KREAD_STEPS} 条 selinux 修复命令没有成功：" +
+                            failures.joinToString(),
+                    )
+                }
+            }
+
+            // (6) restore the debug properties -----------------------------------
+            /* `resetprop` is usable here and not before: the guard is gone and `ksud late-load`
+             * has not reloaded the policy yet. See [ChainSpec.hardenCommands] for the order. */
+            run {
+                val commands = ChainSpec.hardenCommands(ksud)
+                val failures = mutableListOf<String>()
+                onLog("[*] 属性恢复用 $ksud（内置 ksud，busybox 式调用 ksud resetprop）")
+                for (command in commands) {
+                    val result = adb.exec(command)
+                    val output = result.output.trim()
+                    if (output.isNotEmpty()) {
+                        output.lineSequence().filter { it.isNotBlank() }.take(4)
+                            .forEach { onLog("    $it") }
+                    }
+                    onLog("[*] $command -> exit=${result.exitCode}")
+                    if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
+                }
+                if (failures.isEmpty()) {
+                    onLog(
+                        "[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0，" +
+                            "并清掉 ${ChainSpec.ADB_TCP_PORT_PROP}（重建属性区后执行）",
+                    )
+                } else {
+                    onLog(
+                        "[!] ${failures.size}/${commands.size} 条属性恢复命令没有成功：" +
+                            failures.joinToString() + " —— 不阻断后面的 ksud（它才是持久 root 的来源）",
+                    )
+                }
+            }
+
+            "提权环境就绪（adbd 开门 / uid=0 满 cap / guard 已卸 / 管理端已装 / selinux 已修 / 属性已恢复）"
         } != null
         if (!ok) return false
 
-        // step 8a: repair selinux_state (kread_min + fix-selinux.sh + rmmod) ---------
-        /* Order inside the step is the script's: load the module that provides /proc/kwrite,
-         * run the repair (it only writes bytes +1..+10, enforcing is untouched), then unload
-         * the module again -- nothing stays behind. The guard is already gone at this point,
-         * which is what lets a module be loaded at all. */
-        ok = step(ChainStep.SELINUX_REPAIR, "${ChainSpec.KREAD_KO} → ${ChainSpec.FIX_SELINUX} → rmmod") {
-            val failures = mutableListOf<String>()
-            for (command in ChainSpec.selinuxRepairCommands()) {
-                val result = adb.exec(command)
-                val output = result.output.trim()
-                onLog("[*] $command -> exit=${result.exitCode}")
-                if (output.isNotEmpty()) {
-                    output.lineSequence().filter { it.isNotBlank() }.take(12)
-                        .forEach { onLog("    $it") }
-                }
-                if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
-            }
-            if (failures.isEmpty()) {
-                onLog("[+] selinux_state 已修复（+1..+10 回填，enforcing 未动），kread_min 已卸载")
-            } else {
-                onLog(
-                    "[!] ${failures.size}/${ChainSpec.KREAD_STEPS} 条 selinux 修复命令没有成功：" +
-                        failures.joinToString(),
-                )
-            }
-            "selinux repair（${failures.size} 条失败）"
-        } != null
-        if (!ok) return false
-
-        // step 8b: restore the debug properties, in the rmmod -> ksud window ---------
-        /* `resetprop` is usable here and not before: the guard module that would fight the
-         * writes is already unloaded, and `ksud late-load` has not reloaded the policy yet.
-         * See [ChainSpec.HARDEN_COMMANDS] for why the order is what it is. */
-        ok = step(ChainStep.HARDEN_PROPS, ChainSpec.HARDEN_CONTEXT) {
-            val commands = ChainSpec.hardenCommands(ksud)
-            val failures = mutableListOf<String>()
-            onLog("[*] 属性恢复用 $ksud（内置 ksud，busybox 式调用 ksud resetprop）")
-            for (command in commands) {
-                val result = adb.exec(command)
-                val output = result.output.trim()
-                if (output.isNotEmpty()) {
-                    output.lineSequence().filter { it.isNotBlank() }.take(4)
-                        .forEach { onLog("    $it") }
-                }
-                onLog("[*] $command -> exit=${result.exitCode}")
-                if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
-            }
-            if (failures.isEmpty()) {
-                onLog(
-                    "[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0，" +
-                        "并清掉 ${ChainSpec.ADB_TCP_PORT_PROP}（重建属性区后执行）",
-                )
-            } else {
-                onLog(
-                    "[!] ${failures.size}/${commands.size} 条属性恢复命令没有成功：" +
-                        failures.joinToString() + " —— 不阻断后面的 ksud（它才是持久 root 的来源）",
-                )
-            }
-            "ksud resetprop ×${commands.size}（${failures.size} 条失败）"
-        } != null
-        if (!ok) return false
 
         // step 9: the goal, part two ---------------------------------------------
         /* load ok == exit 0 is the whole verdict. `ksud late-load` reloads the SELinux policy

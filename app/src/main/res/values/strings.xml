@@ -258,4 +258,5 @@
     <string name="root_chain_step_harden_props">Restore properties: ro.secure / ro.debuggable / suid_dumpable</string>
     <string name="root_chain_step_selinux_repair">Repair selinux_state (kread_min + fix-selinux.sh)</string>
     <string name="root_chain_step_install_manager">Install the manager: SukiSU-Ultra</string>
+    <string name="root_chain_step_priv_env">Restore the root environment</string>
 </resources>

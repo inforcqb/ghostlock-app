@@ -50,9 +50,9 @@ internal const val ROOT_LOG_TAG = "GhostlockRoot"
  *   upstream's, and it is required: the server refuses to start unless it is
  *   already uid 0).
  * * The server it starts is an AF_UNIX socket + token under
- *   [CHANNEL_DIR]; the app talks to it through [RootChannel], and `adb shell`
- *   (uid 2000) through the device-side `rshell` wrapper.  Not a single IP socket
- *   is opened here -- an isolated process has no AF_INET.
+ *   [ChannelPaths] (inside the app's own data directory); the app talks to it through
+ *   [RootChannel].  Not a single IP socket is opened here -- an isolated process
+ *   has no AF_INET.
  * * `adb_root()` (the adbd patch) is **not** called on bind: it blocks up to 15 s
  *   and it restarts adbd, so it is only reachable through the AIDL method below.
  * * The libsu-based `RemoteProcess*` plumbing of upstream is deliberately NOT
@@ -83,7 +83,19 @@ class RootShellService : Service() {
     private val binder: IRootShellService.Stub = object : IRootShellService.Stub() {
         override fun ensureRoot(): Boolean = root()
 
-        override fun startChannel(): Boolean = start_shell_server()
+        /**
+         * Tell the native server where to listen, then start it.
+         *
+         * The directory is prepared by the app process (see [ChannelPaths.prepare]): this
+         * process is uid 0 **without capabilities**, so it cannot create or chmod a directory
+         * itself -- and the old shared path `/data/local/tmp/gl-w1` had to be created by hand,
+         * which is exactly how `bind/listen failed` happened.
+         */
+        override fun startChannel(): Boolean {
+            val dir = ChannelPaths.dir(this@RootShellService).absolutePath
+            Log.i(TAG, "startChannel: channel dir $dir (set_channel_dir -> ${set_channel_dir(dir)})")
+            return start_shell_server()
+        }
 
         override fun adbRoot(): Boolean = root() && adb_root()
 
@@ -109,8 +121,10 @@ class RootShellService : Service() {
     override fun onBind(intent: Intent?): IBinder {
         val rooted = root()
         Log.i(TAG, "root() -> $rooted (uid=${Process.myUid()} pid=${Process.myPid()})")
+        val dir = ChannelPaths.dir(this).absolutePath
+        set_channel_dir(dir)
         if (start_shell_server()) {
-            Log.i(TAG, "root shell server: $CHANNEL_SOCK (token $CHANNEL_TOKEN)")
+            Log.i(TAG, "root shell server: ${ChannelPaths.socket(dir)} (token ${ChannelPaths.token(dir)})")
         } else {
             Log.w(TAG, "root shell server: not started")
         }
@@ -127,10 +141,10 @@ class RootShellService : Service() {
      * signature: JNI_OnLoad in app/src/main/jni/magica.cpp does
      *
      *     FindClass("com/ghostlock/app/root/RootShellService")
-     *     RegisterNatives({ "root", "adb_root", "start_shell_server" } ...)
+     *     RegisterNatives({ "root", "adb_root", "start_shell_server", "set_channel_dir" } ...)
      *
      * so this class must not be renamed or obfuscated (see app/proguard-rules.pro)
-     * and these three names must not change.  They are *instance* methods here (not
+     * and these names must not change.  They are *instance* methods here (not
      * `@JvmStatic` members of a companion object) on purpose: the JNI lookup key is
      * the plain JVM method name, and an instance method cannot be confused with the
      * companion's static bridge.
@@ -141,14 +155,12 @@ class RootShellService : Service() {
 
     private external fun start_shell_server(): Boolean
 
+    /** Where the native server listens; see [ChannelPaths] for why it is not /data/local/tmp. */
+    private external fun set_channel_dir(dir: String): Boolean
+
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */
         const val TAG = ROOT_LOG_TAG
-
-        /** The device directory shared with adb shell (uid 2000) and the host tooling. */
-        const val CHANNEL_DIR = "/data/local/tmp/gl-w1"
-        const val CHANNEL_SOCK = "$CHANNEL_DIR/rshell.sock"
-        const val CHANNEL_TOKEN = "$CHANNEL_DIR/rshell.token"
 
         init {
             /*

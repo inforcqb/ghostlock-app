@@ -1,4 +1,4 @@
-﻿package com.ghostlock.app.root
+package com.ghostlock.app.root
 
 import android.content.ComponentName
 import android.content.Context
@@ -62,6 +62,11 @@ class IsolatedRootShell(private val context: Context) {
      */
     suspend fun launch(onLog: (String) -> Unit = {}): String {
         logServiceFacts(onLog)
+        /* The channel lives in the app's own data directory and this process is the one that can
+         * create + chmod it (the isolated uid 0 cannot); see [ChannelPaths]. Done before the bind
+         * so the server finds a writable parent directory instead of failing on bind/listen. */
+        val channelDir = ChannelPaths.prepare(context, onLog)
+        onLog("[*] 通道目录：$channelDir")
         val service = try {
             withTimeout(BIND_TIMEOUT_MS) { bindOrNull(onLog) }
         } catch (timeout: TimeoutCancellationException) {
@@ -85,7 +90,7 @@ class IsolatedRootShell(private val context: Context) {
         if (!service.startChannel()) {
             throw IllegalStateException(
                 "startChannel() == false: the uid-0 shell server is not listening on " +
-                    RootShellService.CHANNEL_SOCK,
+                    ChannelPaths.socket(channelDir),
             )
         }
         /* Ported Magica's own "enable root shell" step, run automatically (the upstream
@@ -100,7 +105,7 @@ class IsolatedRootShell(private val context: Context) {
         onLog("[*] Magica adbRoot()（内置 resetprop/adbd 重启逻辑）-> $adbRoot")
         onLog("[*] adb 公钥相关逻辑已移除：配对时 adbd 已登记本机密钥，无需再写 adb_keys")
         return "uid-0 root service ready: bound, ensureRoot=ok, startChannel=ok, adbRoot=$adbRoot " +
-            "(channel ${RootShellService.CHANNEL_SOCK})"
+            "(channel ${ChannelPaths.socket(channelDir)})"
     }
 
     /**

@@ -10,8 +10,8 @@ import java.net.SocketTimeoutException
  *
  * ## Wire protocol (from the ported `magica.cpp` `rsh_*` / `start_shell_server()`)
  *
- * * socket `$deviceDir/rshell.sock`, `AF_UNIX`/`SOCK_STREAM`, mode 0666
- * * token `$deviceDir/rshell.token`, 32 hex chars + `\n`, mode 0644
+ * * socket `<channelDir>/rshell.sock`, `AF_UNIX`/`SOCK_STREAM`, mode 0666
+ * * token `<channelDir>/rshell.token`, 32 hex chars + `\n`, mode 0644
  * * handshake: the client writes the token followed by `\n`; a mismatch answers `bad token\n`
  * * after a successful handshake the server forks a **pty-backed `sh -i`** and pumps raw bytes
  *   between the socket and the pty master, so the session is an interactive shell, not a
@@ -25,11 +25,13 @@ import java.net.SocketTimeoutException
  * only be used for short commands (all channel steps of the root chain are `setprop`/`runcon`
  * calls); a long-running command would be cut off when the pty gets EOF.
  *
- * The directory is shared on purpose: the server runs in an isolated process (a different uid
- * with no access to the app's private data dir) while the adb shell (uid 2000) must be able to
- * read the token -- `/data/local/tmp` plus 0644/0666 is what makes the design work.
+ * ## Where the directory is
+ *
+ * Inside the app's own data directory ([ChannelPaths]) -- NOT `/data/local/tmp`, where a missing
+ * parent directory made `bind/listen` fail. The only client is this class, which runs in the app
+ * process, so the directory does not have to be reachable by the shell uid.
  */
-class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
+class RootChannel(private val deviceDir: String) {
 
     val socketPath: String get() = File(deviceDir, "rshell.sock").absolutePath
     val tokenPath: String get() = File(deviceDir, "rshell.token").absolutePath
@@ -115,9 +117,6 @@ class RootChannel(private val deviceDir: String = DEFAULT_DEVICE_DIR) {
     }
 
     companion object {
-        /** The shared directory used by the device-side tooling (`w1.sh`, `rshell`, cleaners). */
-        const val DEFAULT_DEVICE_DIR = "/data/local/tmp/gl-w1"
-
         /** Pause after the token line, before the command (the wrapper sleeps 1s too). */
         const val TOKEN_SETTLE_MS = 1_000L
 

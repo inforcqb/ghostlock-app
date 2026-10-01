@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ============================================================================
  * magica.cpp -- the "Magica" root service, ported into GhostLock.
  * ============================================================================
@@ -110,12 +110,26 @@
 
 #define arraysize(array) (sizeof(array)/sizeof(array[0]))
 
-/* The one and only definition of the shared channel directory (see the header
- * comment: the host's device tooling and uid 2000 both depend on this path). */
-#define RSH_DIR "/data/local/tmp/gl-w1"
-#define RSH_SOCK_PATH RSH_DIR "/rshell.sock"
-#define RSH_TOKEN_PATH RSH_DIR "/rshell.token"
-#define RSH_LOG_PATH RSH_DIR "/rshell.log"
+/* The channel directory is set from Kotlin before the server starts (`set_channel_dir`), because
+ * the parent directory has to exist and be writable by this capless uid 0 -- and the app's own
+ * data directory is the one place that is guaranteed to exist (`/data/local/tmp/gl-w1` only does
+ * after someone created it, which is exactly how "bind/listen failed" happened). The default
+ * below keeps the old path for a server started without the setter. */
+static char g_rsh_dir[288] = "/data/local/tmp/gl-w1";
+static char g_rsh_sock_path[320];
+static char g_rsh_token_path[320];
+static char g_rsh_log_path[320];
+
+static void rsh_apply_dir(void) {
+    snprintf(g_rsh_sock_path, sizeof g_rsh_sock_path, "%s/rshell.sock", g_rsh_dir);
+    snprintf(g_rsh_token_path, sizeof g_rsh_token_path, "%s/rshell.token", g_rsh_dir);
+    snprintf(g_rsh_log_path, sizeof g_rsh_log_path, "%s/rshell.log", g_rsh_dir);
+}
+
+#define RSH_DIR g_rsh_dir
+#define RSH_SOCK_PATH g_rsh_sock_path
+#define RSH_TOKEN_PATH g_rsh_token_path
+#define RSH_LOG_PATH g_rsh_log_path
 
 static int skip_capset(cap_user_header_t header __unused, cap_user_data_t data __unused) {
     LOGD("Skip capset");
@@ -470,6 +484,26 @@ static void rsh_loop(int listen_fd, const char *expected) {
     }
 }
 
+/* Let the caller choose the channel directory. Called from RootShellService.startChannel() with a
+ * directory the app process created and chmodded to 0777 inside its own data dir: the app owns
+ * that directory and can make it reachable by this capless uid 0, which is the whole point -- a
+ * missing/unwritable parent directory is exactly how "bind/listen failed" used to happen. */
+static jboolean set_channel_dir(JNIEnv *env, jobject thiz __unused, jstring dir) {
+    const char *value = env->GetStringUTFChars(dir, nullptr);
+    if (value == nullptr) return JNI_FALSE;
+    const size_t len = strlen(value);
+    if (len == 0 || len >= sizeof g_rsh_dir) {
+        LOGE("channel: refusing directory '%s' (len=%zu)", value, len);
+        env->ReleaseStringUTFChars(dir, value);
+        return JNI_FALSE;
+    }
+    snprintf(g_rsh_dir, sizeof g_rsh_dir, "%s", value);
+    rsh_apply_dir();
+    LOGI("channel: directory set to %s", g_rsh_dir);
+    env->ReleaseStringUTFChars(dir, value);
+    return JNI_TRUE;
+}
+
 static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused) {
     if (geteuid() != AID_ROOT) {
         LOGW("shell server: not root yet");
@@ -589,10 +623,15 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
         return JNI_ERR;
     }
 
+    /* Fill the derived path strings for the default directory; the caller may replace it with
+     * `set_channel_dir` before the server starts. */
+    rsh_apply_dir();
+
     JNINativeMethod methods[] = {
             {"root",              "()Z", (void *) root},
             {"adb_root",          "()Z", (void *) adb_root},
             {"start_shell_server", "()Z", (void *) start_shell_server},
+            {"set_channel_dir",   "(Ljava/lang/String;)Z", (void *) set_channel_dir},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");
