@@ -55,9 +55,6 @@ object WirelessPairingController {
     private const val KEY_PAIRED_AT = "paired_at"
     private const val KEY_ENDPOINT = "endpoint"
 
-    private const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
-    private const val PAIRING_TIMEOUT_MS = 60_000L
-
     private const val MAX_LOG_LINES = 200
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -268,23 +265,38 @@ object WirelessPairingController {
 
     // ---------------------------------------------------------------- internals
 
+    /**
+     * Pair through the bundled `adb`, which is also what records the device's certificate for
+     * later connects (`$HOME/.android/adb_known_hosts`). Without that record the TLS connect
+     * port refuses us, so pairing and connecting must use the same CLI home -- which is what
+     * [AdbService] owns.
+     */
     private suspend fun pairFlow(context: Context, code: String) {
         mutate { it.copy(busy = true, status = context.getString(R.string.wireless_pairing_busy)) }
         try {
-            log("查找 ${WirelessAdb.SERVICE_PAIRING} ...")
-            val endpoint = WirelessAdb.discover(
-                context,
-                WirelessAdb.SERVICE_PAIRING,
-                PAIRING_DISCOVERY_TIMEOUT_MS,
-            )
-            if (endpoint == null) {
+            log("查找配对服务 ...")
+            val endpoints = AdbService.pairingEndpoints().distinct()
+            if (endpoints.isEmpty()) {
                 markFailed(context, context.getString(R.string.wireless_pair_no_service))
                 return
             }
-            log("配对端点 $endpoint")
-            WirelessAdb.pair(context, endpoint, code, PAIRING_TIMEOUT_MS)
-            savePaired(context, endpoint)
-            mutate { it.copy(paired = true, endpoint = endpoint.toString()) }
+            var message = ""
+            var paired = false
+            for (endpoint in endpoints) {
+                log("配对端点 $endpoint")
+                message = AdbService.pair(endpoint, code)
+                log(message)
+                if (message.contains("Successfully paired", ignoreCase = true)) {
+                    paired = true
+                    savePaired(context, endpoint)
+                    mutate { it.copy(paired = true, endpoint = endpoint) }
+                    break
+                }
+            }
+            if (!paired) {
+                markFailed(context, "配对失败：${message.take(200)}")
+                return
+            }
             log("配对成功")
             /* Release the code-input notification the moment the pairing is done: it is
              * the prompt for a code that no longer matters, and leaving it in the shade
@@ -380,11 +392,11 @@ object WirelessPairingController {
         }
     }
 
-    private fun savePaired(context: Context, endpoint: AdbEndpoint) {
+    private fun savePaired(context: Context, endpoint: String) {
         prefs(context).edit()
             .putBoolean(KEY_PAIRED, true)
             .putLong(KEY_PAIRED_AT, System.currentTimeMillis())
-            .putString(KEY_ENDPOINT, endpoint.toString())
+            .putString(KEY_ENDPOINT, endpoint)
             .apply()
     }
 

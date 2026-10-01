@@ -145,6 +145,9 @@ android {
         jniLibs {
             useLegacyPackaging = true
             excludes += "lib/*/libandroidx.graphics.path.so"
+            /* libadbcli.so is the bundled platform-tools `adb` executable, not a shared
+             * library: keep the NDK's llvm-strip away from it. */
+            keepDebugSymbols += "**/libadbcli.so"
         }
         dex {
             useLegacyPackaging = true
