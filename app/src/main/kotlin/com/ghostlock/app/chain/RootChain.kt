@@ -127,6 +127,32 @@ object ChainSpec {
     const val KREAD_KO = "$DEVICE_DIR/kread_min.ko"
     const val FIX_SELINUX = "$DEVICE_DIR/fix-selinux.sh"
 
+    /** Module name the kernel knows `kread_min.ko` by (`insmod` / `rmmod`). */
+    const val KREAD_MODULE = "kread_min"
+
+    /**
+     * step 8a: repair `selinux_state`, which W1's collateral store clobbers.
+     *
+     * The script's own header states the contract: it repairs bytes `+1..+10` (checkreqprot,
+     * initialized, `policycap[]`) and **never** touches `+0` (enforcing) -- the chain needs
+     * permissive, and turning enforcing back on while the other bytes are still garbage drops
+     * the session instantly. `/proc/kwrite` comes from `kread_min.ko`, so the module has to be
+     * loaded first and unloaded right after (also the user's requirement: 脚本文后要
+     * `rmmod kread_min`).
+     *
+     * It sits **after** `rmmod oplus_security_guard` on purpose: the OPPO guard fights module
+     * loading, and the device-side cleanup tooling loads `kread_min` in exactly that order
+     * (unload the OPPO modules first, then insmod).
+     */
+    fun selinuxRepairCommands(): List<String> = listOf(
+        "insmod $KREAD_KO",
+        "sh $FIX_SELINUX",
+        "rmmod $KREAD_MODULE",
+    )
+
+    /** How many commands [selinuxRepairCommands] holds (for the failure summary). */
+    const val KREAD_STEPS = 3
+
     /** The line the engine prints when the forged PI state is in place. */
     const val W1_LANDED_MARKER = "Write 1 complete"
 
@@ -278,6 +304,7 @@ enum class ChainStep(val label: String, val phase: ChainPhase?) {
     OPEN_ADB_GATE("打开 adbd 门", ChainPhase.PART2),
     ADB_CONNECT("adb 客户端连 127.0.0.1:5555", ChainPhase.PART2),
     REMOVE_GUARD("rmmod oplus_security_guard", ChainPhase.PART2),
+    SELINUX_REPAIR("修复 selinux_state（kread_min + fix-selinux.sh）", ChainPhase.PART2),
     HARDEN_PROPS("恢复属性：ro.secure / ro.debuggable / suid_dumpable", ChainPhase.PART2),
     KSU_LATE_LOAD("ksud late-load", ChainPhase.PART2),
 }
@@ -885,6 +912,35 @@ class RootChain(
                 throw IllegalStateException("oplus_security_guard is still loaded")
             }
             "guard unloaded"
+        } != null
+        if (!ok) return false
+
+        // step 8a: repair selinux_state (kread_min + fix-selinux.sh + rmmod) ---------
+        /* Order inside the step is the script's: load the module that provides /proc/kwrite,
+         * run the repair (it only writes bytes +1..+10, enforcing is untouched), then unload
+         * the module again -- nothing stays behind. The guard is already gone at this point,
+         * which is what lets a module be loaded at all. */
+        ok = step(ChainStep.SELINUX_REPAIR, "$KREAD_KO → $FIX_SELINUX → rmmod") {
+            val failures = mutableListOf<String>()
+            for (command in ChainSpec.selinuxRepairCommands()) {
+                val result = adb.exec(command)
+                val output = result.output.trim()
+                onLog("[*] $command -> exit=${result.exitCode}")
+                if (output.isNotEmpty()) {
+                    output.lineSequence().filter { it.isNotBlank() }.take(12)
+                        .forEach { onLog("    $it") }
+                }
+                if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
+            }
+            if (failures.isEmpty()) {
+                onLog("[+] selinux_state 已修复（+1..+10 回填，enforcing 未动），kread_min 已卸载")
+            } else {
+                onLog(
+                    "[!] ${failures.size}/${ChainSpec.KREAD_STEPS} 条 selinux 修复命令没有成功：" +
+                        failures.joinToString(),
+                )
+            }
+            "selinux repair（${failures.size} 条失败）"
         } != null
         if (!ok) return false
 

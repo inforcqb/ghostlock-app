@@ -256,4 +256,5 @@
     <string name="root_chain_part1">Part 1</string>
     <string name="root_chain_part2">Part 2</string>
     <string name="root_chain_step_harden_props">Restore properties: ro.secure / ro.debuggable / suid_dumpable</string>
+    <string name="root_chain_step_selinux_repair">Repair selinux_state (kread_min + fix-selinux.sh)</string>
 </resources>

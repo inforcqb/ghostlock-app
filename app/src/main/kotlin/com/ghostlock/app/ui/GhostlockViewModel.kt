@@ -671,6 +671,7 @@ class GhostlockViewModel(
         ChainStep.OPEN_ADB_GATE -> R.string.root_chain_step_open_adb_gate
         ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
         ChainStep.REMOVE_GUARD -> R.string.root_chain_step_remove_guard
+        ChainStep.SELINUX_REPAIR -> R.string.root_chain_step_selinux_repair
         ChainStep.HARDEN_PROPS -> R.string.root_chain_step_harden_props
         ChainStep.KSU_LATE_LOAD -> R.string.root_chain_step_ksu_late_load
         else -> R.string.root_chain_step_generic
