@@ -36,7 +36,10 @@ import kotlinx.coroutines.withContext
 object AdbService {
     private const val KEEP_ALIVE_INTERVAL_MS = 5_000L
     private const val GAP_MS = 800L
-    /* `adb mdns services` prints `_adb-tls-connect._tcp.`; AdbCli normalises that to `adb-tls-connect`*/(leading underscore trimmed), so the constants must match THAT form -- comparing against the underscored form silently filtered every candidate away. */
+    /* `adb mdns services` prints the type as `_adb-tls-connect._tcp.` and AdbCli normalises
+     * it to `adb-tls-connect` (the leading underscore is trimmed), so these constants must
+     * match THAT form; comparing against the underscored form filtered every candidate away
+     * and left the pairing flow with nothing but the NsdManager fallback. */
     private const val SERVICE_CONNECT = "adb-tls-connect"
     private const val SERVICE_PAIRING = "adb-tls-pairing"
     private const val CONNECT_ROUNDS = 3
