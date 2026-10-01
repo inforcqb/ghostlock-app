@@ -23,6 +23,11 @@ import kotlinx.coroutines.withTimeout
  *  * legacy-domain tricks (`surfaceflinger`, `crash_dump`, ...) to reach `ctl.*`,
  *  * any step reordering or merging (for example dropping `am hang`).
  *
+ * One deliberate exception, asked for by the user on 2026-10-01: step 8b **closes** the gate
+ * with `resetprop service.adb.tcp.port ""` (see [ChainSpec.hardenCommands]). Opening it still
+ * goes through the adbd domain in step 5 -- only the closing direction uses resetprop, and only
+ * inside the window where resetprop was verified usable.
+ *
  * The domain borrows in steps 5/6 work only while SELinux is permissive (W1 landed
  * and `ksud late-load` has not run yet), which is why the order is what it is.
  */
@@ -228,7 +233,18 @@ object ChainSpec {
      *     reject or silently drop the writes that follow;
      *  2. the two `ro.*` writes;
      *  3. `suid_dumpable` back to 0;
-     *  4. `resetprop -c` with no name, i.e. rebuild **every** property area -- the cleanup.
+     *  4. `resetprop -c` with no name, i.e. rebuild **every** property area -- the cleanup;
+     *  5. `resetprop service.adb.tcp.port ""` -- clears the port this chain opened in step 5/6.
+     *     It goes **last** so the area rebuild above cannot be the thing that rewrites it, and
+     *     the running 5555 listener is unaffected until adbd is restarted (`ksud late-load` does
+     *     that a moment later), which is exactly when the gate is supposed to close.
+     *
+     * Note on the runbook: `docs/analysis/current-chain-20260926.md` §3 blacklists `resetprop`
+     * for `service.*` while *opening* the gate (that has to happen in the `adbd` domain). This
+     * is the closing direction, in the same window where `resetprop` was verified usable, and
+     * the user asked for it explicitly (2026-10-01). If the property is still there after a run,
+     * the alternative is the sanctioned one: `runcon u:r:adbd:s0 setprop service.adb.tcp.port ""`
+     * -- which needs SELinux permissive, i.e. this same window.
      *
      * Non-fatal on purpose: this is hardening/cleanup, and it must not stop the step that gives
      * the device persistent root. Every command is logged with its exit code either way.
@@ -239,7 +255,11 @@ object ChainSpec {
         "$ksud resetprop ro.debuggable 0",
         "echo 0 > /proc/sys/fs/suid_dumpable",
         "$ksud resetprop -c",
+        "$ksud resetprop $ADB_TCP_PORT_PROP \"\"",
     )
+
+    /** The property step 5/6 sets to open the root adbd gate -- step 8b clears it again. */
+    const val ADB_TCP_PORT_PROP = "service.adb.tcp.port"
 
     /** The property area those `ro.*` values live in. */
     const val HARDEN_CONTEXT = "u:object_r:userdebug_or_eng_prop:s0"
@@ -963,7 +983,10 @@ class RootChain(
                 if (result.exitCode != 0) failures += "$command (exit=${result.exitCode})"
             }
             if (failures.isEmpty()) {
-                onLog("[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0（并重建了属性区）")
+                onLog(
+                    "[+] 属性已恢复：ro.secure=1 / ro.debuggable=0 / suid_dumpable=0，" +
+                        "并清掉 ${ChainSpec.ADB_TCP_PORT_PROP}（重建属性区后执行）",
+                )
             } else {
                 onLog(
                     "[!] ${failures.size}/${commands.size} 条属性恢复命令没有成功：" +
