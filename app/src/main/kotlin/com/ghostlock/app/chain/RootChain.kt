@@ -97,6 +97,16 @@ object ChainSpec {
     const val CHANNEL_PROBE = "id"
 
     /**
+     * The fool-proof probe of step 0: does `su` already hand out root?
+     *
+     * Run through the same uid-2000 channel as every other step, with a short budget --
+     * a `su` that has to ask the user for consent (KernelSU's prompt) blocks here, and that
+     * must not stall the preflight: no answer within the budget simply means "no root".
+     */
+    const val SU_PROBE = "su -c id"
+    const val SU_PROBE_TIMEOUT_MS = 20_000L
+
+    /**
      * step 1 -- W1, from the app's own engine.
      *
      * The runbook drove the device-side script `$DEVICE_DIR/w1.sh`, which ran whatever
@@ -533,17 +543,64 @@ class RootChain(
         "not yet: ${t::class.simpleName}: ${t.message}"
     }
 
+    /**
+     * Does `su` already hand out root? See [ChainSpec.SU_PROBE].
+     *
+     * Only a clean `uid=0` in the answer counts. A command that never ran (transport failure),
+     * a timeout, or a `su` that returned non-zero is **not** evidence of root -- so the probe
+     * errs towards running the chain, which is the safe direction: skipping a needed W1 leaves
+     * the user with nothing, while running an unneeded one only costs time.
+     */
+    private suspend fun suGrantsRoot(): Boolean {
+        val probe = runCatching {
+            sh(ChainSpec.SU_PROBE, timeoutMs = ChainSpec.SU_PROBE_TIMEOUT_MS, transportRetries = 1)
+        }.getOrNull() ?: run {
+            onLog("[*] 预检：`${ChainSpec.SU_PROBE}` 没能执行（通道问题）⇒ 按“没有 root”处理")
+            return false
+        }
+        val text = probe.output.trim()
+        val firstLine = text.lineSequence().firstOrNull { it.isNotBlank() }
+        if (firstLine != null) onLog("[*] 预检 su 输出：${firstLine.take(160)}")
+        return probe.exitCode == 0 && UID_ZERO.containsMatchIn(text)
+    }
+
     suspend fun run(): Boolean {
         // step 0 ------------------------------------------------------------------
-        var ok = step(ChainStep.PREFLIGHT, "channel socket") {
+        /* The fool-proof check comes first: if the device already hands out root through
+         * `su`, this chain must not run at all. Every step of it forges kernel state, hangs
+         * system_server and reboots adbd -- all of it pointless, and not harmless, when the
+         * goal (root) is already there. */
+        var alreadyRooted = false
+        var ok = step(ChainStep.PREFLIGHT, "channel socket + su") {
             val listing = sh("ls -l ${ChainSpec.CHANNEL_SOCK} ${ChainSpec.CHANNEL_TOKEN}").output
             onLog("[*] $listing")
             if (!listing.contains("rshell.sock")) {
                 onLog("[*] channel not up yet -- Magica has to run once (step 3)")
             }
+            alreadyRooted = suGrantsRoot()
+            if (alreadyRooted) {
+                onLog("[+] 预检：`${ChainSpec.SU_PROBE}` 拿到了 uid=0 ⇒ 本机已有 root，不必执行利用链")
+            } else {
+                onLog("[*] 预检：su 不可用（或没有 uid=0）⇒ 继续走利用链")
+            }
             "preflight done"
         } != null
         if (!ok) return false
+        if (alreadyRooted) {
+            /* Reported as a *success*: the thing the user asked for (root) is already there,
+             * and the chain stopping here is the correct outcome, not a failure. */
+            onProgress(
+                ChainProgress(
+                    ChainStep.PREFLIGHT,
+                    1,
+                    total,
+                    StepState.OK,
+                    "su 可用（uid=0）：本机已有 root，跳过利用链",
+                ),
+            )
+            onLog("[+] root 可用（su -c id 返回 uid=0）—— 利用链已跳过，没有伪造任何内核状态。")
+            return true
+        }
 
         // step 1: W1 ---------------------------------------------------------------
         /* Live facts decide whether W1 has to run at all -- see [readBootFacts]:
@@ -791,5 +848,10 @@ class RootChain(
         channel.close()
         onLog(if (ok) "[+] root chain complete" else "[!] root chain stopped early")
         return ok
+    }
+
+    private companion object {
+        /** `uid=0` exactly -- `uid=0` must not match a `uid=01…` style line. */
+        val UID_ZERO = Regex("""uid=0(?!\d)""")
     }
 }

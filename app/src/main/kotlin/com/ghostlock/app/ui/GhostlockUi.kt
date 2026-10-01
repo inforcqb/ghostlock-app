@@ -1,4 +1,4 @@
-package com.ghostlock.app.ui
+﻿package com.ghostlock.app.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -66,7 +66,6 @@ import com.ghostlock.app.domain.model.WirelessChannelStatus
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
-import top.yukonga.miuix.kmp.basic.DropdownItem
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
@@ -84,8 +83,6 @@ import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.ArrowPreference
-import top.yukonga.miuix.kmp.preference.OverlaySpinnerPreference
-import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
@@ -785,25 +782,10 @@ private fun ControlPanel(
                 .fillMaxWidth()
                 .padding(top = 12.dp),
         )
-        if (state.cpuPairLabels.isNotEmpty()) {
-            Card(modifier = modifier.padding(top = 12.dp)) {
-                OverlaySpinnerPreference(
-                    title = stringResource(R.string.cpu_pair_label),
-                    items = state.cpuPairLabels.map { DropdownItem(icon = null, title = it) },
-                    selectedIndex = state.cpuPairIndex,
-                    showValue = true,
-                    onSelectedIndexChange = actions::onCpuPairSelected
-                )
-            }
-        }
-        Card(modifier = modifier.padding(top = 12.dp)) {
-            SwitchPreference(
-                checked = state.safeModeEnabled,
-                onCheckedChange = actions::onSafeModeChanged,
-                title = stringResource(R.string.safe_mode_label),
-                summary = stringResource(R.string.safe_mode_summary),
-            )
-        }
+        /* The CPU core pair and the "safe mode" switch are gone from this screen by request
+         * (2026-10-01): the pair stays at its stored value and safe mode at its default, both
+         * still reachable through the profile configuration and still passed to the native
+         * run -- only the two controls are no longer in the main path. */
         /* The app's only privileged dependency: the uid-2000 shell from wireless-debugging
          * pairing. Shizuku played this role before and is gone; this row is the entry to
          * the channel screen (pair / connect / self-check). */
