@@ -207,7 +207,7 @@
 
     <!-- Wireless debugging: the shell channel obtained by pairing, which replaces
          Magica / am hang / Shizuku in the chain. The 22sp status card only shows a short
-         phrase -- the explanation lives in the small row under it, and no string spells
+         phrase; the explanation lives in the small row under it, and no string spells
          out the internals to the user. -->
     <string name="wireless_entry">Wireless debugging</string>
     <string name="wireless_row_unpaired">Not paired · tap to open wireless debugging and pair</string>
