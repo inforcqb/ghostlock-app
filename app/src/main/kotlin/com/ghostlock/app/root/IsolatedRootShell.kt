@@ -87,9 +87,29 @@ class IsolatedRootShell(private val context: Context) {
                     "(check logcat -s ${RootShellService.TAG})",
             )
         }
-        if (!service.startChannel()) {
+        /* startChannel() only asks the isolated process to start the server; the
+         * socket becomes visible asynchronously (bind -> onCreate -> server thread ->
+         * listen), and on a cold or loaded device that can take longer than the single
+         * call we used to make.  Retry instead of failing the whole chain on the first
+         * miss: CHANNEL_START_ATTEMPTS attempts, CHANNEL_START_RETRY_MS apart. */
+        var channelStarted = false
+        for (attempt in 1..CHANNEL_START_ATTEMPTS) {
+            if (service.startChannel()) {
+                channelStarted = true
+                break
+            }
+            onLog(
+                "[!] startChannel() 第 $attempt/${CHANNEL_START_ATTEMPTS} 次未成功" +
+                    "（${ChannelPaths.socket(channelDir)} 还没 listen），" +
+                    "${CHANNEL_START_RETRY_MS / 1000}s 后重试",
+            )
+            if (attempt < CHANNEL_START_ATTEMPTS) Thread.sleep(CHANNEL_START_RETRY_MS)
+        }
+        if (!channelStarted) {
             throw IllegalStateException(
-                "startChannel() == false: the uid-0 shell server is not listening on " +
+                "startChannel() == false after $CHANNEL_START_ATTEMPTS attempts" +
+                    " (${CHANNEL_START_ATTEMPTS * (CHANNEL_START_RETRY_MS / 1000)}s): " +
+                    "the uid-0 shell server is not listening on " +
                     ChannelPaths.socket(channelDir),
             )
         }
@@ -194,6 +214,9 @@ class IsolatedRootShell(private val context: Context) {
 
         /** Starting an isolated process means forking the app zygote; give it room. */
         const val BIND_TIMEOUT_MS = 90_000L
+        /** startChannel() retry policy: the server's socket appears asynchronously. */
+        const val CHANNEL_START_ATTEMPTS = 3
+        const val CHANNEL_START_RETRY_MS = 3_000L
 
         /**
          * `ServiceInfo.FLAG_ISOLATED_PROCESS` and `ServiceInfo.FLAG_USE_APP_ZYGOTE`.
