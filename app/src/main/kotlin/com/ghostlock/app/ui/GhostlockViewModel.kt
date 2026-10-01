@@ -668,7 +668,6 @@ class GhostlockViewModel(
         ChainStep.ADB_CONNECT -> R.string.root_chain_step_adb_connect
         ChainStep.REMOVE_GUARD -> R.string.root_chain_step_remove_guard
         ChainStep.KSU_LATE_LOAD -> R.string.root_chain_step_ksu_late_load
-        ChainStep.VERIFY -> R.string.root_chain_step_verify
         else -> R.string.root_chain_step_generic
     }
 

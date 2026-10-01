@@ -494,15 +494,9 @@ private fun RootChainStepRow(step: RootChainStepUi) {
                 fontSize = 14.sp,
                 color = MiuixTheme.colorScheme.onSurface,
             )
-            if (step.detail.isNotBlank()) {
-                Text(
-                    text = step.detail,
-                    modifier = Modifier.padding(top = 2.dp),
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                )
-            }
+            /* The step's `detail` (the outcome of the step's last command) is deliberately NOT
+             * rendered any more: after a step succeeded it showed a sliced-off command line,
+             * which read as a broken display. The full output is in the log panel. */
         }
     }
 }

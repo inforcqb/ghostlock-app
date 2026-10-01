@@ -1,6 +1,7 @@
 package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
+import com.ghostlock.app.chain.DeviceSync
 import com.ghostlock.app.chain.RootAdbRunner
 import com.ghostlock.app.chain.W1Stage
 import com.ghostlock.app.wireless.RootAdbd
@@ -444,6 +445,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             onLog("error: 无线调试通道不可用 —— 请先在「无线调试」里完成配对与连接")
             return false
         }
+        /* Device tooling the chain and the cleanup steps expect in ${ChainSpec.DEVICE_DIR}:
+         * `kread_min.ko` and `fix-selinux.sh` used to be copied there by hand. Pushed from
+         * `assets/device/` now (sha256-compared, so repeat runs are silent). Non-fatal: a
+         * missing tool must not stop W1 -> Magica -> adbd gate -> ksud. */
+        DeviceSync.pushBundled(appContext, onLog)
         val channel = RootChannel()
         /* Steps 7-9 run on the bundled adb CLI against the root adbd: the app has no adb
          * client of its own any more (libadb, and with it the whole adb public-key story,

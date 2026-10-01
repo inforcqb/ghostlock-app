@@ -1,4 +1,4 @@
-package com.ghostlock.app.chain
+﻿package com.ghostlock.app.chain
 
 import android.content.Context
 import com.ghostlock.app.wireless.AdbCommand
@@ -6,7 +6,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.security.MessageDigest
 
 /**
  * W1, run from the **app's own engine**.
@@ -55,8 +54,12 @@ class W1Stage(private val context: Context) {
             val profileFile = File(context.filesDir, LOCAL_PROFILE)
             profileFile.writeBytes(profile)
 
-            if (!sync(engine, ChainSpec.W1_ENGINE, "755", onLog)) return@withContext false
-            if (!sync(profileFile, ChainSpec.W1_PROFILE, "644", onLog)) return@withContext false
+            if (!DeviceSync.pushIfChanged(engine, ChainSpec.W1_ENGINE, "755", onLog)) {
+                return@withContext false
+            }
+            if (!DeviceSync.pushIfChanged(profileFile, ChainSpec.W1_PROFILE, "644", onLog)) {
+                return@withContext false
+            }
 
             val started = AdbCommand.exec(
                 ChainSpec.W1_START,
@@ -128,77 +131,6 @@ class W1Stage(private val context: Context) {
     private fun tailOf(text: String): String =
         text.lineSequence().filter { it.isNotBlank() }.toList().takeLast(4)
             .joinToString(" | ").take(400)
-
-    /**
-     * Put [source] at [remote] unless the device already has the same bytes.
-     *
-     * The comparison is sha256 on both sides: `adb push` cannot tell us whether it changed
-     * anything, and re-pushing 8 MB on every run is pointless. A push is followed by the
-     * mode (the engine must be executable) and a re-read of the hash, so a truncated push
-     * cannot pass as done.
-     */
-    private suspend fun sync(
-        source: File,
-        remote: String,
-        mode: String,
-        onLog: (String) -> Unit,
-    ): Boolean {
-        val local = sha256(source)
-        val onDevice = remoteSha(remote)
-        if (local == onDevice) {
-            onLog("[*] 已同步 ${remote.substringAfterLast('/')}（sha256 一致，跳过推送）")
-            return true
-        }
-        onLog(
-            "[*] 推送 ${source.name} -> $remote" +
-                if (onDevice.isEmpty()) "（设备上没有）" else "（设备上是 ${onDevice.take(12)}…）",
-        )
-        if (!AdbCommand.push(source.absolutePath, remote, onLog)) {
-            onLog("[!] 推送失败：${source.absolutePath} -> $remote")
-            return false
-        }
-        val chmod = AdbCommand.exec(
-            "chmod $mode $remote",
-            retries = 2,
-            timeoutMs = 20_000,
-            onLog = null,
-        )
-        if (chmod.transportFailure) {
-            onLog("[!] chmod $remote 没有真正执行")
-            return false
-        }
-        val after = remoteSha(remote)
-        if (after != local) {
-            onLog("[!] $remote 的 sha256 与本地不一致（本地 ${local.take(12)}…，设备 ${after.take(12)}…）")
-            return false
-        }
-        return true
-    }
-
-    private suspend fun remoteSha(path: String): String = AdbCommand.exec(
-        "sha256sum $path 2>/dev/null",
-        retries = 2,
-        timeoutMs = 20_000,
-        onLog = null,
-    ).output.lineSequence()
-        .map { it.trim() }
-        .lastOrNull { it.isNotEmpty() }
-        ?.substringBefore(' ')
-        ?.trim()
-        .orEmpty()
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { stream ->
-            val buffer = ByteArray(1 shl 16)
-            while (true) {
-                val read = stream.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
 
     companion object {
         /** The app's own engine: the same binary the local (non-chain) run uses. */

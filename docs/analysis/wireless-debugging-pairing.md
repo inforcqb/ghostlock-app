@@ -260,3 +260,25 @@ adb shell id
   `adb connect` 报 `device unauthorized` / `failed to authenticate`，UI 日志会直接给出该行。
 * W1 用 app 自己的引擎之后，日志里应当出现 **100%** 的质量门（`>=100% coverage`），
   这是判断"真的换了引擎"的现场证据。
+
+### 11.6 2026-10-01 追加（用户定稿）
+
+* **`ksud late-load` 只看返回码**：`ksud` 装载成功后会**重启 adbd**，所以它之后任何走 adb 的读取都必然
+  失败。原先的 `VERIFY` 步骤（`/proc/modules` 里找 `kernelsu`）正是这样把成功读成失败 —— 已整步删除，
+  枚举 `ChainStep` 也从 8 步减到 7 步；`KSU_LATE_LOAD` 现在要求 `exit code == 0`，否则报退出码失败。
+* **两件设备工具打进 app**：`assets/device/kread_min.ko`（302344 B，取自设备 `/sdcard/kread_min.ko`）
+  与 `assets/device/fix-selinux.sh`（2384 B，取自 `/data/local/tmp/gl-w1/fix-selinux.sh`）。
+  `chain/DeviceSync.kt` 在链开始前按 sha256 增量推送到 `/data/local/tmp/gl-w1/`（`ko` 644、`sh` 755），
+  失败只警告不中断链。资产不能直接 push，先落到 `cacheDir` 再推。
+* **步骤列表不再显示 detail**：成功之后那行小字（步骤最后一条命令/输出）会被截断，看起来像坏掉；
+  UI 现在只显示步骤名 + 状态图标，完整输出仍在日志面板与 `chain-state.txt` 里。
+
+### 11.7 2026-10-01 首次用自家引擎跑 W1 的现场记录（未完成，待复跑）
+
+`/data/local/tmp/gl-w1/gl-w1.log`（2742 B，16:05）证明**用的确实是 app 的引擎**：质量门是
+`gate: >=9 colliders, >=100% coverage`（旧引擎同一行是 50%）。但该次运行停在
+`[T+9029ms] heap spray done`，没有 `Write 1 complete`，`gl-engine` 进程随后不在，
+`getenforce` 仍是 `Enforcing`。随后（16:07）设备上出现了用户手动 `w1.sh` 的运行记录（`w1.log` 6564 B），
+且 `gl-engine`/`gl-profile.bin` 被清理 —— 因此**不能断定**是引擎崩溃：也可能是那次清理脚本把 park 进程
+与文件一起删了。复跑一次（重新点「一键 root」）即可区分：成功时日志里应出现 `Write 1 complete`，
+并且 `pidof gl-engine` 有 pid、SELinux 变 Permissive。

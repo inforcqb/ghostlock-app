@@ -112,6 +112,10 @@ object ChainSpec {
     const val W1_PROFILE = "$DEVICE_DIR/gl-profile.bin"
     const val W1_LOG = "$DEVICE_DIR/gl-w1.log"
 
+    /** Bundled device tooling, pushed from `assets/device/` (see DeviceSync.BUNDLED). */
+    const val KREAD_KO = "$DEVICE_DIR/kread_min.ko"
+    const val FIX_SELINUX = "$DEVICE_DIR/fix-selinux.sh"
+
     /** The line the engine prints when the forged PI state is in place. */
     const val W1_LANDED_MARKER = "Write 1 complete"
 
@@ -195,7 +199,6 @@ enum class ChainStep(val label: String) {
     ADB_CONNECT("adb 客户端连 127.0.0.1:5555"),
     REMOVE_GUARD("rmmod oplus_security_guard"),
     KSU_LATE_LOAD("ksud late-load"),
-    VERIFY("校验 KernelSU"),
 }
 
 enum class StepState { RUNNING, OK, FAILED }
@@ -224,6 +227,14 @@ fun interface W1Runner {
 }
 
 /**
+ * One command on the root adbd: the exit code matters as much as the text.
+ *
+ * `ksud late-load` is judged by its return code alone -- it restarts adbd on the way out, so
+ * nothing may be read over that transport afterwards.
+ */
+data class RootAdbResult(val exitCode: Int, val output: String)
+
+/**
  * The root adbd the chain drives in steps 7-9.
  *
  * There is no adb implementation inside this app: the bundled `adb` CLI (see `AdbCli`) is
@@ -236,8 +247,8 @@ interface RootAdbRunner {
     /** Connect to [ChainSpec.ADB_ENDPOINT]; throws when the transport does not come up. */
     suspend fun connect()
 
-    /** Run one command on that transport and return its output. */
-    suspend fun exec(command: String, timeoutMs: Long = 30_000L): String
+    /** Run one command on that transport; throws only when the command never ran. */
+    suspend fun exec(command: String, timeoutMs: Long = 30_000L): RootAdbResult
 }
 
 /**
@@ -710,8 +721,8 @@ class RootChain(
         // step 7: the app becomes an adb client ----------------------------------
         ok = step(ChainStep.ADB_CONNECT, "127.0.0.1:${ChainSpec.ADB_PORT}") {
             adb.connect()
-            val identity = adb.exec(ChainSpec.READ_IDENTITY)
-            val caps = adb.exec(ChainSpec.READ_CAPS)
+            val identity = adb.exec(ChainSpec.READ_IDENTITY).output
+            val caps = adb.exec(ChainSpec.READ_CAPS).output
             onLog("[*] adb identity: ${identity.trim()}")
             val capLine = caps.lineSequence().firstOrNull { it.startsWith("CapEff:") }?.trim() ?: ""
             onLog("[*] adb $capLine")
@@ -725,9 +736,9 @@ class RootChain(
 
         // step 8: the goal, part one ---------------------------------------------
         ok = step(ChainStep.REMOVE_GUARD, ChainSpec.RMMOD_GUARD) {
-            val out = adb.exec(ChainSpec.RMMOD_GUARD)
+            val out = adb.exec(ChainSpec.RMMOD_GUARD).output
             if (out.isNotBlank()) onLog("[*] rmmod: ${out.trim()}")
-            val modules = adb.exec(ChainSpec.READ_MODULES)
+            val modules = adb.exec(ChainSpec.READ_MODULES).output
             if (modules.contains("oplus_security_guard")) {
                 throw IllegalStateException("oplus_security_guard is still loaded")
             }
@@ -736,26 +747,25 @@ class RootChain(
         if (!ok) return false
 
         // step 9: the goal, part two ---------------------------------------------
+        /* load ok == exit 0 is the whole verdict. `ksud late-load` reloads the SELinux policy
+         * and **restarts adbd** on the way out, so anything that would read the module list
+         * afterwards reads through a transport that no longer exists -- which is exactly the
+         * check that used to turn a successful late-load into a failed step. */
         ok = step(ChainStep.KSU_LATE_LOAD, ChainSpec.KSUD_LATE_LOAD) {
             val out = adb.exec(ChainSpec.KSUD_LATE_LOAD, timeoutMs = 120_000)
-            if (out.isNotBlank()) onLog("[*] ksud: ${out.trim()}")
-            // NOTE: ksud late-load reloads the SELinux policy, so `getenforce` going back
-            // to Enforcing here is expected behaviour, not a failure.
-            "late-load returned"
+            if (out.output.isNotBlank()) onLog("[*] ksud: ${out.output.trim()}")
+            if (out.exitCode != 0) {
+                throw IllegalStateException("ksud late-load 退出码 ${out.exitCode}（只看返回码判断成败）")
+            }
+            /* NOTE: ksud late-load reloads the SELinux policy and restarts adbd, so
+             * `getenforce` going back to Enforcing -- and the adb transport going away -- are
+             * expected behaviour, not failures. */
+            "late-load 返回 0 ⇒ 完成"
         } != null
         if (!ok) return false
 
-        // verify -----------------------------------------------------------------
-        ok = step(ChainStep.VERIFY, "kernelsu module") {
-            val modules = await(
-                "kernelsu in /proc/modules",
-                timeoutMs = 30_000L,
-                read = { adb.exec(ChainSpec.READ_MODULES) },
-                check = { it.contains("kernelsu") },
-            )
-            if (!modules.contains("kernelsu")) throw IllegalStateException("kernelsu not loaded")
-            "kernelsu loaded"
-        } != null
+        /* No verification step: it read /proc/modules over the adb transport, which ksud's
+         * adbd restart takes down, so it could only ever report a failure after a success. */
 
         /* Nothing to close on the adb side: the CLI's server owns both transports and
          * [AdbService] keeps them alive across chain runs (the root serial stays marked, so

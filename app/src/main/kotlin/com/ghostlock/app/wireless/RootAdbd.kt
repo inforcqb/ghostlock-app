@@ -1,6 +1,7 @@
 package com.ghostlock.app.wireless
 
 import com.ghostlock.app.chain.ChainSpec
+import com.ghostlock.app.chain.RootAdbResult
 import com.ghostlock.app.chain.RootAdbRunner
 
 /**
@@ -31,11 +32,11 @@ object RootAdbd : RootAdbRunner {
         }
     }
 
-    override suspend fun exec(command: String, timeoutMs: Long): String {
+    override suspend fun exec(command: String, timeoutMs: Long): RootAdbResult {
         val result = AdbCommand.execOnRoot(command, timeoutMs = timeoutMs)
         if (result.transportFailure) {
             throw IllegalStateException("根 adbd 传输失败：${result.output.trim().take(200)}")
         }
-        return result.output
+        return RootAdbResult(result.exitCode, result.output)
     }
 }
