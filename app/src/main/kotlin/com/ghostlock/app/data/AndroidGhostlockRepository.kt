@@ -6,6 +6,7 @@ import com.ghostlock.app.chain.RootAdbRunner
 import com.ghostlock.app.chain.W1Stage
 import com.ghostlock.app.wireless.RootAdbd
 import com.ghostlock.app.wireless.AdbCommand
+import com.ghostlock.app.wireless.WIRELESS_TAG
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.ChainSpec
 import com.ghostlock.app.chain.RootChain
@@ -16,6 +17,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import android.system.Os
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -156,6 +158,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             ?.substringAfter(':')
             ?: return lastChainPhase
         val phase = ChainPhaseRule.of(enforce.output, seccomp)
+        /* One line per transition, on the same tag as the rest of the wireless flow: the phase
+         * is a display decision, but "why is it showing Part 1?" is exactly the question a log
+         * should answer -- with the two facts it was derived from. */
+        if (phase != lastChainPhase) {
+            Log.i(
+                WIRELESS_TAG,
+                "chain phase -> $phase（enforce=${enforce.output.trim()}, Seccomp=${seccomp.trim()}）",
+            )
+        }
         lastChainPhase = phase
         return phase
     }
