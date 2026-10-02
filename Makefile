@@ -110,6 +110,7 @@ $(NATIVE_BUILD_DIR)/%.o: %.cpp $(HDRS)
 JNI_DIR := app/src/main/jni
 JNI_BUILD_DIR := .build/jni
 JNI_SRCS := \
+  gl_server.cpp \
   magica.cpp \
   lsplt/elf_util.cc \
   lsplt/lsplt.cc \
