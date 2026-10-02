@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ============================================================================
  * magica.cpp -- the "Magica" root service, ported into GhostLock.
  * ============================================================================
@@ -640,33 +640,38 @@ static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, j
         return env->NewStringUTF(reason);
     }
 
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, pipes[0]);
-
-    const char *argv[] = {"sh", "-c", cmd, nullptr};
-    const char *envp[] = {
-            "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
-            "HOME=/",
-            nullptr,
-    };
-
-    pid_t pid = -1;
-    const int spawned = posix_spawn(&pid, "/system/bin/sh", &actions, nullptr,
-                                    (char *const *) argv, (char *const *) envp);
-    posix_spawn_file_actions_destroy(&actions);
+    /* fork + execve rather than posix_spawn: bionic only declares the posix_spawn_* file-action
+     * types from API 28 on, and this library's platform level is lower. The child only calls
+     * async-signal-safe functions (open/dup2/close/execve/_exit) before exec, which is what makes
+     * forking from a binder thread of a multi-threaded process acceptable here. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        const int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        dup2(pipes[1], STDOUT_FILENO);
+        dup2(pipes[1], STDERR_FILENO);
+        if (pipes[1] > STDERR_FILENO) close(pipes[1]);
+        close(pipes[0]);
+        char *const argv[] = {(char *) "sh", (char *) "-c", (char *) cmd, nullptr};
+        char *const envp[] = {
+                (char *) "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
+                (char *) "HOME=/",
+                nullptr,
+        };
+        execve("/system/bin/sh", argv, envp);
+        _exit(127);
+    }
     close(pipes[1]);
 
     std::string output;
     bool timed_out = false;
-    if (spawned != 0) {
+    if (pid < 0) {
         close(pipes[0]);
         char reason[192];
-        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: posix_spawn(%d): %s",
-                 spawned, strerror(spawned));
+        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: fork: %s", strerror(errno));
         output = reason;
     } else {
         const int budget = timeout_ms > 0 ? timeout_ms : 30000;
