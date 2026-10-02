@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Control plane of the isolated root service.
  *
  * Implementation: com.ghostlock.app.root.RootShellService (isolatedProcess=true,

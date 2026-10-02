@@ -1,4 +1,4 @@
-﻿package com.ghostlock.app.data
+package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.chain.DeviceSync

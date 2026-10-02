@@ -1,4 +1,4 @@
-﻿package com.ghostlock.app.chain
+package com.ghostlock.app.chain
 
 import android.content.Context
 import com.ghostlock.app.wireless.AdbCommand
