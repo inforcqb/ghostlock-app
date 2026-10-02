@@ -621,8 +621,10 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused
  * same capabilities the isolated process has (CapEff=0x1c0), which is exactly the identity the
  * chain's uid-0 steps used over the socket.
  *
- * `posix_spawn` (not fork/exec) on purpose: this runs on a binder thread of a multi-threaded
- * process, where fork() would leave the child with a lock state it must not touch.
+ * `fork` + `execve`, not `posix_spawn`: bionic only declares the `posix_spawn_file_actions_t`
+ * family from API 28 on and this library builds at a lower level. Forking from a binder thread of
+ * a multi-threaded process is acceptable here because the child only calls async-signal-safe
+ * functions (open / dup2 / close / execve / _exit) before the exec.
  *
  * A spawn failure or a timeout is reported *inside* the returned text as
  * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so callers that parse output cannot mistake it for a
