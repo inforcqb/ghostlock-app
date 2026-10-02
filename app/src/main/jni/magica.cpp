@@ -715,8 +715,24 @@ static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, j
             LOGW("exec: timed out after %dms: %s", budget, cmd);
         } else if (WIFEXITED(status)) {
             LOGI("exec: exit=%d: %s", WEXITSTATUS(status), cmd);
+            /* Silence plus a non-zero exit is the interesting case (a shell that could not be
+             * exec'd, a command that never existed): say so in the returned text, because an
+             * empty answer is indistinguishable from "ran and printed nothing". */
+            if (output.empty() && WEXITSTATUS(status) != 0) {
+                output = "__GHOSTLOCK_EXEC_FAILED__: exit=";
+                output += std::to_string(WEXITSTATUS(status));
+                output += " (no output): ";
+                output += cmd;
+            }
         } else {
-            LOGW("exec: killed by signal %d: %s", WIFSIGNALED(status) ? WTERMSIG(status) : -1, cmd);
+            const int signal = WIFSIGNALED(status) ? WTERMSIG(status) : -1;
+            LOGW("exec: killed by signal %d: %s", signal, cmd);
+            if (output.empty()) {
+                output = "__GHOSTLOCK_EXEC_FAILED__: signal=";
+                output += std::to_string(signal);
+                output += ": ";
+                output += cmd;
+            }
         }
     }
 

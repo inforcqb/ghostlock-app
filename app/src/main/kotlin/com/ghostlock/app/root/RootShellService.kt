@@ -5,7 +5,6 @@ import android.content.Intent
 import android.os.IBinder
 import android.os.Process
 import android.util.Log
-import java.util.concurrent.TimeUnit
 
 /**
  * Name of the JNI module that carries the ported Magica code.
@@ -100,47 +99,23 @@ class RootShellService : Service() {
         override fun adbRoot(): Boolean = root() && adb_root()
 
         /**
-         * One command, through the **JVM** rather than JNI.
+         * One command, in this process, as this process's uid.
          *
-         * This is the same `fork`+`exec` the runtime performs for any app that spawns a process,
-         * except the failure reporting stays in Kotlin: if a device refuses to spawn here, the
-         * exception text is what the caller (and the log) gets, which is exactly what was missing
-         * when the native version silently produced no `uid=0`.
-         *
-         * The identity is the point: this runs as the isolated process's uid 0 (`CapEff=0x1c0`)
-         * with a fixed PATH, because the chain's commands are `runcon`/`setprop`/`id`/`ss`.
+         * **Native on purpose.** `Runtime`/`ProcessBuilder` looks like the same thing, but
+         * Android's process spawn drops back to the app's uid (measured on the PJA110: the
+         * isolated process runs as uid 0 after `ensureRoot()`, yet `id` through a
+         * `ProcessBuilder` printed `uid=90000(u0_i0)`). The JNI `exec_shell` forks and execs
+         * without touching credentials, which is what makes the chain's `runcon`/`setprop`
+         * run with the identity the uid-0 steps need.
          */
         override fun execShell(command: String, timeoutMs: Int): String {
-            val process = try {
-                ProcessBuilder("/system/bin/sh", "-c", command)
-                    .redirectErrorStream(true)
-                    .apply { environment()["PATH"] = SHELL_PATH }
-                    .start()
-            } catch (error: Throwable) {
-                val reason = "__GHOSTLOCK_EXEC_FAILED__: spawn " +
-                    "${error::class.java.simpleName}: ${error.message}"
+            val output = runCatching { exec_shell(command, timeoutMs) }.getOrElse { error ->
+                val reason = "__GHOSTLOCK_EXEC_FAILED__: ${error::class.java.simpleName}: " +
+                    "${error.message}"
                 Log.e(TAG, reason)
                 return reason
             }
-            val collected = StringBuilder()
-            val reader = Thread {
-                runCatching {
-                    process.inputStream.bufferedReader().forEachLine { collected.appendLine(it) }
-                }
-            }.apply { name = "gl-exec-out"; isDaemon = true; start() }
-
-            val budget = if (timeoutMs > 0) timeoutMs.toLong() else 30_000L
-            val finished = process.waitFor(budget, TimeUnit.MILLISECONDS)
-            if (!finished) {
-                process.destroyForcibly()
-                reader.join(1_000)
-                val reason = "__GHOSTLOCK_EXEC_FAILED__: timeout after ${budget}ms: $command"
-                Log.w(TAG, reason)
-                return reason
-            }
-            reader.join(3_000)
-            Log.i(TAG, "execShell exit=${process.exitValue()} cmd=$command")
-            return collected.toString()
+            return output ?: ""
         }
 
         override fun destroy() {
