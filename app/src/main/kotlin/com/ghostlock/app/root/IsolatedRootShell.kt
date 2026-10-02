@@ -82,15 +82,17 @@ class IsolatedRootShell(private val context: Context) {
                     "(check logcat -s ${RootShellService.TAG})",
             )
         }
-        /* startChannel() is a self-test: it runs `id` through the binder and requires uid=0.
-         * The isolated process may need a moment before that works on a cold or loaded device,
-         * so retry instead of failing the whole chain on the first miss:
+        /* startChannel() is a self-test: it reads the identity through the binder and requires
+         * uid=0. The isolated process may need a moment before that works on a cold or loaded
+         * device, so retry instead of failing the whole chain on the first miss:
          * CHANNEL_START_ATTEMPTS attempts, CHANNEL_START_RETRY_MS apart. */
         var channelStarted = false
         for (attempt in 1..CHANNEL_START_ATTEMPTS) {
-            /* Ask the service what a command actually returned: the verdict alone ("false")
-             * wastes a whole chain run when a device misbehaves, and the text is the diagnosis. */
-            val identity = runCatching { service.execShell("id", 15_000) }.getOrElse { error ->
+            /* Ask the service who it is rather than only whether it is happy: the verdict alone
+             * ("false") wastes a whole chain run when a device misbehaves, and the text is the
+             * diagnosis.  A native read, so no child process is involved -- see the note in
+             * RootShellService: a spawned child loses the escalated uid. */
+            val identity = runCatching { service.channelIdentity() }.getOrElse { error ->
                 "抛异常 ${error::class.java.simpleName}: ${error.message}"
             }
             onLog("[*] 通道自检 第 $attempt/$CHANNEL_START_ATTEMPTS 次：${identity.trim().take(200)}")
@@ -104,7 +106,7 @@ class IsolatedRootShell(private val context: Context) {
             throw IllegalStateException(
                 "通道自检失败 $CHANNEL_START_ATTEMPTS 次" +
                     "（${CHANNEL_START_ATTEMPTS * (CHANNEL_START_RETRY_MS / 1000)}s）：" +
-                    "通过 binder 跑 `id` 没有拿到 uid=0 " +
+                    "通过 binder 读身份没有拿到 uid=0 " +
                     "(check logcat -s ${RootShellService.TAG})",
             )
         }

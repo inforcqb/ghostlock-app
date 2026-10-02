@@ -48,10 +48,14 @@ internal const val ROOT_LOG_TAG = "GhostlockRoot"
  *
  * * `onBind` runs `root()` (the escalation `root()` requires, and it must succeed before any
  *   command can run as uid 0).
- * * The command plane is the **binder**: [IRootShellService.execShell] runs one short shell
- *   command in this process and returns its combined output, so the app needs neither a shared
- *   directory nor a token.  Not a single IP socket is opened here -- an isolated process
- *   has no AF_INET.
+ * * The command plane is the **binder**, and it carries three *typed actions* --
+ *   [IRootShellService.channelIdentity], [IRootShellService.setPropInDomain],
+ *   [IRootShellService.waitForPort] -- each of them native code running in this process.
+ *   No shell and no fork: a spawned child loses the escalated uid on this platform
+ *   (measured: the isolated process is uid 0, its `ProcessBuilder` child printed
+ *   `uid=90000(u0_i0)`), and a frozen cached process never gets to run its command at all.
+ *   Not a single IP socket is opened here either -- an isolated process has no AF_INET
+ *   (measured), which is why the listener probe reads `/proc/net/tcp{,6}`.
  * * `adb_root()` (the adbd patch) is **not** called on bind: it blocks up to 15 s
  *   and it restarts adbd, so it is only reachable through the AIDL method below.
  * * The libsu-based `RemoteProcess*` plumbing of upstream is deliberately NOT
@@ -80,15 +84,24 @@ internal const val ROOT_LOG_TAG = "GhostlockRoot"
 class RootShellService : Service() {
 
     private val binder: IRootShellService.Stub = object : IRootShellService.Stub() {
+
+        /** The marker the caller parses: "this action never ran", never "it printed nothing". */
+        private fun failure(what: String, error: Throwable): String {
+            val reason = "__GHOSTLOCK_EXEC_FAILED__: $what 抛异常 " +
+                "${error::class.java.simpleName}: ${error.message}"
+            Log.e(TAG, reason)
+            return reason
+        }
+
         override fun ensureRoot(): Boolean = root()
 
         /**
-         * Self-test: the command plane is the binder itself now, so "is the channel up?" means
-         * "does a command really run as uid 0 through it?" -- a stronger statement than the old
-         * "the socket exists" check, and it needs no filesystem at all.
+         * Self-test: the command plane is this binder, so "is the channel up?" means "does the
+         * service really report a uid-0 identity?" -- a stronger statement than the old "the
+         * socket exists" check, and it needs no filesystem at all.
          */
         override fun startChannel(): Boolean {
-            val identity = runCatching { execShell("id", 15_000) }.getOrElse { error ->
+            val identity = runCatching { channelIdentity() }.getOrElse { error ->
                 "抛异常 ${error::class.java.simpleName}: ${error.message}"
             }
             val rooted = identity.contains("uid=0")
@@ -98,24 +111,33 @@ class RootShellService : Service() {
 
         override fun adbRoot(): Boolean = root() && adb_root()
 
-        /**
-         * One command, in this process, as this process's uid.
+        /*
+         * The three actions.  All of them are **native on purpose**: this is the process that
+         * holds uid 0 and the borrowed SELinux domain, and a JVM-side `Runtime`/`ProcessBuilder`
+         * spawn would drop back to the app uid (measured: `uid=90000(u0_i0)`), while these calls
+         * stay in this process, with this uid, with no child to lose anything to.
          *
-         * **Native on purpose.** `Runtime`/`ProcessBuilder` looks like the same thing, but
-         * Android's process spawn drops back to the app's uid (measured on the PJA110: the
-         * isolated process runs as uid 0 after `ensureRoot()`, yet `id` through a
-         * `ProcessBuilder` printed `uid=90000(u0_i0)`). The JNI `exec_shell` forks and execs
-         * without touching credentials, which is what makes the chain's `runcon`/`setprop`
-         * run with the identity the uid-0 steps need.
+         * A native failure is turned into the `__GHOSTLOCK_EXEC_FAILED__` marker so the caller
+         * sees "the action never ran" and not an empty answer.
          */
-        override fun execShell(command: String, timeoutMs: Int): String {
-            val output = runCatching { exec_shell(command, timeoutMs) }.getOrElse { error ->
-                val reason = "__GHOSTLOCK_EXEC_FAILED__: ${error::class.java.simpleName}: " +
-                    "${error.message}"
-                Log.e(TAG, reason)
-                return reason
-            }
-            return output ?: ""
+        override fun channelIdentity(): String {
+            return runCatching { channel_identity() }.getOrElse { error ->
+                failure("identity", error)
+            } ?: ""
+        }
+
+        override fun setPropInDomain(domain: String, name: String, value: String): String {
+            return runCatching { channel_set_prop(domain, name, value) }.getOrElse { error ->
+                failure("setPropInDomain", error)
+            } ?: ""
+        }
+
+        override fun waitForPort(port: Int, timeoutMs: Int): String {
+            return runCatching { channel_wait_port(port, timeoutMs) }.getOrElse { error ->
+                "unreadable: ${error::class.java.simpleName}: ${error.message}".also {
+                    Log.e(TAG, "waitForPort: $it")
+                }
+            } ?: "unreadable: the native call returned nothing"
         }
 
         override fun destroy() {
@@ -153,7 +175,8 @@ class RootShellService : Service() {
      * app/src/main/jni/magica.cpp does
      *
      *     FindClass("com/ghostlock/app/root/RootShellService")
-     *     RegisterNatives({ "root", "adb_root", "exec_shell" } ...)
+     *     RegisterNatives({ "root", "adb_root", "channel_identity", "channel_set_prop",
+     *                       "channel_wait_port" } ...)
      *
      * so this class must not be renamed or obfuscated (see app/proguard-rules.pro)
      * and these names must not change.  They are *instance* methods here (not
@@ -161,22 +184,26 @@ class RootShellService : Service() {
      * the plain JVM method name, and an instance method cannot be confused with the
      * companion's static bridge.
      *
-     * The old socket server (`start_shell_server` / `set_channel_dir`) is no longer
-     * registered: the command plane is the binder now (see [IRootShellService.execShell]).
+     * The old socket server (`start_shell_server` / `set_channel_dir`) and the shell-string
+     * plane (`exec_shell`) are no longer registered: the command plane is the binder, and it
+     * carries typed actions instead of command strings.
      */
     private external fun root(): Boolean
 
     private external fun adb_root(): Boolean
 
-    /** One shell command as uid 0; the JNI side captures its combined output. */
-    private external fun exec_shell(command: String, timeoutMs: Int): String?
+    /** uid 0 + this process's SELinux context, in the shape `id` prints. */
+    private external fun channel_identity(): String?
+
+    /** setcon(<domain>) -> property_set(name, value) -> setcon(back); see the AIDL doc. */
+    private external fun channel_set_prop(domain: String, name: String, value: String): String?
+
+    /** "listening: …" / "not-listening: …" / "unreadable: …"; see the AIDL doc. */
+    private external fun channel_wait_port(port: Int, timeoutMs: Int): String?
 
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */
         const val TAG = ROOT_LOG_TAG
-
-        /** PATH for every command the chain runs (the isolated process has almost none). */
-        const val SHELL_PATH = "/sbin:/system/sbin:/system/bin:/system/xbin"
 
         init {
             /*
