@@ -34,9 +34,9 @@ import kotlinx.coroutines.withTimeout
 object ChainSpec {
     const val DEVICE_DIR = "/data/local/tmp/gl-w1"
 
-    /* The uid-0 shell channel is NOT here any more: it lives in the app's own data directory
-     * (see `com.ghostlock.app.root.ChannelPaths`), because `/data/local/tmp/gl-w1` had to be
-     * created by hand and a missing parent directory made the server's `bind/listen` fail. */
+    /* The uid-0 command plane is a binder to the isolated root service (`IRootShellService`),
+     * not a socket: the AF_UNIX path + token it used to be needed a shared, writable directory
+     * and behaved differently per device. See `com.ghostlock.app.root.RootChannel`. */
 
     /** step 2: make system_server hang, so Magica's zygote can come up */
     const val AM_HANG = "am hang --allow-restart"
@@ -700,9 +700,9 @@ class RootChain(
          * goal (root) is already there. */
         var alreadyRooted = false
         var ok = step(ChainStep.PREFLIGHT, "channel + su") {
-            /* The channel lives in the app's own data directory now, so there is nothing to list
-             * from the shell side -- the client object answers for itself. */
-            onLog("[*] 通道 ${channel.socketPath}（当前可用=${channel.available()}）")
+            /* The command plane is a binder to the isolated root service, so there is nothing to
+             * list from the shell side -- the client object answers for itself. */
+            onLog("[*] uid-0 通道：${channel.describe()}")
             alreadyRooted = suGrantsRoot()
             if (alreadyRooted) {
                 onLog("[+] 预检：`${ChainSpec.SU_PROBE}` 拿到了 uid=0 ⇒ 本机已有 root，不必执行利用链")

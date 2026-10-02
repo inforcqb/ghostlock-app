@@ -1,126 +1,49 @@
 package com.ghostlock.app.root
 
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
-import java.io.File
-import java.net.SocketTimeoutException
-
 /**
- * Client for the uid-0 shell channel that the root service leaves behind.
+ * The chain's uid-0 command plane: one short shell command per call, run **in the isolated
+ * root process** and returned as text.
  *
- * ## Wire protocol (from the ported `magica.cpp` `rsh_*` / `start_shell_server()`)
+ * ## Why this is a binder and not a socket
  *
- * * socket `<channelDir>/rshell.sock`, `AF_UNIX`/`SOCK_STREAM`, mode 0666
- * * token `<channelDir>/rshell.token`, 32 hex chars + `\n`, mode 0644
- * * handshake: the client writes the token followed by `\n`; a mismatch answers `bad token\n`
- * * after a successful handshake the server forks a **pty-backed `sh -i`** and pumps raw bytes
- *   between the socket and the pty master, so the session is an interactive shell, not a
- *   length-framed request/response protocol.
+ * It used to be an AF_UNIX socket plus a token file under a shared directory. That needs a
+ * filesystem path both sides can reach, and on some devices it simply does not (a parent
+ * directory that does not exist yet, an SELinux label the isolated domain may not touch, a token
+ * the other side cannot read). The app *already* holds a binder to that service -- that is how
+ * the service is started at all -- so the commands ride the binder instead: no path, no token,
+ * no directory to prepare, and one less thing that behaves differently per device.
  *
- * ## How one-shot commands work
+ * What is unchanged is what matters: the command runs as the isolated process's uid 0 with the
+ * capabilities that process has (`CapEff=0x1c0`), i.e. exactly the identity the chain's uid-0
+ * steps used to get over the socket. Each call is one-shot (`sh -c <cmd>`), which is all the
+ * chain ever needed -- it runs `setprop`, `runcon`, `id`, `ss -lnt`, nothing interactive.
  *
- * There is no "execute and exit" request: the host-side wrapper (`rshell '<cmd>'`) simply feeds
- * the command and then closes its stdout, which makes the pty child exit. This client does the
- * same -- write the command, `shutdownOutput()`, then read until EOF. That is why [exec] must
- * only be used for short commands (all channel steps of the root chain are `setprop`/`runcon`
- * calls); a long-running command would be cut off when the pty gets EOF.
- *
- * ## Where the directory is
- *
- * Inside the app's own data directory ([ChannelPaths]) -- NOT `/data/local/tmp`, where a missing
- * parent directory made `bind/listen` fail. The only client is this class, which runs in the app
- * process, so the directory does not have to be reachable by the shell uid.
+ * The service is bound by `IsolatedRootShell`, so this class only resolves the current binder:
+ * before that bind it throws, and the chain reports "the channel is not up yet" instead of
+ * hanging.
  */
-class RootChannel(private val deviceDir: String) {
+class RootChannel(private val service: () -> IRootShellService?) {
 
-    val socketPath: String get() = File(deviceDir, "rshell.sock").absolutePath
-    val tokenPath: String get() = File(deviceDir, "rshell.token").absolutePath
+    /** True once the root service is bound and can take commands. */
+    fun available(): Boolean = service() != null
 
-    /** True when both the socket and the token are visible from this process. */
-    fun available(): Boolean = File(socketPath).exists() && File(tokenPath).exists()
+    /** Human-readable identity of the command plane, for the preflight log line. */
+    fun describe(): String = if (available()) "binder → uid-0 服务" else "binder 尚未绑定"
 
-    /** Read the token; it is world-readable by design (see the class note). */
-    private fun token(): String {
-        val file = File(tokenPath)
-        if (!file.isFile) throw IllegalStateException("channel token missing: $tokenPath")
-        return file.readText().trim()
-    }
-
-    /**
-     * Verification step: connect, hand over the token, run `id` and require `uid=0`.
-     * Called by the chain right after the root service reports that its channel is up.
-     */
-    fun open() {
-        val identity = exec("id")
-        if (!identity.contains("uid=0")) {
-            throw IllegalStateException("channel is not uid 0: ${identity.trim()}")
-        }
-    }
-
-    /**
-     * Run one short command in the channel as uid 0 and return its (combined) output,
-     * with the pty's echo of the command itself removed.
-     *
-     * The timing follows the verified device-side `rshell` wrapper (`echo "$T"; sleep 1;
-     * echo "$*"; sleep 3; echo exit; | nc -U $SOCK`): token first, a pause for the server
-     * to consume it, then the command, then `exit`. Writing token+command back to back and
-     * half-closing immediately -- what this used to do -- does not work against the pty.
-     *
-     * This is the transport the chain uses from step 3 on, because it does NOT depend on
-     * uid 2000: `runcon u:r:usbd:s0 setprop ctl.restart adbd` restarts adbd, which kills
-     * every shell-uid process including Shizuku, so Shizuku may only be used up to (and
-     * including) W1.
-     */
+    /** Run one short command as uid 0; see the class note. */
     fun exec(command: String, timeoutMs: Int = 30_000): String {
-        val raw = StringBuilder()
-        val socket = LocalSocket()
-        try {
-            socket.connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
-            socket.soTimeout = timeoutMs
-            val out = socket.outputStream
-            out.write((token() + "\n").toByteArray(Charsets.UTF_8))
-            out.flush()
-            Thread.sleep(TOKEN_SETTLE_MS)
-            out.write((command + "\n").toByteArray(Charsets.UTF_8))
-            out.flush()
-            Thread.sleep(COMMAND_SETTLE_MS)
-            out.write("exit\n".toByteArray(Charsets.UTF_8))
-            out.flush()
-            try {
-                socket.inputStream.bufferedReader(Charsets.UTF_8).forEachLine { line ->
-                    raw.appendLine(line)
-                }
-            } catch (_: SocketTimeoutException) {
-                // Partial output is still useful; the caller decides from its content.
-            } catch (_: Exception) {
-                // EOF / reset after the child exited: same treatment.
-            }
-        } finally {
-            runCatching { socket.close() }
+        val bound = service() ?: throw IllegalStateException("root 服务还没绑定（通道未就绪）")
+        val output = bound.execShell(command, timeoutMs)
+        if (output.contains(EXEC_FAILED)) {
+            throw IllegalStateException("通道执行失败：${output.trim()}")
         }
-        return stripEcho(command, raw.toString())
+        return output
     }
 
-    fun close() = Unit // each exec owns its own connection
-
-    private fun stripEcho(command: String, raw: String): String {
-        val commandLine = command.trim()
-        /* "bad token" is deliberately NOT filtered away: it is the server saying that the
-         * token we read does not belong to the instance currently holding the socket --
-         * exactly what happens while root services from earlier runs are still alive,
-         * each having re-created the socket and rewritten the token on its own onBind().
-         * Swallowing it made the chain see an empty result and hid the whole story. */
-        return raw.lineSequence()
-            .filterNot { it.trim() == commandLine }
-            .joinToString("\n")
-            .trim()
-    }
+    fun close() = Unit // the binder is owned by IsolatedRootShell, not by us
 
     companion object {
-        /** Pause after the token line, before the command (the wrapper sleeps 1s too). */
-        const val TOKEN_SETTLE_MS = 1_000L
-
-        /** Pause after the command, before `exit`, so the pty has time to print. */
-        const val COMMAND_SETTLE_MS = 2_000L
+        /** Marker the native side uses for "the command never ran" (spawn failure / timeout). */
+        const val EXEC_FAILED = "__GHOSTLOCK_EXEC_FAILED__"
     }
 }

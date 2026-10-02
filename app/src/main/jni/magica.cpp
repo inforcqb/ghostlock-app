@@ -607,6 +607,116 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused
  * .dynsym and ART would never call it -- the three registrations below would then
  * be missing and every native call would throw UnsatisfiedLinkError.
  */
+/*
+ * Run one short shell command in THIS process (uid 0) and return its combined output.
+ *
+ * This replaces the AF_UNIX socket + token channel as the command plane of the root service.
+ * The socket needed a filesystem path both sides could reach, and that turned out to be
+ * device-dependent (a missing/unwritable parent directory, an SELinux label the isolated domain
+ * may not touch, a token the other side cannot read). The app *already* holds a binder to this
+ * service -- that is how the service is started at all -- so the command plane rides the binder
+ * instead: no path, no token, no directory permissions.
+ *
+ * What stays the same is the important part: the command runs as this process's uid 0, with the
+ * same capabilities the isolated process has (CapEff=0x1c0), which is exactly the identity the
+ * chain's uid-0 steps used over the socket.
+ *
+ * `posix_spawn` (not fork/exec) on purpose: this runs on a binder thread of a multi-threaded
+ * process, where fork() would leave the child with a lock state it must not touch.
+ *
+ * A spawn failure or a timeout is reported *inside* the returned text as
+ * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so callers that parse output cannot mistake it for a
+ * command that ran and printed nothing.
+ */
+static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, jint timeout_ms) {
+    const char *cmd = env->GetStringUTFChars(command, nullptr);
+    if (cmd == nullptr) return nullptr;
+
+    int pipes[2] = {-1, -1};
+    if (pipe(pipes) != 0) {
+        char reason[128];
+        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: pipe: %s", strerror(errno));
+        env->ReleaseStringUTFChars(command, cmd);
+        return env->NewStringUTF(reason);
+    }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipes[0]);
+
+    const char *argv[] = {"sh", "-c", cmd, nullptr};
+    const char *envp[] = {
+            "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
+            "HOME=/",
+            nullptr,
+    };
+
+    pid_t pid = -1;
+    const int spawned = posix_spawn(&pid, "/system/bin/sh", &actions, nullptr,
+                                    (char *const *) argv, (char *const *) envp);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipes[1]);
+
+    std::string output;
+    bool timed_out = false;
+    if (spawned != 0) {
+        close(pipes[0]);
+        char reason[192];
+        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: posix_spawn(%d): %s",
+                 spawned, strerror(spawned));
+        output = reason;
+    } else {
+        const int budget = timeout_ms > 0 ? timeout_ms : 30000;
+        struct timespec started{};
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        const long long deadline =
+                (long long) started.tv_sec * 1000LL + started.tv_nsec / 1000000LL + budget;
+        for (;;) {
+            struct timespec now{};
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const long long now_ms = (long long) now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            if (now_ms >= deadline) {
+                timed_out = true;
+                break;
+            }
+            struct pollfd pfd = {pipes[0], POLLIN, 0};
+            const int ready = poll(&pfd, 1, 200);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ready == 0) continue;
+            char buffer[4096];
+            const ssize_t n = read(pipes[0], buffer, sizeof buffer);
+            if (n > 0) {
+                output.append(buffer, (size_t) n);
+            } else {
+                break; /* EOF: the child closed stdout/stderr (or died) */
+            }
+        }
+        close(pipes[0]);
+        if (timed_out) kill(pid, SIGKILL);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (timed_out) {
+            output += "\n__GHOSTLOCK_EXEC_FAILED__: timeout after ";
+            output += std::to_string(budget);
+            output += "ms";
+            LOGW("exec: timed out after %dms: %s", budget, cmd);
+        } else if (WIFEXITED(status)) {
+            LOGI("exec: exit=%d: %s", WEXITSTATUS(status), cmd);
+        } else {
+            LOGW("exec: killed by signal %d: %s", WIFSIGNALED(status) ? WTERMSIG(status) : -1, cmd);
+        }
+    }
+
+    env->ReleaseStringUTFChars(command, cmd);
+    return env->NewStringUTF(output.c_str());
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -623,15 +733,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
         return JNI_ERR;
     }
 
-    /* Fill the derived path strings for the default directory; the caller may replace it with
-     * `set_channel_dir` before the server starts. */
+    /* Kept for the (now unused) socket server below: its derived paths still have to exist as
+     * strings, otherwise the dead code would dereference null pointers if anyone re-enables it. */
     rsh_apply_dir();
 
     JNINativeMethod methods[] = {
             {"root",              "()Z", (void *) root},
             {"adb_root",          "()Z", (void *) adb_root},
-            {"start_shell_server", "()Z", (void *) start_shell_server},
-            {"set_channel_dir",   "(Ljava/lang/String;)Z", (void *) set_channel_dir},
+            /* The command plane: one shell command as uid 0, over the binder the caller already
+             * holds. The socket server (`start_shell_server`) is gone from the registrations --
+             * its AF_UNIX path + token turned out to be device-dependent. */
+            {"exec_shell",        "(Ljava/lang/String;I)Ljava/lang/String;", (void *) exec_shell},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");

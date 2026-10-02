@@ -1,4 +1,4 @@
-package com.ghostlock.app.data
+﻿package com.ghostlock.app.data
 
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.chain.DeviceSync
@@ -10,7 +10,6 @@ import com.ghostlock.app.wireless.WIRELESS_TAG
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.ChainSpec
 import com.ghostlock.app.chain.RootChain
-import com.ghostlock.app.root.ChannelPaths
 import com.ghostlock.app.root.IsolatedRootShell
 import com.ghostlock.app.root.RootChannel
 import android.annotation.SuppressLint
@@ -549,11 +548,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             onLog("[*] 用设备上的 ${ChainSpec.KSUD_FALLBACK}（内置 ksud 没能推送）")
             ChainSpec.KSUD_FALLBACK
         }
-        /* The uid-0 channel lives in the app's own data directory: the app process creates and
-         * chmods it here (it is the owner), because the isolated uid 0 cannot create a missing
-         * parent -- which is exactly what made `bind/listen` fail with /data/local/tmp. */
-        val channelDir = ChannelPaths.prepare(appContext, onLog)
-        val channel = RootChannel(channelDir)
+        /* The uid-0 command plane is the binder to the isolated root service -- the same binder
+         * that starts it. No socket, no token, no directory to prepare: `/data/local/tmp/gl-w1`
+         * needed hand-creation and the app-data-dir variant needed two chmods plus permissive
+         * SELinux, and neither worked on every device (the user's report). */
+        val channel = RootChannel { isolatedRootShell.serviceOrNull() }
         /* Steps 7-9 run on the bundled adb CLI against the root adbd: the app has no adb
          * client of its own any more (libadb, and with it the whole adb public-key story,
          * is gone -- the wireless pairing already authorized our key). */

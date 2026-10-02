@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Control plane of the isolated root service.
  *
  * Implementation: com.ghostlock.app.root.RootShellService (isolatedProcess=true,
@@ -9,7 +9,7 @@
  *
  * This interface is only the *control* plane (start / status / stop).  The command
  * plane is the uid-0 shell the service exposes over the shared UNIX socket
- * (/data/local/tmp/gl-w1/rshell.sock, token rshell.token), used by
+ * (that was an AF_UNIX socket + token; the command plane is [execShell] now), used by
  * com.ghostlock.app.root.RootChannel -- commands are a shell-level thing and do not
  * need an AIDL method each.
  *
@@ -28,13 +28,28 @@ interface IRootShellService {
     boolean ensureRoot() = 1;
 
     /**
-     * Publish the token (0644) and start the daemonised AF_UNIX shell server.
-     * Requires root() to have succeeded.
+     * Self-test of the command plane. Requires root() to have succeeded; returns true when a
+     * command really ran as uid 0 through [execShell].
      */
     boolean startChannel() = 2;
 
     /** ensureRoot() + the adbd root patch (blocking, up to 15 s).  Off the main thread. */
     boolean adbRoot() = 3;
+
+    /**
+     * Run one short shell command **in this uid-0 process** and return its combined output.
+     *
+     * This is the command plane the chain uses from the uid-0 channel step on. It used to be an
+     * AF_UNIX socket plus a token file, which needs a filesystem path both sides can reach --
+     * and that turned out to be device-dependent (missing parent directory, SELinux label,
+     * token permissions on some builds). The caller already holds this binder, so the commands
+     * ride it instead: no path, no token, no directory to prepare.
+     *
+     * A spawn failure or a timeout is reported inside the returned text as
+     * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so a caller that parses output cannot mistake it
+     * for a command that ran and printed nothing.
+     */
+    String execShell(String command, int timeoutMs) = 4;
 
     /** Ask the service to stop itself. */
     void destroy() = 16777114;

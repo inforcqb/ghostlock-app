@@ -46,17 +46,16 @@ internal const val ROOT_LOG_TAG = "GhostlockRoot"
  *
  * ## What it does and does not do
  *
- * * `onBind` runs `root()` and then `start_shell_server()` (that order is
- *   upstream's, and it is required: the server refuses to start unless it is
- *   already uid 0).
- * * The server it starts is an AF_UNIX socket + token under
- *   [ChannelPaths] (inside the app's own data directory); the app talks to it through
- *   [RootChannel].  Not a single IP socket is opened here -- an isolated process
+ * * `onBind` runs `root()` (the escalation `root()` requires, and it must succeed before any
+ *   command can run as uid 0).
+ * * The command plane is the **binder**: [IRootShellService.execShell] runs one short shell
+ *   command in this process and returns its combined output, so the app needs neither a shared
+ *   directory nor a token.  Not a single IP socket is opened here -- an isolated process
  *   has no AF_INET.
  * * `adb_root()` (the adbd patch) is **not** called on bind: it blocks up to 15 s
  *   and it restarts adbd, so it is only reachable through the AIDL method below.
  * * The libsu-based `RemoteProcess*` plumbing of upstream is deliberately NOT
- *   ported: the command plane is the UNIX socket.
+ *   ported: the command plane is the binder.
  *
  * ## Calling convention
  *
@@ -84,20 +83,22 @@ class RootShellService : Service() {
         override fun ensureRoot(): Boolean = root()
 
         /**
-         * Tell the native server where to listen, then start it.
-         *
-         * The directory is prepared by the app process (see [ChannelPaths.prepare]): this
-         * process is uid 0 **without capabilities**, so it cannot create or chmod a directory
-         * itself -- and the old shared path `/data/local/tmp/gl-w1` had to be created by hand,
-         * which is exactly how `bind/listen failed` happened.
+         * Self-test: the command plane is the binder itself now, so "is the channel up?" means
+         * "does a command really run as uid 0 through it?" -- a stronger statement than the old
+         * "the socket exists" check, and it needs no filesystem at all.
          */
         override fun startChannel(): Boolean {
-            val dir = ChannelPaths.dir(this@RootShellService).absolutePath
-            Log.i(TAG, "startChannel: channel dir $dir (set_channel_dir -> ${set_channel_dir(dir)})")
-            return start_shell_server()
+            val identity = runCatching { execShell("id", 15_000) }.getOrDefault("")
+            val rooted = identity.contains("uid=0")
+            Log.i(TAG, "startChannel: identity=${identity.trim()} -> $rooted")
+            return rooted
         }
 
         override fun adbRoot(): Boolean = root() && adb_root()
+
+        /** The chain's command plane from the uid-0 channel step on; see the AIDL doc. */
+        override fun execShell(command: String, timeoutMs: Int): String =
+            exec_shell(command, timeoutMs) ?: ""
 
         override fun destroy() {
             Log.i(TAG, "destroy() requested by the caller")
@@ -111,23 +112,16 @@ class RootShellService : Service() {
     }
 
     /**
-     * `root()` first, `start_shell_server()` second, upstream's order: the shell
-     * server is the point of this service, and it requires uid 0.
+     * `root()` first: it is what makes this process uid 0, and every command the caller sends
+     * runs with that identity.
      *
      * The binder is returned even when `root()` fails: the caller can then ask
-     * [IRootShellService.ensureRoot] / [IRootShellService.startChannel] what
-     * actually happened instead of getting a null binder with no explanation.
+     * [IRootShellService.ensureRoot] / [IRootShellService.startChannel] what actually happened
+     * instead of getting a null binder with no explanation.
      */
     override fun onBind(intent: Intent?): IBinder {
         val rooted = root()
         Log.i(TAG, "root() -> $rooted (uid=${Process.myUid()} pid=${Process.myPid()})")
-        val dir = ChannelPaths.dir(this).absolutePath
-        set_channel_dir(dir)
-        if (start_shell_server()) {
-            Log.i(TAG, "root shell server: ${ChannelPaths.socket(dir)} (token ${ChannelPaths.token(dir)})")
-        } else {
-            Log.w(TAG, "root shell server: not started")
-        }
         return binder
     }
 
@@ -137,26 +131,27 @@ class RootShellService : Service() {
     }
 
     /*
-     * The three native registrations of upstream MagicaService, kept by name and
-     * signature: JNI_OnLoad in app/src/main/jni/magica.cpp does
+     * The native registrations, kept by name and signature: JNI_OnLoad in
+     * app/src/main/jni/magica.cpp does
      *
      *     FindClass("com/ghostlock/app/root/RootShellService")
-     *     RegisterNatives({ "root", "adb_root", "start_shell_server", "set_channel_dir" } ...)
+     *     RegisterNatives({ "root", "adb_root", "exec_shell" } ...)
      *
      * so this class must not be renamed or obfuscated (see app/proguard-rules.pro)
      * and these names must not change.  They are *instance* methods here (not
      * `@JvmStatic` members of a companion object) on purpose: the JNI lookup key is
      * the plain JVM method name, and an instance method cannot be confused with the
      * companion's static bridge.
+     *
+     * The old socket server (`start_shell_server` / `set_channel_dir`) is no longer
+     * registered: the command plane is the binder now (see [IRootShellService.execShell]).
      */
     private external fun root(): Boolean
 
     private external fun adb_root(): Boolean
 
-    private external fun start_shell_server(): Boolean
-
-    /** Where the native server listens; see [ChannelPaths] for why it is not /data/local/tmp. */
-    private external fun set_channel_dir(dir: String): Boolean
+    /** One shell command as uid 0; the JNI side captures its combined output. */
+    private external fun exec_shell(command: String, timeoutMs: Int): String?
 
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */
