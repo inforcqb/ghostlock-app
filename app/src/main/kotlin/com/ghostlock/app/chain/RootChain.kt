@@ -3,6 +3,7 @@ package com.ghostlock.app.chain
 import com.ghostlock.app.domain.model.ChainPhase
 import com.ghostlock.app.root.RootChannel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -88,23 +89,18 @@ object ChainSpec {
      * was delivered), and running a privileged step twice is worse than stopping.
      * Everything else is repeatable -- `rm -f`, `echo`, `test`, the reads -- because the
      * sentinel means the command never ran.
-     *
-     * The two adbd-gate writes are deliberately absent: they are channel *actions* now
-     * ([chanSetProp]), and that path has no retry to guard against in the first place.
      */
     val NON_IDEMPOTENT = listOf(
         AM_HANG,
         RMMOD_GUARD,
         KSUD_LATE_LOAD,
+        ADBD_SET_TCP_PORT,
+        USBD_RESTART_ADBD,
         W1_START_MARK,
     )
 
-    /**
-     * step 4: open the channel and check who we are.
-     *
-     * There is no command string for this any more -- the identity is read inside the service
-     * process ([RootChannel.identity]), so there is nothing to spawn and nothing to parse.
-     */
+    /** step 4: open the channel and check who we are */
+    const val CHANNEL_PROBE = "id"
 
     /**
      * The fool-proof probe of step 0: does `su` already hand out root?
@@ -211,21 +207,11 @@ object ChainSpec {
     /** W1 parks a forged waiter and waits for the engine's marker; give it real headroom. */
     const val W1_TIMEOUT_MS = 240_000L
 
-    /**
-     * step 5: `service.adb.tcp.port` is `adbd_config_prop` -- only the adbd domain may set it, so
-     * the write borrows that domain (`setcon`, i.e. what `runcon u:r:adbd:s0` did).
-     */
-    const val ADBD_DOMAIN = "u:r:adbd:s0"
+    /** step 5: `service.adb.tcp.port` is `adbd_config_prop` -- only the adbd domain may set it */
+    const val ADBD_SET_TCP_PORT = "runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555"
 
-    /** step 6: `ctl_adbd_prop` is granted to `usbd` alone (`plat_sepolicy.cil`). */
-    const val USBD_DOMAIN = "u:r:usbd:s0"
-
-    /** init's own control property for restarting a service, and the service it names. */
-    const val CTL_RESTART_PROP = "ctl.restart"
-    const val ADBD_SERVICE = "adbd"
-
-    /** How long the gate is given to start listening before `adb connect` takes over. */
-    const val GATE_WAIT_MS = 60_000L
+    /** step 6: `ctl_adbd_prop` is granted to `usbd` alone (`plat_sepolicy.cil`) */
+    const val USBD_RESTART_ADBD = "runcon u:r:usbd:s0 setprop ctl.restart adbd"
 
     /** step 8: the first of the two things this chain actually exists for */
     const val RMMOD_GUARD = "rmmod oplus_security_guard"
@@ -320,6 +306,7 @@ object ChainSpec {
      * decide anything.
      */
     const val BOOT_FACTS_ATTEMPTS = 6
+    const val READ_LISTEN = "ss -lnt"
     const val READ_MODULES = "cat /proc/modules"
     const val READ_IDENTITY = "id"
     const val READ_CAPS = "cat /proc/self/status"
@@ -487,40 +474,31 @@ class RootChain(
      * The Shizuku user service prints the command it is about to run through the same
      * callback as the real output, so anything that parses the text must look at the
      * value, not at the beginning of the buffer: comparing the raw output with "0"
-     * meant the W1 step never noticed that SELinux had turned permissive. The user service's
-     * exec filters the echo now, and this keeps the checks robust to any future prefix.
+     * meant the W1 step never noticed that SELinux had turned permissive. [execShell]
+     * now filters the echo, and this keeps the checks robust to any future prefix.
      */
     private fun lastLineOf(output: String): String =
         output.trim().lines().lastOrNull { it.isNotBlank() }?.trim().orEmpty()
 
-    /*
-     * The uid-0 channel, from step 3 on: three typed actions, not shell commands.
+    /**
+     * Run one command in the uid-0 channel, from step 3 on.
      *
-     * Transport is this app's binder to its own isolated root service ([RootChannel]), NOT the
-     * device-side `rshell` wrapper and NOT Shizuku: uid 2000 exists only to start W1.
-     * Restarting adbd (step 6) kills every shell-uid process -- including Shizuku's server and
-     * user services -- so everything after that point comes from this app, over the channel the
-     * isolated uid-0 process serves.
+     * Transport is this app's binder to its own isolated root service ([RootChannel]), NOT
+     * the device-side `rshell` wrapper and NOT Shizuku: uid 2000 exists only to start W1.
+     * Restarting adbd (`runcon u:r:usbd:s0 setprop ctl.restart adbd`, step 6) kills every
+     * shell-uid process -- including Shizuku's server and user services -- so every command
+     * after that point must come from this app, over the channel that the isolated uid-0
+     * process serves.  The service forks and execs the command with `execve` (no shell
+     * startup file, no JVM), so the child is a plain uid-0 process.
      *
-     * Why actions and not command strings: the far side is a capless uid 0 that cannot spawn a
-     * shell with its own identity (the platform drops a spawned child to the app uid -- measured
-     * on this handset) and can be frozen by the cached-app freezer. A string that has to be
-     * parsed and executed is exactly the part that behaves differently per device; each action
-     * below is a syscall, or one property write, inside the isolated process itself.
+     * COMMANDS, not in-process calls -- measured, see docs/analysis/uid0-command-plane.md.
+     * The two `runcon` steps need a process of their own: property_service authorises a
+     * write against the *process* context of the caller, so a domain borrowed inside this
+     * service would not be what it checks.
      */
-
-    /** uid 0 + SELinux context of the service process (step 4's identity check). */
-    private suspend fun chanIdentity(): String = withContext(Dispatchers.IO) {
-        channel.identity()
+    private suspend fun chan(command: String): String = withContext(Dispatchers.IO) {
+        channel.exec(command, timeoutMs = 60_000)
     }
-
-    /** `runcon <domain> setprop <name> <value>`, executed in the service process. */
-    private suspend fun chanSetProp(domain: String, name: String, value: String): String =
-        withContext(Dispatchers.IO) { channel.setPropInDomain(domain, name, value) }
-
-    /** Does the kernel report a LISTEN on `port`?  See [RootChannel.PortProbe]. */
-    private suspend fun chanWaitPort(port: Int, timeoutMs: Long): RootChannel.PortProbe =
-        withContext(Dispatchers.IO) { channel.waitForPort(port, timeoutMs.toInt()) }
 
     private suspend fun step(
         step: ChainStep,
@@ -691,11 +669,12 @@ class RootChain(
      * The step used to wait for `ls -l rshell.sock` to show the file, which a *stale*
      * socket from an earlier boot satisfies -- that is exactly how a run walked past a
      * root service that had never started, and died on the first connect with
-     * `Connection refused`. The probe is the identity read instead: only a live service
-     * running as uid 0 can answer it, and there is no file to be stale.
+     * `Connection refused`.  The probe is an identity read through the binder instead:
+     * only a live service running as uid 0 can answer it, and there is no file to be
+     * stale.
      */
     private suspend fun probeChannel(): String = try {
-        val identity = chanIdentity().trim()
+        val identity = chan(ChainSpec.CHANNEL_PROBE).trim()
         if (identity.contains("uid=0")) "connected" else "connected but identity=$identity"
     } catch (t: Throwable) {
         "not yet: ${t::class.simpleName}: ${t.message}"
@@ -919,10 +898,10 @@ class RootChain(
              * self-test (startChannel() == true, i.e. the service answered with a uid-0
              * identity), so a probe of our own must not hold the chain hostage -- an earlier
              * version of this step burned minutes waiting for a transport the chain does not
-             * use. Read the identity once for the log, check it, and move on to the adb
-             * gate. */
+             * use anyway. Read the identity once for the log, check it, then move on to the
+             * adb gate. */
             onLog("[*] 通道自检（一次性）：${probeChannel()}")
-            val identity = chanIdentity()
+            val identity = chan(ChainSpec.CHANNEL_PROBE)
             onLog("[*] channel identity: ${identity.trim()}")
             if (!identity.contains("uid=0")) throw IllegalStateException("channel is not uid 0")
             if (identity.contains("uid=0") && !identity.contains("isolated_app")) {
@@ -949,29 +928,54 @@ class RootChain(
          */
         ok = step(ChainStep.PRIV_ENV, "adb 门 → 5555 → rmmod → 管理端 → selinux 修复 → 属性恢复") {
             // (1) open the adb gate (domain borrows; permissive only) -------------
-            /* These two lines are the whole of
-             *     runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555
-             *     runcon u:r:usbd:s0 setprop ctl.restart adbd
-             * done inside the uid-0 service process: `setcon` to the borrowed domain, one
-             * property write through property_service (the only client init listens to, and
-             * the reason a `ctl.*` write takes effect at all), and back.  A failure here
-             * throws: without the gate there is no root adbd, and the step would otherwise
-             * spend its time in the connect rounds below. */
-            chanSetProp(ChainSpec.ADBD_DOMAIN, ChainSpec.ADB_TCP_PORT_PROP, "${ChainSpec.ADB_PORT}")
-                .let { onLog("[*] ${ChainSpec.ADBD_DOMAIN} → ${ChainSpec.ADB_TCP_PORT_PROP}=${ChainSpec.ADB_PORT}：${it.trim()}") }
-            chanSetProp(ChainSpec.USBD_DOMAIN, ChainSpec.CTL_RESTART_PROP, ChainSpec.ADBD_SERVICE)
-                .let { onLog("[*] ${ChainSpec.USBD_DOMAIN} → ${ChainSpec.CTL_RESTART_PROP}=${ChainSpec.ADBD_SERVICE}：${it.trim()}") }
-            /* Is adbd listening by now?  The answer comes from inside the isolated process,
-             * which cannot open an IP socket and reads its own /proc/net table -- so a
-             * negative or unreadable answer is *logged*, never fatal.  The authority is
-             * `adb connect` below: it runs in the app process, and it retries
-             * ROOT_CONNECT_ROUNDS times.  A positive answer is real evidence and ends the
-             * wait immediately. */
-            val gate = chanWaitPort(ChainSpec.ADB_PORT, ChainSpec.GATE_WAIT_MS)
-            when (gate.listening) {
-                true -> onLog("[+] adbd 已在 ${ChainSpec.ADB_PORT} 上监听（${gate.detail}）")
-                false -> onLog("[!] 内核监听表里没有 ${ChainSpec.ADB_PORT}（${gate.detail}）⇒ 由 adb connect 判定")
-                null -> onLog("[!] 隔离进程读不到内核监听表（${gate.detail}）⇒ 由 adb connect 判定")
+            /*
+             * The adbd gate, and why it is a *command* rather than an in-process call
+             * (measured on the PJA110, 2026-10-02 -- docs/analysis/uid0-command-plane.md):
+             *
+             * property_service authorises a property write against the *process* context of
+             * the caller, i.e. /proc/<tgid>/attr/current.  A domain borrowed inside a
+             * running service therefore cannot be what it checks, and even borrowing it is
+             * refused: writing /proc/self/attr/current from a non-leader thread (the binder
+             * thread this AIDL call lands on) returns EACCES, because /proc/self resolves to
+             * the thread-group leader and a task may only write its own attributes.
+             * `runcon` + exec in a child process gives that child its own adbd/usbd context,
+             * which is exactly what the policy check wants -- and it is what the verified
+             * runbook ran all along.
+             */
+            chan(ChainSpec.ADBD_SET_TCP_PORT).let {
+                onLog("[*] adbd domain: ${ChainSpec.ADBD_SET_TCP_PORT}")
+                if (it.contains("Failed to set property")) {
+                    throw IllegalStateException(
+                        "property_service 拒了 ${ChainSpec.ADB_TCP_PORT_PROP}（域没借到？" +
+                            "SELinux 不再 permissive？）：$it",
+                    )
+                }
+            }
+            chan(ChainSpec.USBD_RESTART_ADBD).let {
+                onLog("[*] usbd domain: ${ChainSpec.USBD_RESTART_ADBD}")
+            }
+            /* The listener poll is advisory.  `ss -lnt` runs as a child of the isolated
+             * process, and whether that child's /proc/net view is the one adbd listens in is
+             * not something this app can guarantee -- while the *authority* is `adb connect`
+             * a few lines below, which runs in the app process and retries
+             * ROOT_CONNECT_ROUNDS times.  So a poll that cannot confirm the listener is
+             * logged, not fatal; a poll that can confirm it ends the wait immediately. */
+            try {
+                await(
+                    "adbd listening on ${ChainSpec.ADB_PORT}",
+                    timeoutMs = 60_000L,
+                    /* Through the channel, not the shell uid: the setprop above just restarted
+                     * adbd, which takes the whole shell uid with it. The uid-0 channel is
+                     * unaffected. */
+                    read = { chan(ChainSpec.READ_LISTEN) },
+                    check = { it.contains(":${ChainSpec.ADB_PORT}") },
+                )
+                onLog("[+] adbd 已在 ${ChainSpec.ADB_PORT} 上监听")
+            } catch (timeout: TimeoutCancellationException) {
+                onLog(
+                    "[!] 隔离进程 60s 内没读到 ${ChainSpec.ADB_PORT} 的监听（${timeout.message}）" +
+                        " ⇒ 由 adb connect 判定",
+                )
             }
 
             // (2) the app becomes an adb client ----------------------------------

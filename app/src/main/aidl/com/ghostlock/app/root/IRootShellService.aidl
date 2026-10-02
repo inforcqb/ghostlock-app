@@ -7,13 +7,13 @@
  * which is what Magica's activity did; a plain bindService() would not put the
  * service into an isolated process.
  *
- * This interface is the *control* plane (start / status / stop) plus the three privileged
- * actions of the chain's 「提权环境恢复」 phase -- identity, setprop-in-a-borrowed-domain,
- * listener probe -- used by com.ghostlock.app.root.RootChannel.  There is no shell and no
- * command string on the wire: an action that needs a new capability gets a method here and
- * an implementation in `app/src/main/jni/magica.cpp`.
+ * This interface is the *control* plane (start / status / stop) plus the command plane,
+ * [execShell], which runs one short command as uid 0 inside the isolated process.  The
+ * commands themselves are the chain's business (com.ghostlock.app.root.RootChannel) and
+ * do not get an AIDL method each -- and the two `runcon` steps *have* to be commands:
+ * see the note on [execShell].
  *
- * Method ids: 1..6 are ours; 16777114 (0xFFFFAA) is the transaction id Shizuku
+ * Method ids: 1..4 are ours; 16777114 (0xFFFFAA) is the transaction id Shizuku
  * reserves for destroy() in its own AIDL files, and the host's existing
  * IGhostlockUserService.aidl follows the same convention.
  *
@@ -28,66 +28,46 @@ interface IRootShellService {
     boolean ensureRoot() = 1;
 
     /**
-     * Self-test of the command plane. Requires root() to have succeeded; returns true when
-     * [channelIdentity] really reports uid 0.
+     * Self-test of the command plane. Requires root() to have succeeded; returns true when a
+     * command really ran as uid 0 through [execShell].
      */
     boolean startChannel() = 2;
 
     /** ensureRoot() + the adbd root patch (blocking, up to 15 s).  Off the main thread. */
     boolean adbRoot() = 3;
 
-    /*
-     * The command plane, action by action.
+    /**
+     * Run one short shell command **in this uid-0 process** and return its combined output.
      *
-     * It used to be one shell string per call (`execShell`) over this same binder, and before
-     * that an AF_UNIX socket plus a token file.  Both are gone: the socket needed a filesystem
-     * path both sides could reach (device-dependent -- a missing parent directory, an SELinux
-     * label, a token the other side cannot read), and a shell string has to be parsed and
-     * executed by a capless uid 0 that cannot spawn a child with its own identity (Android
-     * drops a spawned child to the app uid -- measured on the PJA110) and can be frozen by the
-     * cached-app freezer.  Each action below is a syscall or one property write inside the
-     * isolated process itself, so nothing is left to spawn, parse or freeze.
+     * This is the command plane the chain uses from the uid-0 channel step on. It used to be an
+     * AF_UNIX socket plus a token file, which needs a filesystem path both sides can reach --
+     * and that turned out to be device-dependent (missing parent directory, SELinux label,
+     * token permissions on some builds). The caller already holds this binder, so the commands
+     * ride it instead: no path, no token, no directory to prepare.
      *
-     * A failure that means "the action never ran" is reported inside the returned text as
+     * A spawn failure or a timeout is reported inside the returned text as
      * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so a caller that parses output cannot mistake it
-     * for an action that ran and printed nothing.
-     */
-
-    /**
-     * Who the isolated process is: uid 0 and its SELinux context, in the shape `id` prints.
+     * for a command that ran and printed nothing.
      *
-     * This is the chain's step-4 identity check, read from this process instead of from a
-     * spawned `sh -c id`.
-     */
-    String channelIdentity() = 4;
-
-    /**
-     * `runcon <domain> setprop <name> <value>`, in-process: `setcon` (i.e. writing
-     * /proc/self/attr/current), the property write, and the switch back to this process's own
-     * domain.  The domain borrow is the point: `service.adb.tcp.port` is `adbd_config_prop`
-     * and `ctl.restart` is `ctl_adbd_prop`, so the adbd gate can only be opened from the
-     * `adbd` / `usbd` domain.
+     * ## Why the command plane is a command string and not typed native actions
      *
-     * The write goes through **property_service** (the platform client), never through the
-     * vendored property client this library also links: the vendored one writes the property
-     * area directly and init never hears about it, which is measurably why `ctl.restart adbd`
-     * used to do nothing at all.
-     */
-    String setPropInDomain(String domain, String name, String value) = 5;
-
-    /**
-     * Wait until the kernel reports a LISTEN socket on `port`, then answer.
+     * Measured on the PJA110 (2026-10-02, see docs/analysis/uid0-command-plane.md): the two
+     * `runcon <domain> setprop ...` steps CANNOT be done inside this process.
      *
-     * This is the `ss -lnt | grep :5555` of the original chain, without the shell and without
-     * a socket of our own: an isolated process may not create an IP socket at all, so the
-     * answer comes from reading /proc/net/tcp{,6}.
+     *  * property_service authorises a property write against the caller's **process**
+     *    context (/proc/<tgid>/attr/current), so a domain borrowed inside a running service
+     *    is not what init's check sees, no matter how the borrow is done;
+     *  * and borrowing it there fails outright anyway: `setcon` from a binder thread returns
+     *    EACCES, because /proc/self resolves to the thread-group leader and a task may only
+     *    write its own attributes.
      *
-     * The answer is text on purpose, because there are three of them and only two are about
-     * adbd: "listening: …", "not-listening: …" (the tables were read and hold no such entry)
-     * and "unreadable: …" (they could not be read from here).  "I cannot see it" is not the
-     * same statement as "it is not there", and the caller decides.
+     * A child process (`fork` + `execve` of `sh -c`, exactly one command) gets its own
+     * context, which is what the policy wants -- and it is the shape the verified runbook
+     * used.  The child inherits this process's uid 0 and capabilities; the JVM never gets
+     * involved, so nothing drops to the app uid (that is a `Runtime.exec` problem, not a
+     * `fork` one).
      */
-    String waitForPort(int port, int timeoutMs) = 6;
+    String execShell(String command, int timeoutMs) = 4;
 
     /** Ask the service to stop itself. */
     void destroy() = 16777114;

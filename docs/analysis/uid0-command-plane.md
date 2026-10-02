@@ -1,128 +1,81 @@
-# uid-0 命令平面：三个原生动作（2026-10-02）
+# uid-0 命令平面：为什么是命令（2026-10-02 实测）
 
 链在 Magica 步骤之后要做的事，全部发生在**我们自己的隔离 uid-0 进程**里：它 `CapEff=0x1c0`、
-`CapBnd=0`（没有 `CAP_DAC_OVERRIDE`），SELinux 当时是 permissive，所以它能 `setresuid(0)`、
-能读 `/proc/self/attr/current`，但没有能力去"随便"操作别的 uid 的文件。
+`CapBnd=0`（没有 `CAP_DAC_OVERRIDE`），SELinux 当时是 permissive。
 
-这份文档记的是**命令怎么送进去**，以及为什么它换过三次形状。
+**结论（先写在这里）**：命令平面就是**一条命令字符串**，由隔离进程 `fork` + `execve` 一个
+`/system/bin/sh -c` 去跑。**不做进程内原生动作**——不是保守，是实测证明做不到（下一节）。
+所以 AIDL 上只有 `String execShell(String command, int timeoutMs)`，链侧只有 `chan(command)`。
 
-## 1. 现在的形状
+## 1. 现场证据
 
-| AIDL（`IRootShellService`） | 原生（`app/src/main/jni/magica.cpp`） | 它替代的原命令 |
-|---|---|---|
-| `channelIdentity() = 4` | `channel_identity` | `id` |
-| `setPropInDomain(domain, name, value) = 5` | `channel_set_prop` | `runcon <domain> setprop <name> <value>` |
-| `waitForPort(port, timeoutMs) = 6` | `channel_wait_port` | `ss -lnt \| grep :<port>` |
-
-调用方是 `RootChannel`（binder 薄客户端）→ `RootChain.chanIdentity / chanSetProp / chanWaitPort`。
-三个动作**都是原生实现、都在服务进程内执行**：没有 `fork`，没有 `execve`，没有管道，没有命令字符串。
-
-`setPropInDomain` 内部就是 `setcon(<domain>)` → `property_set(name, value)` → `setcon(切回)`，
-即 `runcon` 子进程做的事，只是不再需要那个子进程。域借用本身必须保留：
-`service.adb.tcp.port` 的标签是 `adbd_config_prop`，`ctl.restart` 是 `ctl_adbd_prop`。
-
-## 2. 为什么不是 socket，也不是 shell 字符串
-
-两次被真机否掉，都是有记录的事实，不是我推断的：
-
-* **AF_UNIX socket + token**（第一版）：需要"两边都能到达的文件系统路径"。部分设备上父目录
-  不存在、隔离域动不了那个 SELinux 标签、或 token 另一侧读不到 ⇒ `bind/listen failed`。
-  换到 app 数据目录要两次 chmod + permissive，仍然脆（`.sock` 在一些设备上就是不工作）。
-* **shell 字符串走 binder**（第二版，`execShell`）：看起来等价，实际不等价——
-  * 隔离进程的 `ProcessBuilder` 子进程**会掉到 app uid**（真机实测：隔离进程自己是 uid 0，
-    子进程 `id` 打印 `uid=90000(u0_i0)`）⇒ `sh -c runcon …` 里的 `runcon` 根本没以 uid 0 跑；
-  * 缓存的进程会被 freezer 冻住，冻住时"发命令"这件事本身就没有意义；
-  * 命令字符串还得在对面再解析一遍，等于把同一件事做两次。
-
-## 3. ★ `setcon` 之后，属性写必须走 property_service
-
-这是本轮最要紧的一条，也是链里唯一"静默失效"过的环节。
-
-`magica.cpp` 包含 `<api/system_properties.h>`，而那个头文件包含 `hacks.h`，里面写着：
-
-```c
-#pragma redefine_extname __system_property_set __system_property_set2
-```
-
-后果：**这个编译单元里所有 `__system_property_set` 引用都被改名**，绑到 vendored 的 AOSP
-libcutils 客户端上——它直接写属性区（shmem），**从不通知 property_service**。
-而 `ctl.*` 是**由 init 处理的控制消息**，不经过 property_service 就等于没发生。
-
-这正是 `adb_root()` 里那条注释的由来（"ctl.restart does not fire on this handset: measured
-twice… while adbd kept its pid"），也是它后面要补 `pkill -9 adbd` 的原因。
-
-所以 `channel_set_prop_in_domain` 用 `platform_property_set()` 从 **libc 自己的符号表**取平台客户端
-（`dlopen("libc.so")` + `dlsym`），**并且刻意不设回退**：回退到 vendored 客户端就是复现那个静默 no-op，
-宁可让这一步直接报错。符号在**域切换之前**解析（`dlopen`/`dlsym` 是 loader 的活，不该在借来的域里做）。
-
-写完之后用同一个平台客户端**读回**并打进日志（`read-back="…"`）。读回**只记录、不判定**：
-`ctl.*` 是控制消息，可以不落进属性区，所以"读回为空"不是失败；对 `service.adb.tcp.port`
-这类真属性，读回值就是 property_service 收下的值。
-
-## 4. 监听探测为什么返回三种答案
-
-隔离进程**没有 IP socket**（真机实测：`socket(AF_INET)` 返回 -1，同时 Seccomp 显示 mode 2 / 3 filters；
-文件顶部那句 "No TCP code may be added to this file" 就是这条测量事实）。所以
-`connect(127.0.0.1:5555)` 这种探针**不可用**，只能用读内核表的方式，即
-`/proc/net/tcp` + `/proc/net/tcp6` 里找 `st == 0A`（LISTEN）且端口匹配的条目——
-`ss -lnt` 打印的就是同一张表。
-
-答案故意是**字符串**而不是布尔，因为有三种，而只有两种跟 adbd 有关：
-
-| 返回 | 含义 | 链的反应 |
-|---|---|---|
-| `listening: …` | 表里有 LISTEN | 立刻结束等待，算证据 |
-| `not-listening: …` | 表读到了，没有该端口 | 只记日志，交给 `adb connect` |
-| `unreadable: …` | 表根本读不到（errno 附在文本里） | 只记日志，交给 `adb connect` |
-
-"我看不到"和"它不在"是两个不同的陈述，判定权交给 app 进程里的 `adb connect`
-（它在正常进程里，`ROOT_CONNECT_ROUNDS = 6` 轮重试）。
-
-## 5. 仍然留在 adb 侧的步骤
-
-`selinuxRepairCommands()`（`insmod kread_min.ko` / `sh fix-selinux.sh` / `rmmod kread_min`）、
-管理端安装、属性恢复（`ksud resetprop …` / `suid_dumpable`）、`ksud late-load` 都还在 adb 侧：
-那时链已经持有 root adbd（uid 0 + `CapEff 0x1ffffffffff`），这些活它做得比隔离进程干净，
-而且它们本来就是设备侧工具的职责。
-
-**一个已知的悬留项**：`RootShellService.adbRoot()`（移植自上游 Magica 的 adbd patch）内部用
-`system()` fork shell，并 `pkill -9 adbd`。链**不依赖**它的结果（门是用 `chanSetProp` 开的），
-但它每次 `IsolatedRootShell.launch()` 都会跑一遍，会在门的旁边额外杀一次 adbd。
-要不要删掉这个调用，等这一轮真机结果出来再定。
-
-## 6. 怎么读日志（`adb logcat -s GhostlockRoot`）
-
-原生侧：
+2026-10-02 那次运行，链走到「提权环境恢复」的第一步就失败，原生日志是：
 
 ```
-channel: __system_property_set resolved from libc at 0x…
-channel: setprop service.adb.tcp.port=5555 in u:r:adbd:s0 -> rc=0 read-back="5555"
-channel: setprop ctl.restart=adbd in u:r:usbd:s0 -> rc=0 read-back=""
-channel: wait_port 5555 -> listening: /proc/net/tcp{,6} holds a LISTEN on 5555
-channel identity: uid=0(root) gid=0(root) groups=0(root) context=u:r:isolated_app:s0
+channel: __system_property_set resolved from libc at 0x79af8b8cb8     ← 平台属性客户端拿到了（不是它的问题）
+channel: __system_property_get resolved from libc at 0x79af8b8b78
+channel: setcon(u:r:adbd:s0) failed (13: Permission denied)           ← 域根本没借到
+channel: setprop service.adb.tcp.port=5555 in u:r:adbd:s0 -> rc=-1 read-back=""
+[!] 提权环境恢复 failed: 通道执行失败：__GHOSTLOCK_EXEC_FAILED__: property_set(service.adb.tcp.port, 5555) rc=-1 in u:r:adbd:s0
 ```
 
-链侧（UI 日志同源）：
+同一台设备、同一次开机，用 adb（uid 2000，`u:r:shell:s0`）做对照实验：
 
-```
-[*] u:r:adbd:s0 → service.adb.tcp.port=5555：service.adb.tcp.port=5555 (in u:r:adbd:s0) read-back="5555"
-[*] u:r:usbd:s0 → ctl.restart=adbd：ctl.restart=adbd (in u:r:usbd:s0) read-back=""
-[+] adbd 已在 5555 上监听（listening: …）
-```
-
-失败形态对照：
-
-| 日志 | 含义 |
+| 实验 | 结果 |
 |---|---|
-| `__GHOSTLOCK_EXEC_FAILED__: libc's __system_property_set is not resolvable` | 拿不到平台客户端（不再回退，直接停） |
-| `__GHOSTLOCK_EXEC_FAILED__: property_set(…) rc=N in <domain>` | property_service 拒了这次写 |
-| `channel: setcon(<domain>) failed` | 域没借到（SELinux 不是 permissive？） |
-| `not-listening: …` / `unreadable: …` | 见 §4，判定权在 `adb connect` |
-| `通道自检 第 N/3 次：uid=0(root) … context=u:r:isolated_app:s0` | 通道自检通过的样子 |
+| `runcon u:r:adbd:s0 id` | `context=u:r:adbd:s0` ✓（exec 型域转换可用） |
+| `echo u:r:adbd:s0 > /proc/self/attr/current` 然后 `cat` | `u:r:adbd:s0` ✓（单线程 shell 里，setcon 也可用） |
+| `setprop service.adb.tcp.port 5555`（shell 域直接写） | `Failed to set property`，rc=1 ✗ |
+| `cat /sys/fs/selinux/enforce` | `0`（permissive） |
 
-## 7. 验证状态
+最后一行值得注意：**permissive 并没有让那次 `setprop` 通过**。属性写入的判定在本机确实会按
+调用方的上下文拒绝（是 property_service 的 MAC 检查，还是属性区/持有者检查，这次没有进一步区分）——
+"permissive 兜底"不能当作设计前提。
 
-* CI：构建 + release 通过（见提交 `3f25933`）。
-* 真机：**待跑**。要看的四条就是 §6 里的原生日志行——尤其是
-  `__system_property_set resolved from libc`（说明绕开了 vendored 客户端）和
-  `ctl.restart … rc=0` 之后 `adb connect 127.0.0.1:5555` 是否拿到 uid 0。
+## 2. 两个机制原因（都不依赖 SELinux 是否 permissive）
+
+**(a) `/proc/self` 指向线程组 leader。** 我们的服务是多线程的（binder 线程池），AIDL 调用落在非
+leader 线程上，而 `/proc/self/attr/current` 解析到的是**进程 leader** 的属性文件；内核只允许任务写
+**自己**的属性（`current != task` ⇒ 返回 **EACCES**）。观察到的 `13: Permission denied` 正好是这个，
+而且 logcat 里**没有 `avc: denied`** —— 它根本没走到 SELinux 判定。对照实验里单线程的 shell 能写成功，
+也印证了这一点。
+
+**(b) 就算切换成功也没用：property_service 看的是进程上下文。** 它取调用方的
+`/proc/<tgid>/attr/current` 做授权，即**线程组 leader 的标签**。在服务进程内部 `setcon`（哪怕成功）
+改的是某个线程的标签，init 侧检查的仍然会是 `isolated_app`。要让它看到 `adbd`/`usbd`，这个域必须属于
+**一个独立的进程** —— 也就是 `runcon` + exec 的子进程，这正是最初 runbook 里那条链的形状。
+
+## 3. 现在的形状
+
+| 步骤 | 命令（逐字） |
+|---|---|
+| step 4 通道自检 | `id` |
+| step 5 开 adb 门（域：adbd_config_prop） | `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555` |
+| step 6 重启 adbd（域：ctl_adbd_prop） | `runcon u:r:usbd:s0 setprop ctl.restart adbd` |
+| 等待监听 | `ss -lnt`（轮询，**判定权在 `adb connect`**） |
+
+执行方式：`RootChannel.exec(command, timeoutMs)` → binder → `RootShellService.execShell` →
+JNI `exec_shell`：`fork` + `execve("/system/bin/sh", ["sh","-c",cmd])`，stdin=/dev/null，
+stdout+stderr 走管道，带 deadline，超时 SIGKILL；spawn 失败/超时在返回文本里带
+`__GHOSTLOCK_EXEC_FAILED__: <reason>`，调用方不会误判成"跑了但没输出"。
+
+子进程继承本进程的 uid 0 与（0x1c0 的）capabilities。**JVM 的 `Runtime`/`ProcessBuilder` 会掉到
+app uid（实测 `uid=90000(u0_i0)`），但 `fork`+`execve` 不会** —— 这两件事经常被混为一谈。
+
+监听轮询是**建议性**的：`ss -lnt` 跑在隔离进程的子进程里，它的 `/proc/net` 视图未必是 adbd 所在的
+那个；真正的判定是紧接着的 `adb connect`（`ROOT_CONNECT_ROUNDS = 6` 轮）。所以轮询读不到只记日志，
+不再中止步骤。
+
+## 4. 被撤回的方案（留个记性）
+
+同一天早些时候试过把这些步骤做成 .so 里的原生动作（`channel_identity` /
+`channel_set_prop_in_domain`（`setcon` + 平台 `__system_property_set`）/ `channel_wait_port`
+（读 `/proc/net/tcp{,6}`）），想法是"没有 shell、没有 fork、没有可冻结的东西"。其中两条本身没问题
+（身份读取、监听表读取都工作），但**域借用那一步在架构上就不成立**（§2），而域借用正是这一步的全部意义。
+用户当天的指示是「命令能跑就用命令，而不用原生的」，方案据此撤回，代码回到 `4d0ab23` 的命令平面。
+
+顺带记下那条仍然有价值的发现：`magica.cpp` 包含 `<api/system_properties.h>`，它带进 `hacks.h` 的
+`#pragma redefine_extname __system_property_set __system_property_set2`，于是这个编译单元里所有
+`__system_property_set` **引用**都会绑到 vendored 客户端（直写属性区、不通知 property_service）——
+这就是 `adb_root()` 里 `ctl.restart` "成功但没反应"、要靠 `pkill` 兜底的原因。要从这里写属性，
+必须自己 `dlopen("libc.so")` + `dlsym` 取平台客户端；**但链本身不需要它**（链是命令，走 `setprop`）。

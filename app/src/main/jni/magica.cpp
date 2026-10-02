@@ -6,24 +6,17 @@
  * Source: the Magica fork at `.scratch/magica-upstream`, branch `v21-adbroot-fix`
  * (upstream Magica v2.1 is Unlicense / public domain; the delta that matters here
  * is in magica.cpp, MagicaService.java and MainActivity.java).  Only the three
- * capabilities below are ported on purpose, plus the channel actions further down;
- * the libsu-based RemoteProcess*, ParcelFileDescriptorUtil, MainActivity and the
- * `stub` module are NOT ported -- the host holds a binder to this service and calls
- * it directly (see `app/src/main/kotlin/com/ghostlock/app/root/RootChannel.kt`).
+ * capabilities below are ported on purpose; the libsu-based RemoteProcess*,
+ * ParcelFileDescriptorUtil, MainActivity and the `stub` module are NOT ported --
+ * the host talks to the shell channel over the UNIX socket directly (see
+ * `app/src/main/kotlin/com/ghostlock/app/root/RootChannel.kt`).
  *
  *   1. root()               -- setresuid/setresgid/setgroups to uid 0.
  *   2. adb_root()           -- su:s0 pre-check, /proc/sys/fs/suid_dumpable = 0,
  *                              resetprop ro.debuggable/ro.secure, `ctl.restart adbd`
  *                              through both __system_property_set and
  *                              /system/bin/setprop, pkill -9 adbd, bounded 15 s poll.
- *   3. channel_identity()   -- who this process is (uid 0 + its SELinux context).
- *   4. channel_set_prop_in_domain() -- `runcon <domain> setprop <n> <v>`, in-process.
- *   5. channel_wait_port()  -- is anything LISTENing on a port (read of /proc/net/tcp).
- *
- * 3-5 are the command plane: every step of the chain's "privileged environment" as a
- * syscall or one property write, in this process, with no shell and no fork.  The old
- * command plane was a daemonised AF_UNIX root shell (`start_shell_server()` below): it is
- * still compiled for reference but is no longer registered -- see JNI_OnLoad.
+ *   3. start_shell_server() -- daemonised AF_UNIX root shell at the shared path.
  *
  * ---------------------------------------------------------------------------
  * WHY THE ORDER OF LOADING IS LOAD-BEARING
@@ -73,10 +66,7 @@
  * bundled client got as far as writing the token, then socket(AF_INET) returned
  * -1, and nothing listened, while Seccomp showed mode 2 with 3 filters).  Unix
  * sockets are allowed there, and 0666 on the node is enough for adb shell to
- * connect without any chown.  No TCP code may be added to this file -- not even a
- * `connect()` probe: "is adbd listening on 5555?" is answered by reading the kernel's
- * own socket table, /proc/net/tcp{,6} (channel_wait_port below), which is the table
- * `ss -lnt` prints, without needing a socket at all.
+ * connect without any chown.  No TCP code may be added to this file.
  *
  * ---------------------------------------------------------------------------
  * LICENCES (see THIRD_PARTY_NOTICES.md in this directory for the full text)
@@ -98,13 +88,11 @@
 
 #include <jni.h>
 #include <errno.h>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pty.h>
 #include <stdarg.h>
 #include <stdlib.h>
-#include <string>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -613,289 +601,160 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused
 }
 
 /*
- * ---------------------------------------------------------------------------------------------
- * Built-in channel actions: the privileged environment, without a shell and without a fork.
- *
- * The chain used to send these as command *strings* over the uid-0 channel (`id`, and the two
- * `runcon <domain> setprop …` pairs plus an `ss -lnt` poll). Spawning `/system/bin/sh` from the
- * isolated process is what made the whole thing device-dependent: the process can be frozen by
- * the cached-app freezer, and a spawned child loses the escalation on some builds. None of it is
- * needed -- every one of those commands is a syscall or a property write, and this process is the
- * uid 0 one:
- *
- *  * `id`                     -> assembled from getuid/getgid plus /proc/self/attr/current,
- *  * `runcon <domain> setprop` -> `setcon` (via /proc/self/attr/current) around a plain
- *                                 `__system_property_set`, which is exactly what `runcon`
- *                                 + `setprop` do; the domain switch is the point and it stays,
- *  * `ss -lnt | grep <port>`   -> a read of /proc/net/tcp{,6}, looking for a LISTEN
- *                                 entry on the port.  A `connect()` probe is not an
- *                                 option here (see the AF_INET note at the top).
- *
- * `setcon` needs only `dyntransition`, which is granted while SELinux is permissive -- the same
- * precondition the `runcon` subprocess had (it is the reason the frozen chain borrows the
- * `adbd`/`usbd` domains at all: `service.adb.tcp.port` is `adbd_config_prop`, `ctl.restart` is
- * `ctl_adbd_prop`). Switching back is done immediately, so the process keeps its own domain.
- *
- * THE PROPERTY WRITE MUST NOT USE THE VENDORED CLIENT.  Including <api/system_properties.h>
- * activates `hacks.h`, which carries
- *
- *     #pragma redefine_extname __system_property_set __system_property_set2
- *
- * so every `__system_property_set` *reference* in this translation unit is renamed to the
- * VENDORED AOSP client, which writes the property area directly and never talks to
- * property_service.  That is measurably why `ctl.restart adbd` "succeeded" and adbd kept its
- * pid (see the note in adb_root() below, and why that function falls back to pkill).
- * `ctl.*` is handled by init, so the write has to go through property_service: the platform
- * client, fetched out of libc's own symbol table, is the one that does.  The value is read
- * back through the platform client as well and logged, because for a capless uid 0 in a
- * borrowed domain the interesting failure is a write that returns 0 and changes nothing.
- */
-static void channel_current_context(char *out, size_t cap) {
-    out[0] = '\0';
-    const int fd = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    const ssize_t n = read(fd, out, cap - 1);
-    close(fd);
-    if (n <= 0) {
-        out[0] = '\0';
-        return;
-    }
-    out[n] = '\0';
-    char *nl = strchr(out, '\n');
-    if (nl) *nl = '\0';
-}
-
-static bool channel_switch_context(const char *domain) {
-    const int fd = open("/proc/self/attr/current", O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-        LOGW("channel: cannot open attr/current (%d: %s)", errno, strerror(errno));
-        return false;
-    }
-    const ssize_t n = write(fd, domain, strlen(domain));
-    const int saved_errno = errno;
-    close(fd);
-    if (n != (ssize_t) strlen(domain)) {
-        LOGW("channel: setcon(%s) failed (%d: %s)", domain, saved_errno,
-             strerror(saved_errno));
-        return false;
-    }
-    return true;
-}
-
-/* 1) The identity the chain's self-test looks at, in the shape `id` prints. */
-static jstring channel_identity(JNIEnv *env, jobject thiz __unused) {
-    char context[256] = {};
-    channel_current_context(context, sizeof context);
-    char out[512];
-    snprintf(out, sizeof out,
-             "uid=%d(root) gid=%d(root) groups=%d(root) context=%s",
-             (int) getuid(), (int) getgid(), (int) getgid(),
-             context[0] ? context : "unknown");
-    LOGI("channel identity: %s", out);
-    return env->NewStringUTF(out);
-}
-
-/* ---------------------------------------------------------------------------------------------
- * The platform property client, fetched from libc by hand.
- *
- * See the note above the channel actions: this file's `__system_property_set` references are
- * renamed onto the VENDORED client by hacks.h, and the vendored client never talks to
- * property_service -- which is why `ctl.restart adbd` used to do nothing.  Going through libc's
- * own symbol table is the only way to reach the client init actually listens to.
- *
- * Resolved lazily, once, and always before a domain switch: dlopen/dlsym are loader work and
- * have no business happening in a borrowed SELinux domain.
- * ------------------------------------------------------------------------------------------- */
-typedef int (*property_set_fn)(const char *, const char *);
-typedef int (*property_get_fn)(const char *, char *);
-
-static void *platform_symbol(const char *name) {
-    void *libc = dlopen("libc.so", RTLD_NOW | RTLD_LOCAL);
-    if (libc == nullptr) {
-        LOGE("channel: dlopen(libc.so) failed: %s", dlerror());
-        return nullptr;
-    }
-    dlerror();
-    void *symbol = dlsym(libc, name);
-    const char *error = dlerror();
-    if (symbol == nullptr) {
-        LOGE("channel: dlsym(libc.so, %s) failed: %s", name, error ? error : "unknown error");
-    } else {
-        LOGI("channel: %s resolved from libc at %p", name, symbol);
-    }
-    return symbol;
-}
-
-static property_set_fn platform_property_set(void) {
-    static property_set_fn cached = (property_set_fn) platform_symbol("__system_property_set");
-    return cached;
-}
-
-static property_get_fn platform_property_get(void) {
-    static property_get_fn cached = (property_get_fn) platform_symbol("__system_property_get");
-    return cached;
-}
-
-/* 2) `runcon <domain> setprop <name> <value>`, in-process. */
-static jstring channel_set_prop_in_domain(JNIEnv *env, jobject thiz __unused,
-                                          jstring domain, jstring name, jstring value) {
-    const char *dom = env->GetStringUTFChars(domain, nullptr);
-    const char *prop = name ? env->GetStringUTFChars(name, nullptr) : nullptr;
-    const char *val = value ? env->GetStringUTFChars(value, nullptr) : nullptr;
-    char result[384];
-    if (dom == nullptr || prop == nullptr || val == nullptr) {
-        snprintf(result, sizeof result, "__GHOSTLOCK_EXEC_FAILED__: null argument");
-    } else {
-        /* Both symbols are resolved first, before the domain switch (see platform_symbol). */
-        const property_set_fn set_prop = platform_property_set();
-        const property_get_fn get_prop = platform_property_get();
-        if (set_prop == nullptr) {
-            /* Deliberately no fallback to the vendored client: it would write the property area
-             * and leave property_service (and therefore init, and therefore `ctl.*`) untouched,
-             * which is the silent no-op this whole path exists to avoid. */
-            snprintf(result, sizeof result,
-                     "__GHOSTLOCK_EXEC_FAILED__: libc's __system_property_set is not "
-                     "resolvable -- refusing the vendored client, which cannot reach "
-                     "property_service");
-        } else {
-            char saved[256] = {};
-            channel_current_context(saved, sizeof saved);
-            const bool switched = channel_switch_context(dom);
-            const int rc = set_prop(prop, val);
-            if (switched && saved[0] != '\0' && !channel_switch_context(saved)) {
-                LOGW("channel: could not switch back to %s (staying in %s)", saved, dom);
-            }
-            /* Informational only: `ctl.*` is a control message and need not be stored in the
-             * area, so a read-back mismatch is not a failure -- it is a log line.  For the
-             * real properties (`service.adb.tcp.port`) it is the value property_service kept. */
-            char read_back[128] = {};
-            if (get_prop != nullptr) get_prop(prop, read_back);
-            LOGI("channel: setprop %s=%s in %s -> rc=%d read-back=\"%s\"", prop, val, dom, rc,
-                 read_back);
-            if (rc != 0) {
-                snprintf(result, sizeof result,
-                         "__GHOSTLOCK_EXEC_FAILED__: property_set(%s, %s) rc=%d in %s", prop, val,
-                         rc, dom);
-            } else {
-                snprintf(result, sizeof result, "%s=%s (in %s) read-back=\"%s\"", prop, val, dom,
-                         read_back);
-            }
-        }
-    }
-    if (dom) env->ReleaseStringUTFChars(domain, dom);
-    if (prop) env->ReleaseStringUTFChars(name, prop);
-    if (val) env->ReleaseStringUTFChars(value, val);
-    return env->NewStringUTF(result);
-}
-
-/*
- * Is there a LISTEN socket on this port?  1 = yes, 0 = the tables were read and hold none,
- * -1 = the tables could not be read from here (`why` says why).
- *
- * The three answers are kept apart on purpose: "I cannot see it" is a different statement from
- * "it is not there", and the caller has to be able to decide which one it is looking at.
- */
-static int proc_net_listen_scan(int port, char *why, size_t why_cap) {
-    static const char *const tables[] = {"/proc/net/tcp", "/proc/net/tcp6"};
-    bool readable = false;
-    int first_errno = 0;
-    for (const char *table : tables) {
-        const int fd = open(table, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
-            if (first_errno == 0) first_errno = errno;
-            continue;
-        }
-        readable = true;
-        std::string text;
-        char buffer[4096];
-        for (;;) {
-            const ssize_t n = read(fd, buffer, sizeof buffer);
-            if (n > 0) {
-                text.append(buffer, (size_t) n);
-                continue;
-            }
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
-        close(fd);
-        size_t start = 0;
-        while (start < text.size()) {
-            size_t end = text.find('\n', start);
-            if (end == std::string::npos) end = text.size();
-            const std::string line = text.substr(start, end - start);
-            start = end + 1;
-            char local[80] = {};
-            char state[8] = {};
-            /* Columns: `sl local_address rem_address st …`; sl and rem_address are skipped.
-             * local_address is `<hex address>:<hex port>` and st == 0A is LISTEN. */
-            if (sscanf(line.c_str(), "%*s %79s %*s %7s", local, state) != 2) continue;
-            if (strcmp(state, "0A") != 0) continue;
-            const char *colon = strrchr(local, ':');
-            if (colon == nullptr) continue;
-            if ((int) strtol(colon + 1, nullptr, 16) == port) return 1;
-        }
-    }
-    if (!readable) {
-        snprintf(why, why_cap, "%s (%d)", strerror(first_errno), first_errno);
-        return -1;
-    }
-    why[0] = '\0';
-    return 0;
-}
-
-/*
- * 3) The `ss -lnt | grep <port>` replacement: wait until the kernel reports a LISTEN on the port.
- *
- * A `connect()` probe is not available to this process (AF_INET sockets fail here, see the note
- * at the top of the file), so this walks /proc/net/tcp and /proc/net/tcp6 -- the tables `ss`
- * itself prints -- looking for a LISTEN entry with that port.
- *
- * The answer is a *string* and not a boolean, because "not listening" and "cannot read the
- * table" lead to different decisions upstream: "listening: …", "not-listening: …",
- * "unreadable: …".
- */
-static jstring channel_wait_port(JNIEnv *env, jobject thiz __unused, jint port, jint timeout_ms) {
-    const long long budget = timeout_ms > 0 ? timeout_ms : 60'000;
-    struct timespec started{};
-    clock_gettime(CLOCK_MONOTONIC, &started);
-    const long long deadline =
-            (long long) started.tv_sec * 1000LL + started.tv_nsec / 1000000LL + budget;
-    char why[192] = {};
-    for (;;) {
-        const int found = proc_net_listen_scan((int) port, why, sizeof why);
-        char out[288];
-        if (found == 1) {
-            snprintf(out, sizeof out, "listening: /proc/net/tcp{,6} holds a LISTEN on %d",
-                     (int) port);
-            LOGI("channel: wait_port %d -> %s", (int) port, out);
-            return env->NewStringUTF(out);
-        }
-        if (found < 0) {
-            snprintf(out, sizeof out, "unreadable: %s", why);
-            LOGW("channel: wait_port %d -> %s", (int) port, out);
-            return env->NewStringUTF(out);
-        }
-        struct timespec now{};
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        const long long now_ms = (long long) now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
-        if (now_ms >= deadline) {
-            snprintf(out, sizeof out,
-                     "not-listening: no LISTEN on %d in /proc/net/tcp{,6} after %lldms",
-                     (int) port, budget);
-            LOGW("channel: wait_port %d -> %s", (int) port, out);
-            return env->NewStringUTF(out);
-        }
-        usleep(500 * 1000);
-    }
-}
-
-/*
  * JNIEXPORT is not decoration: the whole library is compiled with
  * -fvisibility=hidden (that is what keeps the vendored resetprop from being
  * interposed by, or interposing, libc), so without it JNI_OnLoad would not be in
- * .dynsym and ART would never call it -- the registrations below would then be
- * missing and every native call would throw UnsatisfiedLinkError.
+ * .dynsym and ART would never call it -- the three registrations below would then
+ * be missing and every native call would throw UnsatisfiedLinkError.
  */
+/*
+ * Run one short shell command in THIS process (uid 0) and return its combined output.
+ *
+ * This replaces the AF_UNIX socket + token channel as the command plane of the root service.
+ * The socket needed a filesystem path both sides could reach, and that turned out to be
+ * device-dependent (a missing/unwritable parent directory, an SELinux label the isolated domain
+ * may not touch, a token the other side cannot read). The app *already* holds a binder to this
+ * service -- that is how the service is started at all -- so the command plane rides the binder
+ * instead: no path, no token, no directory permissions.
+ *
+ * What stays the same is the important part: the command runs as this process's uid 0, with the
+ * same capabilities the isolated process has (CapEff=0x1c0), which is exactly the identity the
+ * chain's uid-0 steps used over the socket.
+ *
+ * `fork` + `execve`, not `posix_spawn`: bionic only declares the `posix_spawn_file_actions_t`
+ * family from API 28 on and this library builds at a lower level. Forking from a binder thread of
+ * a multi-threaded process is acceptable here because the child only calls async-signal-safe
+ * functions (open / dup2 / close / execve / _exit) before the exec.
+ *
+ * A spawn failure or a timeout is reported *inside* the returned text as
+ * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so callers that parse output cannot mistake it for a
+ * command that ran and printed nothing.
+ *
+ * WHY A CHILD PROCESS AND NOT AN IN-PROCESS CALL (measured, PJA110, 2026-10-02 -- the chain
+ * has to run `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555` and its `usbd` sibling):
+ *
+ *  * property_service checks the property against the caller's *process* context
+ *    (/proc/<tgid>/attr/current).  Borrowing the `adbd` domain inside this process -- by
+ *    writing /proc/self/attr/current, i.e. what `setcon` does -- could never satisfy it: the
+ *    check reads the thread-group leader's label, not the one this thread switched to.
+ *  * Such a write is refused anyway: this service is multi-threaded (binder pool) and a
+ *    write from a non-leader thread returns EACCES (13), because /proc/self resolves to the
+ *    thread-group leader and the kernel only lets a task write its OWN attributes.  Observed
+ *    exactly: `setcon(u:r:adbd:s0) failed (13: Permission denied)`, with no `avc: denied` in
+ *    the log -- it never reached SELinux.
+ *  * The child below is a single-threaded process of its own, so `runcon` inside it works,
+ *    and property_service sees the context it needs.  That is why the gate is a command.
+ */
+static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, jint timeout_ms) {
+    const char *cmd = env->GetStringUTFChars(command, nullptr);
+    if (cmd == nullptr) return nullptr;
+
+    int pipes[2] = {-1, -1};
+    if (pipe(pipes) != 0) {
+        char reason[128];
+        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: pipe: %s", strerror(errno));
+        env->ReleaseStringUTFChars(command, cmd);
+        return env->NewStringUTF(reason);
+    }
+
+    /* fork + execve rather than posix_spawn: bionic only declares the posix_spawn_* file-action
+     * types from API 28 on, and this library's platform level is lower. The child only calls
+     * async-signal-safe functions (open/dup2/close/execve/_exit) before exec, which is what makes
+     * forking from a binder thread of a multi-threaded process acceptable here. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        const int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        dup2(pipes[1], STDOUT_FILENO);
+        dup2(pipes[1], STDERR_FILENO);
+        if (pipes[1] > STDERR_FILENO) close(pipes[1]);
+        close(pipes[0]);
+        char *const argv[] = {(char *) "sh", (char *) "-c", (char *) cmd, nullptr};
+        char *const envp[] = {
+                (char *) "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
+                (char *) "HOME=/",
+                nullptr,
+        };
+        execve("/system/bin/sh", argv, envp);
+        _exit(127);
+    }
+    close(pipes[1]);
+
+    std::string output;
+    bool timed_out = false;
+    if (pid < 0) {
+        close(pipes[0]);
+        char reason[192];
+        snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: fork: %s", strerror(errno));
+        output = reason;
+    } else {
+        const int budget = timeout_ms > 0 ? timeout_ms : 30000;
+        struct timespec started{};
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        const long long deadline =
+                (long long) started.tv_sec * 1000LL + started.tv_nsec / 1000000LL + budget;
+        for (;;) {
+            struct timespec now{};
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const long long now_ms = (long long) now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            if (now_ms >= deadline) {
+                timed_out = true;
+                break;
+            }
+            struct pollfd pfd = {pipes[0], POLLIN, 0};
+            const int ready = poll(&pfd, 1, 200);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (ready == 0) continue;
+            char buffer[4096];
+            const ssize_t n = read(pipes[0], buffer, sizeof buffer);
+            if (n > 0) {
+                output.append(buffer, (size_t) n);
+            } else {
+                break; /* EOF: the child closed stdout/stderr (or died) */
+            }
+        }
+        close(pipes[0]);
+        if (timed_out) kill(pid, SIGKILL);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (timed_out) {
+            output += "\n__GHOSTLOCK_EXEC_FAILED__: timeout after ";
+            output += std::to_string(budget);
+            output += "ms";
+            LOGW("exec: timed out after %dms: %s", budget, cmd);
+        } else if (WIFEXITED(status)) {
+            LOGI("exec: exit=%d: %s", WEXITSTATUS(status), cmd);
+            /* Silence plus a non-zero exit is the interesting case (a shell that could not be
+             * exec'd, a command that never existed): say so in the returned text, because an
+             * empty answer is indistinguishable from "ran and printed nothing". */
+            if (output.empty() && WEXITSTATUS(status) != 0) {
+                output = "__GHOSTLOCK_EXEC_FAILED__: exit=";
+                output += std::to_string(WEXITSTATUS(status));
+                output += " (no output): ";
+                output += cmd;
+            }
+        } else {
+            const int signal = WIFSIGNALED(status) ? WTERMSIG(status) : -1;
+            LOGW("exec: killed by signal %d: %s", signal, cmd);
+            if (output.empty()) {
+                output = "__GHOSTLOCK_EXEC_FAILED__: signal=";
+                output += std::to_string(signal);
+                output += ": ";
+                output += cmd;
+            }
+        }
+    }
+
+    env->ReleaseStringUTFChars(command, cmd);
+    return env->NewStringUTF(output.c_str());
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -912,22 +771,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
         return JNI_ERR;
     }
 
-    /* Kept for the socket server above, which is compiled but not registered any more: its
-     * derived paths still have to exist as strings, otherwise that dead code would dereference
-     * null pointers if anyone re-enables it.  The command plane is the binder. */
+    /* Kept for the (now unused) socket server below: its derived paths still have to exist as
+     * strings, otherwise the dead code would dereference null pointers if anyone re-enables it. */
     rsh_apply_dir();
 
     JNINativeMethod methods[] = {
             {"root",              "()Z", (void *) root},
             {"adb_root",          "()Z", (void *) adb_root},
-            /* The command plane: three typed actions, in this process, as uid 0.  No shell and
-             * no fork, so nothing can be lost to a spawned child (Android drops the escalated
-             * uid there) and nothing can be frozen mid-command.
-             * `start_shell_server` is no longer registered: its AF_UNIX path + token turned
-             * out to be device-dependent, and the caller already holds this binder. */
-            {"channel_identity",  "()Ljava/lang/String;", (void *) channel_identity},
-            {"channel_set_prop",  "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *) channel_set_prop_in_domain},
-            {"channel_wait_port", "(II)Ljava/lang/String;", (void *) channel_wait_port},
+            /* The command plane: one shell command as uid 0, over the binder the caller already
+             * holds. The socket server (`start_shell_server`) is gone from the registrations --
+             * its AF_UNIX path + token turned out to be device-dependent. */
+            {"exec_shell",        "(Ljava/lang/String;I)Ljava/lang/String;", (void *) exec_shell},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");

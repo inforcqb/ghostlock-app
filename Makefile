@@ -150,7 +150,7 @@ magica2jni: $(JNI_BUILD_DIR)/libmagica2.so
 
 $(JNI_BUILD_DIR)/libmagica2.so: $(JNI_OBJS) Makefile
 	@echo "Using NDK C++ compiler/linker: $(NDK_CXX)"
-	$(NDK_CXX) $(JNI_OBJS) $(JNI_LDFLAGS) -llog -ldl -o $@
+	$(NDK_CXX) $(JNI_OBJS) $(JNI_LDFLAGS) -llog -o $@
 	@if [ -x "$(LLVM_READELF)" ]; then \
 		if "$(LLVM_READELF)" -d $@ 2>/dev/null | grep -q libc++_shared; then \
 			echo "WARNING: $@ needs libc++_shared.so, which the APK does not ship"; \
