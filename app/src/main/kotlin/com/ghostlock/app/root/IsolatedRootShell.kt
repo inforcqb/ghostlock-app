@@ -82,9 +82,27 @@ class IsolatedRootShell(private val context: Context) {
                     "(check logcat -s ${RootShellService.TAG})",
             )
         }
-        if (!service.startChannel()) {
+        /* startChannel() is a self-test: it runs `id` through the binder and requires uid=0.
+         * The isolated process may need a moment before that works on a cold or loaded device,
+         * so retry instead of failing the whole chain on the first miss:
+         * CHANNEL_START_ATTEMPTS attempts, CHANNEL_START_RETRY_MS apart. */
+        var channelStarted = false
+        for (attempt in 1..CHANNEL_START_ATTEMPTS) {
+            if (service.startChannel()) {
+                channelStarted = true
+                break
+            }
+            onLog(
+                "[!] 通道自检 第 $attempt/${CHANNEL_START_ATTEMPTS} 次未拿到 uid=0，" +
+                    "${CHANNEL_START_RETRY_MS / 1000}s 后重试",
+            )
+            if (attempt < CHANNEL_START_ATTEMPTS) Thread.sleep(CHANNEL_START_RETRY_MS)
+        }
+        if (!channelStarted) {
             throw IllegalStateException(
-                "startChannel() == false: 通道自检失败 —— 通过 binder 跑 `id` 没有拿到 uid=0 " +
+                "通道自检失败 $CHANNEL_START_ATTEMPTS 次" +
+                    "（${CHANNEL_START_ATTEMPTS * (CHANNEL_START_RETRY_MS / 1000)}s）：" +
+                    "通过 binder 跑 `id` 没有拿到 uid=0 " +
                     "(check logcat -s ${RootShellService.TAG})",
             )
         }
@@ -192,6 +210,9 @@ class IsolatedRootShell(private val context: Context) {
 
         /** Starting an isolated process means forking the app zygote; give it room. */
         const val BIND_TIMEOUT_MS = 90_000L
+        /** startChannel() retry policy: the server's socket appears asynchronously. */
+        const val CHANNEL_START_ATTEMPTS = 3
+        const val CHANNEL_START_RETRY_MS = 3_000L
 
         /**
          * `ServiceInfo.FLAG_ISOLATED_PROCESS` and `ServiceInfo.FLAG_USE_APP_ZYGOTE`.

