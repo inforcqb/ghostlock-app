@@ -16,7 +16,12 @@
  *                              resetprop ro.debuggable/ro.secure, `ctl.restart adbd`
  *                              through both __system_property_set and
  *                              /system/bin/setprop, pkill -9 adbd, bounded 15 s poll.
- *   3. start_shell_server() -- daemonised AF_UNIX root shell at the shared path.
+ *   3. start_shell_server() -- daemonised AF_UNIX root shell at the shared path
+ *                              (compiled, but no longer registered: see 4).
+ *   4. the command plane     -- four intent methods, each running ONE command fixed in
+ *                              this library, in a child process: identity, adb gate,
+ *                              restart adbd, listeners.  No command string comes in
+ *                              from Java.  See the note above `run_inlined`.
  *
  * ---------------------------------------------------------------------------
  * WHY THE ORDER OF LOADING IS LOAD-BEARING
@@ -601,67 +606,75 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jobject thiz  __unused
 }
 
 /*
- * JNIEXPORT is not decoration: the whole library is compiled with
- * -fvisibility=hidden (that is what keeps the vendored resetprop from being
- * interposed by, or interposing, libc), so without it JNI_OnLoad would not be in
- * .dynsym and ART would never call it -- the three registrations below would then
- * be missing and every native call would throw UnsatisfiedLinkError.
- */
-/*
- * Run one short shell command in THIS process (uid 0) and return its combined output.
+ * ---------------------------------------------------------------------------------------------
+ * THE uid-0 COMMAND PLANE: inlined commands, one child process each.
  *
- * This replaces the AF_UNIX socket + token channel as the command plane of the root service.
- * The socket needed a filesystem path both sides could reach, and that turned out to be
- * device-dependent (a missing/unwritable parent directory, an SELinux label the isolated domain
- * may not touch, a token the other side cannot read). The app *already* holds a binder to this
- * service -- that is how the service is started at all -- so the command plane rides the binder
- * instead: no path, no token, no directory permissions.
+ * Every action below runs exactly ONE command, fixed right here in the library.  No command
+ * string crosses the binder and there is no generic "run this" method on the service: the AIDL
+ * surface is a set of *intents* (IRootShellService.channelIdentity / channelOpenAdbGate /
+ * channelRestartAdbd / channelListeners).
  *
- * What stays the same is the important part: the command runs as this process's uid 0, with the
- * same capabilities the isolated process has (CapEff=0x1c0), which is exactly the identity the
- * chain's uid-0 steps used over the socket.
+ * How a command runs: fork + execve("/system/bin/sh", ["sh", "-c", <command>]), stdin
+ * /dev/null, stdout+stderr through a pipe, deadline, SIGKILL on timeout.  The child inherits
+ * this process's uid 0 and its capabilities (CapEff=0x1c0).  `fork`+`execve` does NOT drop the
+ * uid the way the JVM's Runtime/ProcessBuilder does on this platform (measured:
+ * `uid=90000(u0_i0)`), and the child is single-threaded -- which the two gate commands need.
  *
- * `fork` + `execve`, not `posix_spawn`: bionic only declares the `posix_spawn_file_actions_t`
- * family from API 28 on and this library builds at a lower level. Forking from a binder thread of
- * a multi-threaded process is acceptable here because the child only calls async-signal-safe
- * functions (open / dup2 / close / execve / _exit) before the exec.
+ * WHY THE GATE COMMANDS MUST RUN IN A CHILD PROCESS (measured, PJA110, 2026-10-02):
  *
- * A spawn failure or a timeout is reported *inside* the returned text as
- * `__GHOSTLOCK_EXEC_FAILED__: <reason>`, so callers that parse output cannot mistake it for a
- * command that ran and printed nothing.
- *
- * WHY A CHILD PROCESS AND NOT AN IN-PROCESS CALL (measured, PJA110, 2026-10-02 -- the chain
- * has to run `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555` and its `usbd` sibling):
- *
- *  * property_service checks the property against the caller's *process* context
- *    (/proc/<tgid>/attr/current).  Borrowing the `adbd` domain inside this process -- by
- *    writing /proc/self/attr/current, i.e. what `setcon` does -- could never satisfy it: the
- *    check reads the thread-group leader's label, not the one this thread switched to.
- *  * Such a write is refused anyway: this service is multi-threaded (binder pool) and a
- *    write from a non-leader thread returns EACCES (13), because /proc/self resolves to the
- *    thread-group leader and the kernel only lets a task write its OWN attributes.  Observed
- *    exactly: `setcon(u:r:adbd:s0) failed (13: Permission denied)`, with no `avc: denied` in
+ *  * property_service authorises a property write against the caller's *process* context
+ *    (/proc/<tgid>/attr/current).  Borrowing the `adbd`/`usbd` domain inside this process --
+ *    `setcon`, i.e. writing /proc/self/attr/current -- could never satisfy that check: it reads
+ *    the thread-group leader's label, not the label a single thread switched to.
+ *  * Such a write is refused here anyway: this service is multi-threaded (binder pool), and a
+ *    write from a non-leader thread returns EACCES(13), because /proc/self resolves to the
+ *    thread-group leader while a task may only write its OWN attributes.  Observed exactly that
+ *    (`setcon(u:r:adbd:s0) failed (13: Permission denied)`) with no `avc: denied` anywhere in
  *    the log -- it never reached SELinux.
- *  * The child below is a single-threaded process of its own, so `runcon` inside it works,
- *    and property_service sees the context it needs.  That is why the gate is a command.
- */
-static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, jint timeout_ms) {
-    const char *cmd = env->GetStringUTFChars(command, nullptr);
-    if (cmd == nullptr) return nullptr;
+ *  * `runcon` + exec inside a child gives that child both a process of its own and the
+ *    adbd/usbd context, which is what policy and init want.  It is also the shape the verified
+ *    runbook used.
+ *
+ * A non-zero exit, a spawn failure and a timeout all come back as
+ * `__GHOSTLOCK_EXEC_FAILED__: <reason>` inside the returned text, so the caller cannot mistake
+ * "it never ran" (or it failed) for "it ran and printed nothing".
+ * ------------------------------------------------------------------------------------------- */
+
+/* The commands, verbatim.  These are the single source of truth: the Kotlin side labels things
+ * for the log and never restates a command, so there is nothing to keep in step.  Absolute
+ * paths on purpose (PATH is set for the child as well, but a bare name is a second guess). */
+static const char *const CMD_IDENTITY =
+        "/system/bin/id";
+static const char *const CMD_ADB_GATE =
+        "/system/bin/runcon u:r:adbd:s0 /system/bin/setprop service.adb.tcp.port 5555";
+static const char *const CMD_RESTART_ADBD =
+        "/system/bin/runcon u:r:usbd:s0 /system/bin/setprop ctl.restart adbd";
+static const char *const CMD_LISTENERS =
+        "/system/bin/ss -lnt";
+
+/* Per-command budgets.  A property write is fast; the budget only exists so that a hung child
+ * cannot hold the chain hostage. */
+static const int TIMEOUT_IDENTITY_MS  = 20'000;
+static const int TIMEOUT_GATE_MS      = 30'000;
+static const int TIMEOUT_RESTART_MS   = 30'000;
+static const int TIMEOUT_LISTENERS_MS = 20'000;
+
+/* Run one of the commands above and return its combined output (marker on any failure). */
+static jstring run_inlined(JNIEnv *env, const char *what, const char *command, int timeout_ms) {
+    LOGI("channel: %s: run: %s", what, command);
 
     int pipes[2] = {-1, -1};
     if (pipe(pipes) != 0) {
-        char reason[128];
+        char reason[160];
         snprintf(reason, sizeof reason, "__GHOSTLOCK_EXEC_FAILED__: pipe: %s", strerror(errno));
-        env->ReleaseStringUTFChars(command, cmd);
         return env->NewStringUTF(reason);
     }
 
     /* fork + execve rather than posix_spawn: bionic only declares the posix_spawn_* file-action
-     * types from API 28 on, and this library's platform level is lower. The child only calls
+     * types from API 28 on, and this library's platform level is lower.  The child only calls
      * async-signal-safe functions (open/dup2/close/execve/_exit) before exec, which is what makes
      * forking from a binder thread of a multi-threaded process acceptable here. */
-    pid_t pid = fork();
+    const pid_t pid = fork();
     if (pid == 0) {
         const int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
@@ -672,7 +685,7 @@ static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, j
         dup2(pipes[1], STDERR_FILENO);
         if (pipes[1] > STDERR_FILENO) close(pipes[1]);
         close(pipes[0]);
-        char *const argv[] = {(char *) "sh", (char *) "-c", (char *) cmd, nullptr};
+        char *const argv[] = {(char *) "sh", (char *) "-c", (char *) command, nullptr};
         char *const envp[] = {
                 (char *) "PATH=/sbin:/system/sbin:/system/bin:/system/xbin",
                 (char *) "HOME=/",
@@ -724,37 +737,69 @@ static jstring exec_shell(JNIEnv *env, jobject thiz __unused, jstring command, j
         int status = 0;
         waitpid(pid, &status, 0);
         if (timed_out) {
-            output += "\n__GHOSTLOCK_EXEC_FAILED__: timeout after ";
+            LOGW("channel: %s: timed out after %dms: %s", what, budget, command);
+            if (!output.empty()) output += "\n";
+            output += "__GHOSTLOCK_EXEC_FAILED__: timeout after ";
             output += std::to_string(budget);
-            output += "ms";
-            LOGW("exec: timed out after %dms: %s", budget, cmd);
+            output += "ms: ";
+            output += command;
         } else if (WIFEXITED(status)) {
-            LOGI("exec: exit=%d: %s", WEXITSTATUS(status), cmd);
-            /* Silence plus a non-zero exit is the interesting case (a shell that could not be
-             * exec'd, a command that never existed): say so in the returned text, because an
-             * empty answer is indistinguishable from "ran and printed nothing". */
-            if (output.empty() && WEXITSTATUS(status) != 0) {
-                output = "__GHOSTLOCK_EXEC_FAILED__: exit=";
-                output += std::to_string(WEXITSTATUS(status));
-                output += " (no output): ";
-                output += cmd;
+            const int code = WEXITSTATUS(status);
+            LOGI("channel: %s: exit=%d (%zu bytes)", what, code, output.size());
+            /* A non-zero exit is a failure of the intent, not an empty answer: say so in the
+             * text, together with whatever the command itself printed (a `setprop` that
+             * property_service refused prints `Failed to set property ...`). */
+            if (code != 0) {
+                if (!output.empty()) output += "\n";
+                output += "__GHOSTLOCK_EXEC_FAILED__: exit=";
+                output += std::to_string(code);
+                output += ": ";
+                output += command;
             }
         } else {
             const int signal = WIFSIGNALED(status) ? WTERMSIG(status) : -1;
-            LOGW("exec: killed by signal %d: %s", signal, cmd);
-            if (output.empty()) {
-                output = "__GHOSTLOCK_EXEC_FAILED__: signal=";
-                output += std::to_string(signal);
-                output += ": ";
-                output += cmd;
-            }
+            LOGW("channel: %s: killed by signal %d: %s", what, signal, command);
+            if (!output.empty()) output += "\n";
+            output += "__GHOSTLOCK_EXEC_FAILED__: signal=";
+            output += std::to_string(signal);
+            output += ": ";
+            output += command;
         }
     }
-
-    env->ReleaseStringUTFChars(command, cmd);
     return env->NewStringUTF(output.c_str());
 }
 
+/* 1) `id` -- who this service is: uid 0 and its SELinux context (the step-4 identity check). */
+static jstring channel_identity(JNIEnv *env, jobject thiz __unused) {
+    return run_inlined(env, "identity", CMD_IDENTITY, TIMEOUT_IDENTITY_MS);
+}
+
+/* 2) The adb gate: only the `adbd` domain may write `service.adb.tcp.port`
+ *    (`adbd_config_prop`). */
+static jstring channel_open_adb_gate(JNIEnv *env, jobject thiz __unused) {
+    return run_inlined(env, "adb gate", CMD_ADB_GATE, TIMEOUT_GATE_MS);
+}
+
+/* 3) Restart adbd: `ctl_adbd_prop` is granted to `usbd` alone (`plat_sepolicy.cil`). */
+static jstring channel_restart_adbd(JNIEnv *env, jobject thiz __unused) {
+    return run_inlined(env, "restart adbd", CMD_RESTART_ADBD, TIMEOUT_RESTART_MS);
+}
+
+/* 4) The listener table, for the chain's poll -- same table `adb connect` will use, before it
+ *    tries.  Advisory: whether this child's /proc/net view is adbd's is not guaranteed. */
+static jstring channel_listeners(JNIEnv *env, jobject thiz __unused) {
+    return run_inlined(env, "listeners", CMD_LISTENERS, TIMEOUT_LISTENERS_MS);
+}
+
+
+
+/*
+ * JNIEXPORT is not decoration: the whole library is compiled with
+ * -fvisibility=hidden (that is what keeps the vendored resetprop from being
+ * interposed by, or interposing, libc), so without it JNI_OnLoad would not be in
+ * .dynsym and ART would never call it -- the registrations below would then be
+ * missing and every native call would throw UnsatisfiedLinkError.
+ */
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -778,10 +823,15 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNINativeMethod methods[] = {
             {"root",              "()Z", (void *) root},
             {"adb_root",          "()Z", (void *) adb_root},
-            /* The command plane: one shell command as uid 0, over the binder the caller already
-             * holds. The socket server (`start_shell_server`) is gone from the registrations --
-             * its AF_UNIX path + token turned out to be device-dependent. */
-            {"exec_shell",        "(Ljava/lang/String;I)Ljava/lang/String;", (void *) exec_shell},
+            /* The uid-0 command plane: four intents, each running ONE command that is fixed in
+             * this library (see the note above `run_inlined`).  No command string comes in from
+             * Java -- the old `exec_shell(command, timeoutMs)` is gone -- and the socket server
+             * (`start_shell_server`) stays unregistered: its AF_UNIX path + token turned out to
+             * be device-dependent, and the caller already holds this binder. */
+            {"channel_identity",     "()Ljava/lang/String;", (void *) channel_identity},
+            {"channel_open_gate",    "()Ljava/lang/String;", (void *) channel_open_adb_gate},
+            {"channel_restart_adbd", "()Ljava/lang/String;", (void *) channel_restart_adbd},
+            {"channel_listeners",    "()Ljava/lang/String;", (void *) channel_listeners},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");

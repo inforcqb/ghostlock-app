@@ -48,10 +48,13 @@ internal const val ROOT_LOG_TAG = "GhostlockRoot"
  *
  * * `onBind` runs `root()` (the escalation `root()` requires, and it must succeed before any
  *   command can run as uid 0).
- * * The command plane is the **binder**: [IRootShellService.execShell] runs one short shell
- *   command in this process and returns its combined output, so the app needs neither a shared
- *   directory nor a token.  Not a single IP socket is opened here -- an isolated process
- *   has no AF_INET.
+ * * The command plane is the **binder**, and it carries four *intents* --
+ *   [IRootShellService.channelIdentity], [IRootShellService.channelOpenAdbGate],
+ *   [IRootShellService.channelRestartAdbd], [IRootShellService.channelListeners].  Each of
+ *   them runs ONE command that is fixed in the native library, in a child process: no command
+ *   string comes in from Java, and the JVM never spawns anything (a `Runtime`/`ProcessBuilder`
+ *   child would drop to the app uid -- measured `uid=90000(u0_i0)`).  Not a single IP socket
+ *   is opened here either -- an isolated process has no AF_INET.
  * * `adb_root()` (the adbd patch) is **not** called on bind: it blocks up to 15 s
  *   and it restarts adbd, so it is only reachable through the AIDL method below.
  * * The libsu-based `RemoteProcess*` plumbing of upstream is deliberately NOT
@@ -88,7 +91,7 @@ class RootShellService : Service() {
          * "the socket exists" check, and it needs no filesystem at all.
          */
         override fun startChannel(): Boolean {
-            val identity = runCatching { execShell("id", 15_000) }.getOrElse { error ->
+            val identity = runCatching { channelIdentity() }.getOrElse { error ->
                 "抛异常 ${error::class.java.simpleName}: ${error.message}"
             }
             val rooted = identity.contains("uid=0")
@@ -99,24 +102,33 @@ class RootShellService : Service() {
         override fun adbRoot(): Boolean = root() && adb_root()
 
         /**
-         * One command, in this process, as this process's uid.
+         * The four intents, in this process and as this process's uid 0.
          *
-         * **Native on purpose.** `Runtime`/`ProcessBuilder` looks like the same thing, but
-         * Android's process spawn drops back to the app's uid (measured on the PJA110: the
-         * isolated process runs as uid 0 after `ensureRoot()`, yet `id` through a
-         * `ProcessBuilder` printed `uid=90000(u0_i0)`). The JNI `exec_shell` forks and execs
-         * without touching credentials, which is what makes the chain's `runcon`/`setprop`
-         * run with the identity the uid-0 steps need.
+         * **Native on purpose.** Each native call forks and execs ONE command that the library
+         * fixes itself; `Runtime`/`ProcessBuilder` looks like the same thing and is not --
+         * Android's process spawn drops back to the app's uid (measured: the isolated process
+         * is uid 0, its `ProcessBuilder` child printed `uid=90000(u0_i0)`), while `fork` +
+         * `execve` keeps this process's uid and capabilities.
+         *
+         * A Java-side throw becomes the caller's marker, so it cannot read as an empty (i.e.
+         * successful) answer.
          */
-        override fun execShell(command: String, timeoutMs: Int): String {
-            val output = runCatching { exec_shell(command, timeoutMs) }.getOrElse { error ->
-                val reason = "__GHOSTLOCK_EXEC_FAILED__: ${error::class.java.simpleName}: " +
-                    "${error.message}"
+        private fun action(what: String, call: () -> String?): String =
+            runCatching { call() }.getOrElse { error ->
+                val reason = "__GHOSTLOCK_EXEC_FAILED__: $what 抛异常 " +
+                    "${error::class.java.simpleName}: ${error.message}"
                 Log.e(TAG, reason)
-                return reason
-            }
-            return output ?: ""
-        }
+                reason
+            } ?: ""
+
+        override fun channelIdentity(): String = action("identity") { channel_identity() }
+
+        override fun channelOpenAdbGate(): String = action("adb gate") { channel_open_gate() }
+
+        override fun channelRestartAdbd(): String =
+            action("restart adbd") { channel_restart_adbd() }
+
+        override fun channelListeners(): String = action("listeners") { channel_listeners() }
 
         override fun destroy() {
             Log.i(TAG, "destroy() requested by the caller")
@@ -153,7 +165,8 @@ class RootShellService : Service() {
      * app/src/main/jni/magica.cpp does
      *
      *     FindClass("com/ghostlock/app/root/RootShellService")
-     *     RegisterNatives({ "root", "adb_root", "exec_shell" } ...)
+     *     RegisterNatives({ "root", "adb_root", "channel_identity", "channel_open_gate",
+     *                       "channel_restart_adbd", "channel_listeners" } ...)
      *
      * so this class must not be renamed or obfuscated (see app/proguard-rules.pro)
      * and these names must not change.  They are *instance* methods here (not
@@ -162,14 +175,24 @@ class RootShellService : Service() {
      * companion's static bridge.
      *
      * The old socket server (`start_shell_server` / `set_channel_dir`) is no longer
-     * registered: the command plane is the binder now (see [IRootShellService.execShell]).
+     * registered, and neither is a generic `exec_shell`: the command plane is the binder, and
+     * it carries intents whose commands live in the library.  See [IRootShellService].
      */
     private external fun root(): Boolean
 
     private external fun adb_root(): Boolean
 
-    /** One shell command as uid 0; the JNI side captures its combined output. */
-    private external fun exec_shell(command: String, timeoutMs: Int): String?
+    /** Runs `/system/bin/id`; returns uid 0 + this process's SELinux context. */
+    private external fun channel_identity(): String?
+
+    /** Runs `runcon u:r:adbd:s0 setprop service.adb.tcp.port 5555`. */
+    private external fun channel_open_gate(): String?
+
+    /** Runs `runcon u:r:usbd:s0 setprop ctl.restart adbd`. */
+    private external fun channel_restart_adbd(): String?
+
+    /** Runs `ss -lnt`. */
+    private external fun channel_listeners(): String?
 
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */

@@ -3,9 +3,19 @@
 链在 Magica 步骤之后要做的事，全部发生在**我们自己的隔离 uid-0 进程**里：它 `CapEff=0x1c0`、
 `CapBnd=0`（没有 `CAP_DAC_OVERRIDE`），SELinux 当时是 permissive。
 
-**结论（先写在这里）**：命令平面就是**一条命令字符串**，由隔离进程 `fork` + `execve` 一个
-`/system/bin/sh -c` 去跑。**不做进程内原生动作**——不是保守，是实测证明做不到（下一节）。
-所以 AIDL 上只有 `String execShell(String command, int timeoutMs)`，链侧只有 `chan(command)`。
+**结论（先写在这里）**：形状是**命令执行**（隔离进程 `fork` + `execve("/system/bin/sh", sh -c <cmd>)`），
+但**不做成通用接口**：AIDL 上只有四个*意图*，每个意图跑的那条命令**内联在 `magica.cpp` 里**，
+没有任何命令字符串过 binder。
+
+| AIDL | 原生 | 内联的命令（`magica.cpp` 是唯一真源） |
+|---|---|---|
+| `channelIdentity() = 4` | `run_inlined(CMD_IDENTITY)` | `/system/bin/id` |
+| `channelOpenAdbGate() = 5` | `run_inlined(CMD_ADB_GATE)` | `/system/bin/runcon u:r:adbd:s0 /system/bin/setprop service.adb.tcp.port 5555` |
+| `channelRestartAdbd() = 6` | `run_inlined(CMD_RESTART_ADBD)` | `/system/bin/runcon u:r:usbd:s0 /system/bin/setprop ctl.restart adbd` |
+| `channelListeners() = 7` | `run_inlined(CMD_LISTENERS)` | `/system/bin/ss -lnt` |
+
+命令的权威记录是 logcat 里的 `channel: <what>: run: <command>`；Kotlin 侧只写标签，不重复任何命令文本，
+所以两侧没有"要同步的副本"。
 
 ## 1. 现场证据
 
@@ -54,10 +64,12 @@ leader 线程上，而 `/proc/self/attr/current` 解析到的是**进程 leader*
 | step 6 重启 adbd（域：ctl_adbd_prop） | `runcon u:r:usbd:s0 setprop ctl.restart adbd` |
 | 等待监听 | `ss -lnt`（轮询，**判定权在 `adb connect`**） |
 
-执行方式：`RootChannel.exec(command, timeoutMs)` → binder → `RootShellService.execShell` →
-JNI `exec_shell`：`fork` + `execve("/system/bin/sh", ["sh","-c",cmd])`，stdin=/dev/null，
-stdout+stderr 走管道，带 deadline，超时 SIGKILL；spawn 失败/超时在返回文本里带
-`__GHOSTLOCK_EXEC_FAILED__: <reason>`，调用方不会误判成"跑了但没输出"。
+执行方式：`chanOpenAdbGate()` / `chanRestartAdbd()` / `chanIdentity()` / `chanListeners()` → binder 意图
+→ `RootShellService` 的 JNI 包装 → `run_inlined(what, CMD_*, budget)`：`fork` +
+`execve("/system/bin/sh", ["sh","-c",CMD_*])`，stdin=/dev/null，stdout+stderr 走管道，每条命令自带
+deadline，超时 SIGKILL。spawn 失败、超时、**非零退出**都在返回文本里带
+`__GHOSTLOCK_EXEC_FAILED__: <reason>`（`setprop` 被拒时它打印的 `Failed to set property` 就在里面），
+调用方不会误判成"跑了但没输出"。
 
 子进程继承本进程的 uid 0 与（0x1c0 的）capabilities。**JVM 的 `Runtime`/`ProcessBuilder` 会掉到
 app uid（实测 `uid=90000(u0_i0)`），但 `fork`+`execve` 不会** —— 这两件事经常被混为一谈。
