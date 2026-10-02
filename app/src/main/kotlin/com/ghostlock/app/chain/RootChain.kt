@@ -915,12 +915,12 @@ class RootChain(
         ok = step(ChainStep.MAGICA_ROOT, "内置 uid-0 服务 -> channel") {
             onLog("[*] ${ChainSpec.CHANNEL_LAUNCH_NOTE}")
             onLog("[*] ${rootShell.launch()}")
-            /* Do NOT block here. The root service already reported that its server is
-             * listening (startChannel() == true), and the channel is verifiably up on the
-             * device (a shell-side `rshell` gets `uid=0` / `u:r:isolated_app:s0`), so a
-             * probe of our own must not hold the chain hostage: it burned minutes waiting
-             * for a transport that the chain does not use anyway. Probe once for the log,
-             * then move on to opening the adb gate. */
+            /* Do NOT block here. [IsolatedRootShell.launch] already required a successful
+             * self-test (startChannel() == true, i.e. the service answered with a uid-0
+             * identity), so a probe of our own must not hold the chain hostage -- an earlier
+             * version of this step burned minutes waiting for a transport the chain does not
+             * use. Read the identity once for the log, check it, and move on to the adb
+             * gate. */
             onLog("[*] 通道自检（一次性）：${probeChannel()}")
             val identity = chanIdentity()
             onLog("[*] channel identity: ${identity.trim()}")

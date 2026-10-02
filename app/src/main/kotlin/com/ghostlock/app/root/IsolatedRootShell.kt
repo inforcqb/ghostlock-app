@@ -34,11 +34,10 @@ import kotlin.coroutines.resume
  *   process that was born with the right credentials. The caller is this app (the
  *   process that owns the service) -- binding from the Shizuku user service, which
  *   runs as uid 2000, is not allowed for an isolated service.
- * * [RootShellService.onBind] already does `root()` and `start_shell_server()`; the
- *   two AIDL calls below only confirm it, so a silent failure cannot be mistaken for
- *   a working channel.
+ * * [RootShellService.onBind] already does `root()`; the AIDL calls below only confirm
+ *   it, so a silent failure cannot be mistaken for a working channel.
  * * [release] is deliberately NOT called by the chain: unbinding destroys the isolated
- *   process, and with it the uid-0 shell server the next steps still talk to. The
+ *   process, and with it the uid-0 command plane every later step talks to. The
  *   service lives until the app (or the framework) goes away, which matches the
  *   lifetime the verified chain assumes.
  */
@@ -214,7 +213,7 @@ class IsolatedRootShell(private val context: Context) {
 
         /** Starting an isolated process means forking the app zygote; give it room. */
         const val BIND_TIMEOUT_MS = 90_000L
-        /** startChannel() retry policy: the server's socket appears asynchronously. */
+        /** startChannel() retry policy: a cold isolated process may not answer at once. */
         const val CHANNEL_START_ATTEMPTS = 3
         const val CHANNEL_START_RETRY_MS = 3_000L
 
