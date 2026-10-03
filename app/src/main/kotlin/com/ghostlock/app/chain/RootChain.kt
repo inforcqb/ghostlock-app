@@ -1258,16 +1258,47 @@ class RootChain(
             adbRoot = capLine != null
             if (adbRoot) {
                 onLog("[+] 提权通道：root adbd（${ChainSpec.ADB_ENDPOINT}，$capLine）")
+            } else {
+                /* The plane is about to carry the rest of part 2, so probe it HERE, before
+                 * the first real command: one handshake + one read, and the log gets the two
+                 * facts that decide whether `rmmod` and `ksud late-load` can run on it at
+                 * all -- the child's capability sets. A uid-0 child with `CapBnd 0` (what the
+                 * isolated process starts with, see [RootShellService]) can do file and
+                 * property work but cannot load or unload a module; if the w1c park did its
+                 * job the bounding set is full and everything works.
+                 *
+                 * Non-fatal: this is a diagnosis, and the actual commands below report their
+                 * own exit codes. */
+                runCatching {
+                    chanExec(
+                        "grep -E '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status",
+                        timeoutMs = 30_000L,
+                    )
+                }.onSuccess { caps ->
+                    val oneLine = caps.output.lineSequence().filter { it.isNotBlank() }
+                        .joinToString(" ") { it.trim().replace(Regex("\\s+"), " ") }
+                    onLog("[*] uid-0 命令面自检（exit=${caps.exitCode}）：$oneLine")
+                }.onFailure { error ->
+                    onLog(
+                        "[!] uid-0 命令面自检失败：${error.message} —— 后面每条命令都会报自己的错，" +
+                            "命令面不通就只能靠 adb 通道（它此刻不可用）",
+                    )
+                }
             }
 
             // (3) the goal, part one: drop the security module -------------------
             val rmmod = privileged(ChainSpec.RMMOD_GUARD)
-            if (rmmod.output.isNotBlank()) {
+            /* Log it even when it printed nothing: a bare EPERM is exactly the answer that
+             * matters here, and swallowing it made the next line's verdict look mysterious. */
+            if (rmmod.output.isNotBlank() || rmmod.exitCode != 0) {
                 onLog("[*] rmmod（${transport()}）-> exit=${rmmod.exitCode}: ${rmmod.output.trim()}")
             }
             val modules = privileged(ChainSpec.READ_MODULES)
             if (modules.output.contains("oplus_security_guard")) {
-                throw IllegalStateException("oplus_security_guard is still loaded")
+                throw IllegalStateException(
+                    "oplus_security_guard 还挂着（${transport()}，rmmod exit=${rmmod.exitCode}）—— " +
+                        "uid-0 命令面只有在满 cap 时才卸得掉模块（看上面那行命令面自检的 CapBnd/CapEff）",
+                )
             }
             onLog("[+] oplus_security_guard 已卸载")
 
