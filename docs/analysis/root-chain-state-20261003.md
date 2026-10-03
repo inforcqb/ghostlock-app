@@ -1,6 +1,6 @@
 # GhostLock 链条:任务目标 / 当前状态 / 下一步
 
-> 记录时间:2026-10-03(第二轮更新:同日,`57d4b6c1b` / `2e148a076`)· 仓库 `inforcqb/ghostlock-app`(main)· 相关仓库 `inforcqb/kp_rmap_guard_lkm`(kread_min)、`inforcqb/oneplus-susfs4ksu-lkm`、`inforcqb/Magica`
+> 记录时间:2026-10-03(第二轮更新:同日,`bb8d8c94b` 文档对应 main = `4850d5163`)· 仓库 `inforcqb/ghostlock-app`(main)· 相关仓库 `inforcqb/kp_rmap_guard_lkm`(kread_min)、`inforcqb/oneplus-susfs4ksu-lkm`、`inforcqb/Magica`
 
 ## 0. 任务目标
 
@@ -31,7 +31,7 @@
 | `selinux_state` 字段与修复 | ✅ 设备验证 | `+0 enforcing`、`+1 checkreqprot=0`、`+2 initialized=1`、`+3..+10 policycap[]={0,1,2,5}`(策略只声明 4 个 cap);用 `kread/kwrite` 现场恢复过 |
 | `new_boot.img` 字段 diff | ✅ | 新旧镜像同尺寸;`selinux_state`/`init_task`/`root_task_group`/`task_struct.*`/`mm_struct_sz=0x3e8`/`rb_erase` 全部**同址同字节** ⇒ profile 无需重推;`kernel_phys_load` 需真机日志确认;`.ko` vermagic 因内核版本号变了要重编 |
 | parked 清理脚本 | ✅ 就绪 | `cleanup-parked.sh`(kallsyms/pid 定位 + 读回验证 + kill),自带 `insmod` 兜底与工作目录回退 |
-| `startChannel()` 时序 bug | ✅ 已修 | `IsolatedRootShell.kt`:3 次 × 3s 重试,失败才抛 |
+| Magica 身份自检 | ✅ 已升级 | 见下面「Magica uid-0 自检失败 → 杀进程重拉」:轮内 3 次 × 3s,轮外最多 3 轮重启 |
 | uid-0 command server(native) | ✅ 编译验证 | `app/src/main/jni/gl_server.cpp` + `gl_server_start()`;`bin.yml` run `37084659961` success |
 | JNI 入口 | ✅ 已推 | `magica.cpp` 表项 `start_command_server(ILjava/lang/String;Ljava/lang/String;)I` |
 | service 调用点 | ✅ 已推 | `RootShellService.startChannel()` 在 `uid=0` 自检通过后启动 server |
@@ -71,6 +71,10 @@ d42f2e39b  app/jni: gl_server.cpp（server 本体 + 协议）
 
 **CI**:run `37086461837`(main = `4850d5163`)**全绿**(Build APK 9m36s + 两个 extractor + Release)。
 签名 APK 在 release 资产里:`https://github.com/inforcqb/ghostlock-app/releases/download/release/GhostLock-release.apk`(tag `release`,资产每次构建覆盖);原始件也可从 run 页面下(`GhostLock-release.apk` / `ghostlock` / `libmagica2`,后两个 `archive:false` 得用 `gh api .../artifacts/<id>/zip`)。
+
+APK 内容已核对(下载后直接看 zip):
+`lib/arm64-v8a/` 里有 `libghostlock.so` / `libmagica2.so`(111848B,与 Bin 产物一致)/ `libksud.so` / `libextract.so` / `libadbcli.so`,
+**没有** `libc++_shared.so`,且 `libmagica2.so` 里有 `JNI_OnLoad`、动态依赖只有 `liblog/libm/libdl/libc`。
 
 ## 2. 当前形态(数据流)
 
