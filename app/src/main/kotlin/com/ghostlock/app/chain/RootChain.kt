@@ -971,16 +971,30 @@ class RootChain(
              * non-zero exit), and the marker text carries what `setprop` printed -- normally
              * `Failed to set property`, i.e. the domain was not borrowed or property_service
              * refused it (SELinux enforcing again?). */
-            chanOpenAdbGate().let { output ->
-                val shown = output.trim().ifBlank { "（无输出）" }
-                onLog(
-                    "[*] 开 adb 门：${ChainSpec.ADBD_DOMAIN} → " +
-                        "${ChainSpec.ADB_TCP_PORT_PROP}=${ChainSpec.ADB_PORT}：$shown",
-                )
+            /* PART 2 DOES NOT DEPEND ON THIS.  The uid-0 command plane above is the
+             * authority for everything that follows (rmmod / manager / selinux repair /
+             * properties); the adb gate is a convenience that gives the app a root adb
+             * client, and on a device where the domain borrow or property_service refuses
+             * it, the chain must still finish.  Both calls therefore log instead of
+             * failing the step -- a refused `setprop` used to stop part 2 here. */
+            try {
+                chanOpenAdbGate().let { output ->
+                    val shown = output.trim().ifBlank { "（无输出）" }
+                    onLog(
+                        "[*] 开 adb 门：${ChainSpec.ADBD_DOMAIN} → " +
+                            "${ChainSpec.ADB_TCP_PORT_PROP}=${ChainSpec.ADB_PORT}：$shown",
+                    )
+                }
+            } catch (error: Exception) {
+                onLog("[!] 开 adb 门失败（part2 继续，走 uid-0 通道）：${error.message}")
             }
-            chanRestartAdbd().let { output ->
-                val shown = output.trim().ifBlank { "（无输出）" }
-                onLog("[*] 重启 adbd：${ChainSpec.USBD_DOMAIN} → ctl.restart adbd：$shown")
+            try {
+                chanRestartAdbd().let { output ->
+                    val shown = output.trim().ifBlank { "（无输出）" }
+                    onLog("[*] 重启 adbd：${ChainSpec.USBD_DOMAIN} → ctl.restart adbd：$shown")
+                }
+            } catch (error: Exception) {
+                onLog("[!] 重启 adbd 失败（part2 继续）：${error.message}")
             }
             /* The listener poll is advisory.  `ss -lnt` runs as a child of the isolated
              * process, and whether that child's /proc/net view is the one adbd listens in is
