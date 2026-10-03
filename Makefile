@@ -61,7 +61,10 @@ COMMON_FLAGS := -O2 -flto -Wall -Wextra -Wconversion -Wsign-conversion \
   -Isrc/core -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\"
 CFLAGS := $(COMMON_FLAGS) -std=gnu11
 CXXFLAGS := $(COMMON_FLAGS) -std=c++20 -fno-rtti
-LDFLAGS := -fPIE -pie -pthread -flto -static-libstdc++
+# -llog: gl_server.cpp (built into the engine too, for its `--glserver` mode) logs through
+# logcat -- `fprintf(stderr)` goes nowhere in an app process, and the whole point of those
+# lines is that a bind failure has to say WHY (errno).  liblog is part of every Android.
+LDFLAGS := -fPIE -pie -pthread -flto -static-libstdc++ -llog
 
 HOST_CC ?= cc
 HOST_CXX ?= c++
