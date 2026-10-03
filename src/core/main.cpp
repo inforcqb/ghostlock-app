@@ -23,6 +23,8 @@
 
 using namespace ghostlock;
 
+int gl_server_run(int port, const char *token);   /* app/src/main/jni/gl_server.cpp */
+
 /* Prototype hook: the pipe-substitution shot, run *before* the stage pipeline.
  * Once selinux_state has been written, the pipeline's own pre-W1 stages bail out
  * (measured: status 0x7f00 every round after the first), which would starve a
@@ -72,6 +74,25 @@ static int pipe_shot_only(void) {
  * Inputs: argc/argv plus the process-level session; output: stable exit code.
  * Argument parsing stays here; the stage sequence only owns the session. */
 int main(int argc, char **argv) {
+    /* `ghostlock --glserver [--port N] [--token T]`
+     *
+     * The same binary doubles as the uid-0 command server, so the app can
+     * re-exec the engine it already staged when the isolated process cannot
+     * bind the listener:
+     *     runcon u:r:system_server:s0 <staged>/ghostlock --glserver --port P --token T
+     * The server itself lives in app/src/main/jni/gl_server.cpp and is linked in
+     * (see CXX_SRCS) so both hosts share one implementation. */
+    if (argc > 1 && strcmp(argv[1], "--glserver") == 0) {
+        int port = 5038;
+        const char *token = "";
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[++i];
+        }
+        const int rc = gl_server_run(port, token);
+        pr_info("glserver: listen on 127.0.0.1:%d rc=%d\n", port, rc);
+        return rc == 0 ? 0 : 1;
+    }
     if (getenv("GHOSTLOCK_PIPE_SHOT_ONLY")) return pipe_shot_only();
     const char *profile_path = nullptr;
     for (int i = 1; i < argc; i++) {
