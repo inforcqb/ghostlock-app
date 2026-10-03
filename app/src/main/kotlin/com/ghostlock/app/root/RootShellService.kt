@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.os.Process
 import android.util.Log
+import java.io.File
 
 /**
  * Name of the JNI module that carries the ported Magica code.
@@ -19,6 +20,21 @@ import android.util.Log
  * initialised inside the app zygote).
  */
 internal const val NATIVE_LIB_NAME = "magica2"
+
+/**
+ * The uid-0 command server (`app/src/main/jni/gl_server.cpp`).
+ *
+ * One process holds the link -- this isolated, uid-0 one -- and everybody else
+ * submits commands to 127.0.0.1:[COMMAND_SERVER_PORT]: [RootCommand] in the app, the
+ * device scripts, or plain `nc`.  The paths are the staging contract: the app writes
+ * the token it wants clients to present, and stages the engine that a failed bind
+ * re-execs as `runcon u:r:system_server:s0 <engine> --glserver` (runcon is only the
+ * *listening* fallback).  Defaults keep working even before the app writes anything:
+ * [RootCommand] falls back to the same port and an empty token.
+ */
+internal const val COMMAND_SERVER_PORT = 5038
+internal const val COMMAND_SERVER_ENGINE = "/data/local/tmp/gl-w1/ghostlock"
+internal const val COMMAND_SERVER_TOKEN = "/data/local/tmp/gl-w1/token"
 
 /**
  * The logcat tag of the port (`TAG` in `app/src/main/jni/logging.h`), shared by
@@ -96,7 +112,21 @@ class RootShellService : Service() {
             }
             val rooted = identity.contains("uid=0")
             Log.i(TAG, "startChannel: identity=${identity.trim()} -> $rooted")
-            return rooted
+            if (!rooted) return false
+            /* Same self-test, one more statement: bring up the command server.  A bind
+             * failure is not fatal -- the native side already forked a child into
+             * u:r:system_server:s0 to listen -- so rc==-1 only means "check again". */
+            val token = runCatching { File(COMMAND_SERVER_TOKEN).readText().trim() }.getOrDefault("")
+            val rc = runCatching {
+                start_command_server(COMMAND_SERVER_PORT, token, COMMAND_SERVER_ENGINE)
+            }.getOrElse { error ->
+                Log.e(TAG, "startChannel: start_command_server 抛异常 " +
+                    "${error::class.java.simpleName}: ${error.message}")
+                -1
+            }
+            Log.i(TAG, "startChannel: command server port=$COMMAND_SERVER_PORT rc=$rc " +
+                "(0=listening, -1=bind failed)")
+            return true
         }
 
         override fun adbRoot(): Boolean = root() && adb_root()
@@ -193,6 +223,12 @@ class RootShellService : Service() {
 
     /** Runs `ss -lnt`. */
     private external fun channel_listeners(): String?
+
+    /**
+     * Starts the uid-0 command server: 0 = a listener exists now (here or in the
+     * runcon child), -1 = GL_ERR_BIND (nothing is listening).
+     */
+    private external fun start_command_server(port: Int, token: String, engine: String): Int
 
     companion object {
         /** The logcat tag of both this class and the native code (see [ROOT_LOG_TAG]). */
