@@ -111,7 +111,7 @@ $(NATIVE_BUILD_DIR)/%.o: %.cpp $(HDRS)
 JNI_DIR := app/src/main/jni
 MAGICA2_SO := .build/jni/libmagica2.so
 MAGICA2_SRCS := \
-  $(JNI_DIR)/magica2.cpp \
+  $(JNI_DIR)/magica.cpp \
   $(JNI_DIR)/gl_server.cpp \
   $(JNI_DIR)/lsplt/elf_util.cc \
   $(JNI_DIR)/lsplt/lsplt.cc \

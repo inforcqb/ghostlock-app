@@ -1,13 +1,16 @@
 name: Bin
 
-# Fast path used while calibrating: build *only* the native ghostlock binary.
-# Same toolchain/cache as build.yml, but no JDK/gradle/APK and no Rust extractor
-# jobs, so a build is ~1-2 min instead of ~10.
+# Fast path used while calibrating: build *only* the native artifacts -- the
+# ghostlock engine and the ported Magica JNI library (libmagica2.so).  Same
+# toolchain/cache as build.yml, but no JDK/gradle/APK and no Rust extractor
+# jobs, so a build is ~1-2 min instead of ~10.  It runs on main too, so a
+# native-only break shows up in minutes instead of after the whole APK build.
 
 on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - mcast-msfilter-calib
     paths-ignore:
       - "**.md"
@@ -17,7 +20,7 @@ env:
 
 jobs:
   bin:
-    name: Build ghostlock binary
+    name: Build native artifacts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -50,9 +53,31 @@ jobs:
         run: |
           "${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all ghostlock || true
 
+      # The same target Gradle's buildMagica2Jni runs (`make magica2jni`): the
+      # ported Magica root-shell JNI library, .build/jni/libmagica2.so.  It is
+      # checked here because an APK build that dies inside it costs ten minutes;
+      # the readelf dump makes the "no libc++_shared.so" property visible.
+      - name: Build libmagica2.so
+        run: |
+          export ANDROID_NDK_HOME="${{ runner.temp }}/ondk"
+          export NDK_ROOT="$ANDROID_NDK_HOME"
+          make magica2jni
+          bin="${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$bin/llvm-strip" --strip-all .build/jni/libmagica2.so || true
+          echo "--- NEEDED ---"
+          "$bin/llvm-readelf" -d .build/jni/libmagica2.so | grep -E "NEEDED|SONAME" || true
+          echo "--- exported JNI symbols ---"
+          "$bin/llvm-nm" -D --defined-only .build/jni/libmagica2.so | grep -c "Java_" || true
       - name: Upload Ghostlock binary
         uses: actions/upload-artifact@v7
         with:
           name: ghostlock
           path: ghostlock
+          archive: false
+
+      - name: Upload libmagica2.so
+        uses: actions/upload-artifact@v7
+        with:
+          name: libmagica2
+          path: .build/jni/libmagica2.so
           archive: false
