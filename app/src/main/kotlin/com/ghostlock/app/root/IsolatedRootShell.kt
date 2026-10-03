@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.os.IBinder
 import android.os.Process
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -40,6 +41,14 @@ import kotlin.coroutines.resume
  *   process, and with it the uid-0 command plane every later step talks to. The
  *   service lives until the app (or the framework) goes away, which matches the
  *   lifetime the verified chain assumes.
+ *
+ * ## When it does not become uid 0
+ *
+ * A failed round is not re-polled forever and it is not fatal on the first try either:
+ * the process is **killed and pulled up again** ([restart]), up to [SERVICE_RESTART_ROUNDS]
+ * rounds. The AppZygote capset hook either fired in that process or it did not, so a
+ * process that answers "not uid 0" [CHANNEL_START_ATTEMPTS] times is not going to change
+ * its mind -- a new process is the only thing that can.
  */
 class IsolatedRootShell(private val context: Context) {
 
@@ -51,16 +60,57 @@ class IsolatedRootShell(private val context: Context) {
     fun isReady(): Boolean = bound != null
 
     /**
-     * Bind the isolated service (if not already bound) and require that it reports both
-     * a uid-0 process and a listening channel. Throws with a diagnosis on any failure;
-     * the returned string is what the chain prints.
+     * Start the isolated service and require that it really is uid 0.
      *
-     * [onLog] receives the diagnosis as it happens, because the interesting failure is a
-     * silent `false` from the framework (see [logServiceFacts]) that leaves no trace in
-     * logcat.
+     * **Restarted on failure, at most [SERVICE_RESTART_ROUNDS] times** (the user's call,
+     * 2026-10-03): a round is "bind + `ensureRoot()` + [CHANNEL_START_ATTEMPTS] identity
+     * reads [CHANNEL_START_RETRY_MS] apart", and a round that never sees uid=0 means the
+     * process is not going to recover on its own -- the AppZygote capset hook either fired
+     * in *that* process or it did not.  So the process is killed and pulled up again
+     * ([restart]) instead of being re-polled, and only the third failed round throws.
+     *
+     * Killing it is safe *because the round failed*: nothing in a process that never reached
+     * uid 0 has forged kernel state yet (the parks that must not die are the ones the engine
+     * creates, and those are only reached after a successful identity read).
      */
     suspend fun launch(onLog: (String) -> Unit = {}): String {
         logServiceFacts(onLog)
+        var lastFailure: String? = null
+        for (round in 1..SERVICE_RESTART_ROUNDS) {
+            if (round > 1) {
+                onLog(
+                    "[!] 第 ${round - 1} 轮没拿到 uid=0（$lastFailure）⇒ " +
+                        "杀掉隔离进程重新拉起（第 $round/$SERVICE_RESTART_ROUNDS 轮）",
+                )
+                restart(onLog)
+            }
+            val outcome = try {
+                Result.success(startOnce(onLog))
+            } catch (cancelled: CancellationException) {
+                /* Not a failed round: the caller went away. Re-running three rounds of
+                 * bind + 9 s of identity reads after a cancel would keep the app busy for
+                 * minutes for nothing. */
+                throw cancelled
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+            outcome.getOrNull()?.let { return it }
+            lastFailure = outcome.exceptionOrNull()?.message ?: "未知原因"
+            onLog("[!] 隔离 root 服务第 $round/$SERVICE_RESTART_ROUNDS 轮失败：$lastFailure")
+        }
+        throw IllegalStateException(
+            "隔离 root 服务重启 $SERVICE_RESTART_ROUNDS 轮都没能给出 uid=0：" +
+                "最后一次失败：$lastFailure（logcat -s ${RootShellService.TAG}）",
+        )
+    }
+
+    /**
+     * One round: bind, require uid 0, run [CHANNEL_START_ATTEMPTS] identity reads.
+     *
+     * Throws with a diagnosis on any failure; the string it returns on success is what the
+     * chain prints.
+     */
+    private suspend fun startOnce(onLog: (String) -> Unit): String {
         val service = try {
             withTimeout(BIND_TIMEOUT_MS) { bindOrNull(onLog) }
         } catch (timeout: TimeoutCancellationException) {
@@ -85,7 +135,11 @@ class IsolatedRootShell(private val context: Context) {
          * and requires uid=0. The isolated process may need a moment before that works on a cold
          * or loaded device -- measured: the first answer can still be the pre-escalation uid --
          * so retry instead of failing the whole chain on the first miss:
-         * CHANNEL_START_ATTEMPTS attempts, CHANNEL_START_RETRY_MS apart. */
+         * CHANNEL_START_ATTEMPTS attempts, CHANNEL_START_RETRY_MS apart.
+         *
+         * These attempts are *inside* one round: if all of them miss, the process is not
+         * warming up, it is wrong -- [launch] then kills it and starts a new one, up to
+         * SERVICE_RESTART_ROUNDS rounds. */
         var channelStarted = false
         for (attempt in 1..CHANNEL_START_ATTEMPTS) {
             /* Ask the service who it is rather than only whether it is happy: the verdict alone
@@ -105,8 +159,31 @@ class IsolatedRootShell(private val context: Context) {
             throw IllegalStateException(
                 "通道自检失败 $CHANNEL_START_ATTEMPTS 次" +
                     "（${CHANNEL_START_ATTEMPTS * (CHANNEL_START_RETRY_MS / 1000)}s）：" +
-                    "通过 binder 读身份没有拿到 uid=0 " +
+                    "通过 binder 读身份没有拿到 uid=0 —— 本轮判负，" +
+                    "会杀掉这个隔离进程重新拉起（最多 $SERVICE_RESTART_ROUNDS 轮）" +
                     "(check logcat -s ${RootShellService.TAG})",
+            )
+        }
+        /* Bring up the second command plane -- and this is the only place that does it.
+         *
+         * [IRootShellService.startChannel] re-reads the identity and then starts
+         * `gl_server` (`app/src/main/jni/gl_server.cpp`) on 127.0.0.1:5038, the transport the
+         * chain falls back to when the root adbd is not there ([RootExec] on the Kotlin side,
+         * `RootCommand` as its client).  Nothing else may start it: a second bind would fail
+         * and a restart of this process would leave an orphan.
+         *
+         * The boolean is the *identity* verdict, not "the listener is up" -- a bind failure
+         * makes the native side fork a `runcon u:r:system_server:s0` child that binds
+         * instead, and the rc is logged by the service.  What proves the plane end to end is
+         * the first command the chain sends through it. */
+        val started = runCatching { service.startChannel() }.getOrElse { error ->
+            onLog("[!] startChannel() 抛异常：${error::class.java.simpleName}: ${error.message}")
+            false
+        }
+        onLog("[*] Magica startChannel()（uid-0 命令面 127.0.0.1:5038）-> $started")
+        if (!started) {
+            throw IllegalStateException(
+                "startChannel() == false：服务进程没有确认 uid=0（这一轮判负，会重新拉起）",
             )
         }
         /* Ported Magica's own "enable root shell" step, run automatically (the upstream
@@ -194,6 +271,37 @@ class IsolatedRootShell(private val context: Context) {
         }
     }
 
+    /**
+     * Kill the isolated process and drop the binding, so that the next bind forks a *new*
+     * one.
+     *
+     * Three steps, in this order, because the framework decides the process's fate:
+     *
+     *  1. [IRootShellService.destroy] asks the service to `stopSelf()`. This is the only
+     *     handle the app has on that process: `Process.killProcess(pid)` from here is
+     *     denied (different uid, and an isolated process is not ours to signal) and the
+     *     shell is not root yet.
+     *  2. `unbindService()`: an isolated process exists for its binding, and nothing may
+     *     be bound to it any more.
+     *  3. a short settle delay, so the next `bindIsolatedService()` does not race the
+     *     teardown and attach to the process we just asked to die.
+     *
+     * Every step is best-effort: `destroy()` on an already-dead binder throws
+     * `DeadObjectException`, which is exactly the state we are trying to reach.
+     */
+    private fun restart(onLog: (String) -> Unit) {
+        val service = bound
+        bound = null
+        val conn = connection
+        connection = null
+        runCatching { service?.destroy() }.onFailure { error ->
+            onLog("[*] destroy() 没能送达（进程可能已经没了）：${error.message}")
+        }
+        if (conn != null) runCatching { context.unbindService(conn) }
+        onLog("[*] 隔离服务已停（destroy + unbind），${RESTART_SETTLE_MS}ms 后重新拉起")
+        Thread.sleep(RESTART_SETTLE_MS)
+    }
+
     /** See the class note: the chain does not release the binding. */
     fun release() {
         val conn = connection ?: return
@@ -216,6 +324,16 @@ class IsolatedRootShell(private val context: Context) {
         /** startChannel() retry policy: a cold isolated process may not answer at once. */
         const val CHANNEL_START_ATTEMPTS = 3
         const val CHANNEL_START_RETRY_MS = 3_000L
+
+        /**
+         * How many times the isolated process may be killed and started over when it never
+         * reports uid 0: three rounds, the user's number. [CHANNEL_START_ATTEMPTS] identity
+         * reads happen inside each of them.
+         */
+        const val SERVICE_RESTART_ROUNDS = 3
+
+        /** How long the framework gets to reap a killed isolated process before the next bind. */
+        const val RESTART_SETTLE_MS = 2_000L
 
         /**
          * `ServiceInfo.FLAG_ISOLATED_PROCESS` and `ServiceInfo.FLAG_USE_APP_ZYGOTE`.

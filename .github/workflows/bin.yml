@@ -55,8 +55,12 @@ jobs:
 
       # The same target Gradle's buildMagica2Jni runs (`make magica2jni`): the
       # ported Magica root-shell JNI library, .build/jni/libmagica2.so.  It is
-      # checked here because an APK build that dies inside it costs ten minutes;
-      # the readelf dump makes the "no libc++_shared.so" property visible.
+      # checked here because an APK build that dies inside it costs ten minutes,
+      # and the two properties that decide whether the library is *loadable* at
+      # all are asserted, not just printed: it must not depend on libc++_shared.so
+      # (the APK does not ship it), and JNI_OnLoad must be exported (it is what
+      # registers every native method -- the whole library is built with
+      # -fvisibility=hidden).
       - name: Build libmagica2.so
         run: |
           export ANDROID_NDK_HOME="${{ runner.temp }}/ondk"
@@ -66,8 +70,15 @@ jobs:
           "$bin/llvm-strip" --strip-all .build/jni/libmagica2.so || true
           echo "--- NEEDED ---"
           "$bin/llvm-readelf" -d .build/jni/libmagica2.so | grep -E "NEEDED|SONAME" || true
-          echo "--- exported JNI symbols ---"
-          "$bin/llvm-nm" -D --defined-only .build/jni/libmagica2.so | grep -c "Java_" || true
+          if "$bin/llvm-readelf" -d .build/jni/libmagica2.so | grep -q "libc++_shared"; then
+            echo "libmagica2.so needs libc++_shared.so, which the APK does not ship" >&2
+            exit 1
+          fi
+          echo "--- exported JNI entry point ---"
+          "$bin/llvm-nm" -D --defined-only .build/jni/libmagica2.so | grep -E "JNI_OnLoad|Java_" || {
+            echo "libmagica2.so exports no JNI entry point: System.loadLibrary would register nothing" >&2
+            exit 1
+          }
       - name: Upload Ghostlock binary
         uses: actions/upload-artifact@v7
         with:
