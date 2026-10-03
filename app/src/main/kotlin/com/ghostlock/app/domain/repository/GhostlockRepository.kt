@@ -10,6 +10,13 @@ import com.ghostlock.app.domain.model.ParseResult
 interface GhostlockRepository {
     suspend fun snapshot(): KernelSnapshot
 
+    /**
+     * Bring the uid-0 command plane up now, at app entry -- see the implementation for why that
+     * needs neither adb nor a button tap.  Returns true when the plane answered; failures are
+     * reported through [onLog] and are never fatal.
+     */
+    suspend fun prewarmRootPlane(onLog: (String) -> Unit = {}): Boolean
+
     fun selectCpuPair(index: Int)
 
     fun setSafeModeEnabled(enabled: Boolean)

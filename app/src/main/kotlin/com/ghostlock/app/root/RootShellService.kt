@@ -117,7 +117,7 @@ class RootShellService : Service() {
          * "does a command really run as uid 0 through it?" -- a stronger statement than the old
          * "the socket exists" check, and it needs no filesystem at all.
          */
-        override fun startChannel(): Boolean {
+        override fun startChannel(commandPlaneToken: String): Boolean {
             val identity = runCatching { channelIdentity() }.getOrElse { error ->
                 "抛异常 ${error::class.java.simpleName}: ${error.message}"
             }
@@ -139,7 +139,10 @@ class RootShellService : Service() {
             var last = Int.MIN_VALUE
             var used = ""
             for (attempt in 1..COMMAND_SERVER_ATTEMPTS) {
-                used = readCommandToken()
+                /* The token arrives over the binder; the staged file is only a fallback for a
+                 * caller that has not been updated yet (and an empty token means "refuse to
+                 * serve", never "serve without a token"). */
+                used = commandPlaneToken.ifBlank { readCommandToken() }
                 last = runCatching {
                     start_command_server(COMMAND_SERVER_PORT, used, COMMAND_SERVER_ENGINE)
                 }.getOrElse { error ->

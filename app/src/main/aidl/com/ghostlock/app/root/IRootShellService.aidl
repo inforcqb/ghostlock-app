@@ -28,10 +28,19 @@ interface IRootShellService {
     boolean ensureRoot() = 1;
 
     /**
-     * Self-test of the command plane. Requires root() to have succeeded; returns true when
-     * [channelIdentity] really reports uid 0.
+     * Self-test of the command plane, and then bring it up. Requires root() to have succeeded;
+     * returns true when [channelIdentity] really reports uid 0.
+     *
+     * [commandPlaneToken] is the secret the command server (`start_command_server`) requires
+     * from its clients. It travels **here, over the binder**, instead of being read out of
+     * `/data/local/tmp`: the app generated it and knows it, while a device with no adb pairing
+     * cannot push a file anywhere -- and that is exactly the state part 2 has to come up in.
+     * An empty string falls back to the staged file, and a server without a token refuses to
+     * serve at all rather than serving without authentication.
+     *
+     * Whether a listener actually came up is reported separately (the log line with `rc=`).
      */
-    boolean startChannel() = 2;
+    boolean startChannel(String commandPlaneToken) = 2;
 
     /** ensureRoot() + the adbd root patch (blocking, up to 15 s).  Off the main thread. */
     boolean adbRoot() = 3;

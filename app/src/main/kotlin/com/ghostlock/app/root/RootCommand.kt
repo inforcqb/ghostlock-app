@@ -60,8 +60,16 @@ object RootCommand {
     fun port(): Int =
         runCatching { File(dir, "port").readText().trim().toInt() }.getOrDefault(DEFAULT_PORT)
 
-    private fun token(): String =
+    /**
+     * The staged token, also handed to the service over the binder (see
+     * [IRootShellService.startChannel]): without adb there is no way to push it to the device,
+     * and the server refuses to serve without it.
+     */
+    fun token(): String =
         runCatching { File(dir, "token").readText().trim() }.getOrDefault("")
+
+    /** Liveness without a handshake: is the port file there and does a listener answer? */
+    fun staged(): Boolean = token().isNotEmpty()
 
     /**
      * Run one command and wait for its terminator.  [domain] runs it through

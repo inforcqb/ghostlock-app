@@ -1,6 +1,7 @@
 package com.ghostlock.app.ui
 
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
@@ -8,6 +9,7 @@ import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.ChainStateStore
 import com.ghostlock.app.chain.ChainStep
 import com.ghostlock.app.chain.StepState
+import com.ghostlock.app.domain.model.ChainPhase
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LogTone
 import com.ghostlock.app.domain.model.OffsetCandidate
@@ -28,6 +30,7 @@ import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
 import com.ghostlock.app.domain.usecase.RunExploitUseCase
 import com.ghostlock.app.domain.usecase.RunRootChainUseCase
 import com.ghostlock.app.domain.usecase.SelectCpuPairUseCase
+import com.ghostlock.app.wireless.WIRELESS_TAG
 import com.ghostlock.app.wireless.WirelessPairingController
 import com.ghostlock.app.wireless.WirelessStateListener
 import kotlinx.coroutines.CancellationException
@@ -84,6 +87,7 @@ class GhostlockViewModel(
     val effects = effectChannel.receiveAsFlow()
 
     private var kernelSnapshot: KernelSnapshot? = null
+    private var rootPlanePrewarmed = false
     private var pendingParseWithXbl = false
     private var pendingBootPath: String? = null
     private var exportCandidates: List<OffsetCandidate> = emptyList()
@@ -99,7 +103,36 @@ class GhostlockViewModel(
         WirelessPairingController.addListener(wirelessListener)
         viewModelScope.launch {
             refreshSnapshot()
+            /* The Magica server comes up **at entry**, not on a button tap: if this boot is
+             * already in part 2 (permissive + Seccomp 0) the uid-0 command plane needs no adb
+             * and no user action, and the root button is unlocked by the phase alone.  One
+             * attempt per process, silent on failure (the chain retries it). */
+            ensureRootPlanePrewarmed()
         }
+    }
+
+    /**
+     * Start the uid-0 command plane as soon as the app knows this boot is part 2.
+     *
+     * This is what makes "no adb pairing" a non-issue in that state.  Logs go to logcat instead
+     * of the UI log list on purpose: [refreshSnapshot] is driven by the wireless state listener,
+     * and writing into that list from here would re-enter the snapshot forever (the trap
+     * documented on `chainPhase()` in the repository).
+     */
+    private suspend fun ensureRootPlanePrewarmed() {
+        if (rootPlanePrewarmed) return
+        if (state.value.chainPhase != ChainPhase.PART2) return
+        rootPlanePrewarmed = true
+        val ready = runCatching {
+            withContext(Dispatchers.IO) { repository.prewarmRootPlane() }
+        }.getOrElse { error ->
+            Log.i(
+                WIRELESS_TAG,
+                "prewarmRootPlane 失败：${error::class.java.simpleName}: ${error.message}",
+            )
+            false
+        }
+        Log.i(WIRELESS_TAG, "part 2 入口预热：uid-0 命令面 ${if (ready) "已就绪" else "没起来（链会再试）"}")
     }
 
     private val wirelessListener = WirelessStateListener { refreshAccessStatus() }
@@ -577,13 +610,25 @@ class GhostlockViewModel(
             }
             return
         }
-        if (snapshot.wirelessStatus == WirelessChannelStatus.NOT_PAIRED) {
+        /* Part 2 does not run on the wireless channel at all -- the uid-0 command plane does the
+         * work, and the app brings that plane up at entry.  So a missing pairing is only fatal
+         * when the device still needs part 1 (W1 + am hang); a device that is already permissive
+         * with Seccomp 0 must be rootable without pairing anything. */
+        val part2 = mutableState.value.part2Ready || snapshot.chainPhase == ChainPhase.PART2
+        if (snapshot.wirelessStatus == WirelessChannelStatus.NOT_PAIRED && !part2) {
             appendLog(
-                "error: 无线调试通道未配对 —— 一键 root 的 uid-2000 步骤跑在这条通道上，" +
-                    "请先在「无线调试」里配对并连接",
+                "error: 无线调试通道未配对 —— part 1 的步骤（管理端安装 / W1 / am hang）跑在这条通道上，" +
+                    "请先在「无线调试」里配对并连接；" +
+                    "若本机已是 SELinux 宽容 + Seccomp 0（Part 2 已就绪），则无需配对",
             )
             onStatusClick()
             return
+        }
+        if (part2 && snapshot.wirelessStatus == WirelessChannelStatus.NOT_PAIRED) {
+            appendLog(
+                "[*] 未配对无线调试，但本机已是 Part 2（SELinux 宽容 + Seccomp 0）⇒ " +
+                    "不需要 uid-2000 通道，全部步骤走 uid-0 命令面",
+            )
         }
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         if (!beginOperation()) return
@@ -834,6 +879,9 @@ class GhostlockViewModel(
                 safeModeEnabled = snapshot.safeModeEnabled,
                 wirelessStatus = snapshot.wirelessStatus,
                 chainPhase = snapshot.chainPhase,
+                /* Part 2 needs no adb: the button must not be greyed out for a missing pairing
+                 * when the device is already permissive with Seccomp 0. */
+                part2Ready = snapshot.chainPhase == ChainPhase.PART2,
                 exportVisible = canExport,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,

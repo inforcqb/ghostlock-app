@@ -141,6 +141,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      */
     private val isolatedRootShell = IsolatedRootShell(appContext)
 
+    /** One prewarm per process, and what it found; see [prewarmRootPlane]. */
+    @Volatile
+    private var rootPlanePrewarmed = false
+
+    @Volatile
+    private var rootPlaneReady = false
+
     init {
         buildCpuPairs()
         restoreCpuPair()
@@ -186,7 +193,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      *    the part-2 case, which [rememberedPart2Phase] recovers from the chain's own record.
      */
     private suspend fun chainPhase(): ChainPhase {
-        if (!WirelessPairingController.state.paired) return rememberedPart2Phase()
+        /* No pairing is not "unknown": the two facts are readable from *inside this app*, which
+         * is what lets part 2 be recognised without adb at all. */
+        if (!WirelessPairingController.state.paired) return localChainPhase()
         if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) return lastChainPhase
         return phaseGate.withLock {
             if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) {
@@ -220,6 +229,40 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             lastChainPhase = phase
             phase
         }
+    }
+
+    /**
+     * The phase when this app cannot ask anybody: the two facts read **locally**.
+     *
+     * `Seccomp:` comes out of our own `/proc/self/status` (an app may always read that), and
+     * `enforce` out of `/sys/fs/selinux/enforce`. Both reads succeed in the state that matters
+     * here: part 2 is *defined* as permissive + Seccomp 0, and while the device is permissive a
+     * MAC denial cannot stop a read anyway.
+     *
+     * An unreadable fact is never guessed at -- the answer falls back to the chain's own record
+     * ([rememberedPart2Phase]) and then to [lastChainPhase]. That is the safe direction: a wrong
+     * PART2 would offer a root button to a device that still needs the wireless channel for W1.
+     */
+    private fun localChainPhase(): ChainPhase {
+        val status = runCatching { File("/proc/self/status").readText() }.getOrNull()
+            ?: return rememberedPart2Phase()
+        val seccomp = status.lineSequence()
+            .firstOrNull { it.startsWith("Seccomp:") }
+            ?.substringAfter(':')
+            ?.trim()
+            .orEmpty()
+        val enforce = runCatching {
+            File("/sys/fs/selinux/enforce").readText().trim()
+        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return rememberedPart2Phase()
+        val phase = ChainPhaseRule.of(enforce, seccomp)
+        if (phase != lastChainPhase) {
+            Log.i(
+                WIRELESS_TAG,
+                "chain phase（本机读，无 adb）-> $phase（enforce=$enforce, Seccomp=$seccomp）",
+            )
+        }
+        lastChainPhase = phase
+        return phase
     }
 
     /**
@@ -539,6 +582,49 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * (that document's §3 blacklists the "simplified" variants). Nothing here cleans up: the
      * verified chain leaves the adb gate open and the W1 park in place.
      */
+    /**
+     * Bring the Magica uid-0 command plane up **at app entry** -- not when the root button is
+     * tapped, and without any adb.
+     *
+     * This plane is the part of the chain that does not need the wireless channel: the isolated
+     * service escalates itself (AppZygote capset hook + permissive SELinux), and its command
+     * server is handed the token **over the binder** by [RootShellService.startChannel] exactly
+     * because a device with no pairing cannot be pushed a file. So a device that is already in
+     * part 2 has its privileged plane the moment the app opens, and the root button is usable
+     * without pairing anything.
+     *
+     * Silent, idempotent and never fatal: one attempt per process, failures go to the caller's
+     * log sink (the UI passes a logcat sink: writing into the wireless log list would re-enter
+     * the snapshot listener), and the chain calls [IsolatedRootShell.launch] itself anyway if
+     * this did not get there. Returns true when the plane answered.
+     */
+    override suspend fun prewarmRootPlane(onLog: (String) -> Unit): Boolean {
+        if (rootPlanePrewarmed) return rootPlaneReady
+        rootPlanePrewarmed = true
+        return withContext(Dispatchers.IO) {
+            /* Stage the token/port locally (and try the device-side copy: it works when adb is
+             * there and other tools can then drive the same plane; when it is not, the binder
+             * hand-over below is what counts). */
+            runCatching { prepareCommandPlane(onLog) }
+            val ready = runCatching {
+                isolatedRootShell.launch(onLog, RootCommand.token())
+            }.onFailure { error ->
+                onLog(
+                    "[!] uid-0 命令面没能在入口起来：${error::class.java.simpleName}: ${error.message}",
+                )
+            }.isSuccess
+            rootPlaneReady = ready
+            onLog(
+                if (ready) {
+                    "[+] uid-0 命令面已在入口就绪（Magica 隔离服务 + 127.0.0.1:${RootCommand.port()}）"
+                } else {
+                    "[!] uid-0 命令面入口预热失败 —— 链启动时会再试一次"
+                },
+            )
+            ready
+        }
+    }
+
     override suspend fun runRootChain(
         pair: CpuPair,
         onLog: (String) -> Unit,
@@ -569,9 +655,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * need the wireless channel at all. Refusing to start there would strand a device
          * whose adbd never came back as a root adbd. */
         val part2Resume = resumedPart2()
-        if (part2Resume) {
+        /* The live facts count too, not just the record: a device that is permissive with
+         * Seccomp 0 *is* part 2 whether or not a record survived (cleared data, a reinstall),
+         * and part 2 does not need the wireless channel -- that is the whole point of the entry
+         * check, and the reason the button is not greyed out in that state. */
+        val part2Ready = part2Resume || chainPhase() == ChainPhase.PART2
+        if (part2Ready) {
             onLog(
-                "[*] 续跑 PART 2（上一次记录：${ChainStateStore.load()?.summary() ?: "无"}）—— " +
+                "[*] 续跑 PART 2（${if (part2Resume) "上一次记录：" + (ChainStateStore.load()?.summary() ?: "无") else "现场事实 enforce=0 + Seccomp=0"}）—— " +
                     "不要求 uid-2000 通道；本阶段的命令由 uid-0 命令面执行",
             )
         } else if (!WirelessPairingController.ensureChannel(appContext, onLog)) {
@@ -625,7 +716,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user
              * service). It used to be `am start` on an external app that is not installed. */
-            rootShell = { isolatedRootShell.launch(onLog) },
+            rootShell = { isolatedRootShell.launch(onLog, RootCommand.token()) },
             channel = channel,
             adb = adb,
             /* The uid-0 command plane: one line in, output and an exit code out (see

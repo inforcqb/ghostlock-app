@@ -152,6 +152,13 @@ data class GhostlockUiState(
      * preflight step has no phase and is always shown.
      */
     val chainPhase: ChainPhase = ChainPhase.PART1,
+    /**
+     * The device is in part 2 (permissive + `Seccomp` 0), read **without adb** -- from this
+     * app's own `/proc/self/status` and selinuxfs. In that state the whole remaining path runs
+     * on the uid-0 command plane, so the root button must not be greyed out for a missing
+     * pairing, and the status card says 「Part 2 已就绪」.
+     */
+    val part2Ready: Boolean = false,
 )
 
 enum class DialogType { NONE, LIST, INPUT, CONFIRM }
@@ -769,6 +776,7 @@ private fun ControlPanel(
         ActivationStatusCard(
             supported = state.kernelSupported,
             wirelessStatus = state.wirelessStatus,
+            part2Ready = state.part2Ready,
             showParametersHint = !state.executionHasProfile,
             onParametersClick = actions::onOpenParameters,
             onClick = actions::onStatusClick,
@@ -817,13 +825,16 @@ private fun ControlPanel(
 private fun ActivationStatusCard(
     supported: Boolean,
     wirelessStatus: WirelessChannelStatus,
+    part2Ready: Boolean,
     showParametersHint: Boolean,
     onParametersClick: () -> Unit,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val accessReady = wirelessStatus != WirelessChannelStatus.NOT_PAIRED
-    val active = supported && accessReady
+    /* A part-2 device is ready *without* the channel: the remaining path runs on the uid-0
+     * command plane, which the app brings up at entry. */
+    val active = supported && (accessReady || part2Ready)
     val cardColor = if (isSystemInDarkTheme()) {
         if (active) Color(0xFF173923) else Color(0xFF3B2715)
     } else {
@@ -840,7 +851,7 @@ private fun ActivationStatusCard(
         if (isSystemInDarkTheme()) Color(0xFFFFC56C) else Color(0xFFF5A623)
     }
     Card(
-        modifier = modifier.clickable(enabled = supported && !accessReady) { onClick() },
+        modifier = modifier.clickable(enabled = supported && !active) { onClick() },
         colors = CardDefaults.defaultColors(color = cardColor),
     ) {
         Box(
@@ -852,6 +863,7 @@ private fun ActivationStatusCard(
                 text = stringResource(
                     when {
                         !supported -> R.string.kernel_unsupported
+                        part2Ready -> R.string.root_chain_part2
                         wirelessStatus == WirelessChannelStatus.READY -> R.string.wireless_status_ready
                         wirelessStatus == WirelessChannelStatus.PAIRED -> R.string.wireless_status_paired
                         else -> R.string.wireless_status_unpaired
@@ -1029,8 +1041,10 @@ private fun RunActions(
     actions: GhostlockActions,
     modifier: Modifier = Modifier,
 ) {
-    val supported = state.kernelSupported &&
-        state.wirelessStatus != WirelessChannelStatus.NOT_PAIRED
+    /* Part 2 needs no adb: a device that is already permissive with Seccomp 0 has a live uid-0
+     * Magica command plane, so the button must not be greyed out for a missing pairing. */
+    val adbReady = state.wirelessStatus != WirelessChannelStatus.NOT_PAIRED
+    val supported = state.kernelSupported && (adbReady || state.part2Ready)
     val profileValid = state.profileInvalidPaths.isEmpty()
     RunButton(
         running = state.running,
