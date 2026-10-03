@@ -17,16 +17,13 @@ import java.nio.charset.StandardCharsets
  *     RootCommand.exec("rmmod oplus_security_guard").ok
  *     RootCommand.exec("setprop service.adb.tcp.port 5555", domain = "u:r:adbd:s0")
  *
- * Wire format (see gl_server.cpp): banner `GHOSTLOCK/1`, the token line, `OK`,
- * then one command line per request; output is streamed verbatim and terminated
- * by `__GL_EXIT__ <rc>`; a spawn failure comes back as
- * `__GHOSTLOCK_EXEC_FAILED__: <reason>` instead of the terminator.
+ * Wire format (see gl_server.cpp): banner `GHOSTLOCK/1`, `OK`, then one command line per
+ * request; output is streamed verbatim and terminated by `__GL_EXIT__ <rc>`; a spawn failure
+ * comes back as `__GHOSTLOCK_EXEC_FAILED__: <reason>` instead of the terminator.
  *
- * `port` is read from `<filesDir>/port` (the run writes the real one there, in
- * case 5038 was taken), `token` from `<filesDir>/token`.  There is no default token:
- * an empty one means the server refuses to serve at all (loopback is reachable by
- * every app on the device), so an empty read is treated as "not staged yet" and
- * retried -- see [exec].
+ * **There is no authentication** (the user's call, 2026-10-03): the server accepts any client
+ * that reaches 127.0.0.1, so nothing is sent for a handshake. The port file is the only thing
+ * staged in the app's private directory.
  */
 object RootCommand {
 
@@ -59,17 +56,6 @@ object RootCommand {
 
     fun port(): Int =
         runCatching { File(dir, "port").readText().trim().toInt() }.getOrDefault(DEFAULT_PORT)
-
-    /**
-     * The staged token, also handed to the service over the binder (see
-     * [IRootShellService.startChannel]): without adb there is no way to push it to the device,
-     * and the server refuses to serve without it.
-     */
-    fun token(): String =
-        runCatching { File(dir, "token").readText().trim() }.getOrDefault("")
-
-    /** Liveness without a handshake: is the port file there and does a listener answer? */
-    fun staged(): Boolean = token().isNotEmpty()
 
     /**
      * Run one command and wait for its terminator.  [domain] runs it through
@@ -127,7 +113,6 @@ object RootCommand {
             val input = socket.getInputStream()
 
             readLine(input) ?: return Result(-1, "", "no banner")
-            send(out, token())
             val ack = readLine(input)
             if (ack != "OK") return Result(-1, "", "handshake: ${ack ?: "closed"}")
 

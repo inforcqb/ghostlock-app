@@ -337,16 +337,6 @@ object ChainSpec {
     /** The uid-0 command plane's port, as a line the app writes into `<filesDir>/port`. */
     const val COMMAND_PLANE_PORT = 5038
 
-    /**
-     * Where the isolated process reads the plane's token from.
-     *
-     * The plane's own staging contract (`RootShellService.COMMAND_SERVER_TOKEN`): the app
-     * writes the token it generated into `<filesDir>/token` (for [com.ghostlock.app.root.RootCommand])
-     * and pushes the same bytes to this device path, because an isolated process has no
-     * business reading the app's private directory on an enforcing boot.
-     */
-    const val COMMAND_PLANE_TOKEN = "$DEVICE_DIR/token"
-
     const val ADB_PORT = 5555
 
     /** The root adbd the chain talks to once the gate is open (steps 7-9). */

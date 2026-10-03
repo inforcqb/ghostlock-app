@@ -72,12 +72,8 @@ class IsolatedRootShell(private val context: Context) {
      * Killing it is safe *because the round failed*: nothing in a process that never reached
      * uid 0 has forged kernel state yet (the parks that must not die are the ones the engine
      * creates, and those are only reached after a successful identity read).
-     *
-     * [commandPlaneToken] is handed to the service over the binder on every round (see
-     * [IRootShellService.startChannel]): with no adb pairing there is no way to push a token
-     * file to the device, and the command server refuses to serve without one.
      */
-    suspend fun launch(onLog: (String) -> Unit = {}, commandPlaneToken: String = ""): String {
+    suspend fun launch(onLog: (String) -> Unit = {}): String {
         logServiceFacts(onLog)
         var lastFailure: String? = null
         for (round in 1..SERVICE_RESTART_ROUNDS) {
@@ -89,7 +85,7 @@ class IsolatedRootShell(private val context: Context) {
                 restart(onLog)
             }
             val outcome = try {
-                Result.success(startOnce(onLog, commandPlaneToken))
+                Result.success(startOnce(onLog))
             } catch (cancelled: CancellationException) {
                 /* Not a failed round: the caller went away. Re-running three rounds of
                  * bind + 9 s of identity reads after a cancel would keep the app busy for
@@ -114,7 +110,7 @@ class IsolatedRootShell(private val context: Context) {
      * Throws with a diagnosis on any failure; the string it returns on success is what the
      * chain prints.
      */
-    private suspend fun startOnce(onLog: (String) -> Unit, commandPlaneToken: String): String {
+    private suspend fun startOnce(onLog: (String) -> Unit): String {
         val service = try {
             withTimeout(BIND_TIMEOUT_MS) { bindOrNull(onLog) }
         } catch (timeout: TimeoutCancellationException) {
@@ -180,7 +176,7 @@ class IsolatedRootShell(private val context: Context) {
          * makes the native side fork a `runcon u:r:system_server:s0` child that binds
          * instead, and the rc is logged by the service.  What proves the plane end to end is
          * the first command the chain sends through it. */
-        val started = runCatching { service.startChannel(commandPlaneToken) }.getOrElse { error ->
+        val started = runCatching { service.startChannel() }.getOrElse { error ->
             onLog("[!] startChannel() 抛异常：${error::class.java.simpleName}: ${error.message}")
             false
         }

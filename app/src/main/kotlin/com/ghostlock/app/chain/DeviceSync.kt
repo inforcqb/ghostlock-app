@@ -86,11 +86,14 @@ object DeviceSync {
     }
 
     /**
-     * Put literal [content] at [remote] -- the uid-0 command plane's token, at the path the
-     * isolated process reads ([ChainSpec.COMMAND_PLANE_TOKEN]).
+     * Put literal [content] at [remote].
      *
      * Staged in the cache and pushed like every other file: `adb push` is the only transport
      * the app has, and uid 2000 cannot write into the app's private directory.
+     *
+     * Currently unused -- it carried the command plane's token until the plane became
+     * unauthenticated (2026-10-03) -- and kept because it is the one-liner for "push a small
+     * config to the device", which the chain has needed twice already.
      */
     suspend fun pushText(
         context: Context,

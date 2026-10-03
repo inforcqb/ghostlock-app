@@ -20,14 +20,17 @@
  * shape; length-prefixing was rejected as it cannot be driven from a terminal):
  *
  *   S->C  "GHOSTLOCK/1\n"                 banner
- *   C->S  "<token>\n"                     first line
- *   S->C  "OK\n" | "ERR token\n"          (ERR: server closes)
- *         "ERR no-token\n"                the server holds NO token -> it refuses everyone
+ *   S->C  "OK\n"                          immediately: there is NO handshake to fail
+ *   then, once per command:
+ *   C->S  "<command line>\n"              e.g.  rmmod oplus_security_guard
+ *   S->C  <command output, verbatim>      stdout+stderr, no framing
+ *         "__GL_EXIT__ <rc>\n"            always exactly one terminator
  *
- *   FAIL CLOSED: the listener is 127.0.0.1, and on Android loopback is not a security boundary
- *   (any installed app may connect).  An empty token therefore means "nobody", not "anybody":
- *   with no token staged the server does not even start (GL_ERR_ARG), and a client that reaches
- *   a server without one is refused.  The app treats that as a retryable staging failure.
+ *   NO AUTHENTICATION (the user's call, 2026-10-03): any client that can reach 127.0.0.1 may
+ *   drive this uid-0 plane.  127.0.0.1 is the whole boundary, which is why the bind is pinned to
+ *   loopback and why every accepted connection logs its peer uid -- an audit line is all that is
+ *   left of "who did that".  Note that on Android loopback is reachable by every installed app,
+ *   so while this listener is up, a local app can execute uid-0 commands through it.
  *   then, once per command:
  *   C->S  "<command line>\n"              e.g.  rmmod oplus_security_guard
  *   S->C  <command output, verbatim>      stdout+stderr, no framing
@@ -200,28 +203,11 @@ static void gl_serve_client(int fd, const char *token)
 {
     char line[GL_LINE_MAX], domain[128] = "";
     int timeout_ms = GL_DEF_TIMEOUT;
+    (void) token;   /* no auth: see the protocol note at the top of this file */
 
     gl_reply(fd, GL_BANNER);
-    if (gl_read_line(fd, line, sizeof(line)) <= 0) return;
-    if (!token || !*token) {
-        /* FAIL CLOSED, and this check is the point of the whole handshake.
-         *
-         * The listener is on 127.0.0.1, which on Android is NOT a security boundary: every
-         * installed app may connect to loopback without any permission.  So "no token was
-         * staged" must never mean "anyone may drive uid 0" -- it means nobody may.  The app
-         * side treats an empty token as a *retryable staging failure* (it re-pushes the token)
-         * and the chain still has the root-adbd transport, so refusing here costs a fallback,
-         * while accepting would hand uid-0 command execution to any local process. */
-        gl_loge("gl_server: refusing a client -- no token was staged (fail closed); "
-                "the app must push the token file first");
-        gl_reply(fd, "ERR no-token\n");
-        return;
-    }
-    if (strcmp(line, token) != 0) {
-        gl_logw("gl_server: refusing a client -- wrong token");
-        gl_reply(fd, "ERR token\n");
-        return;
-    }
+    /* Straight to commands.  There is no token to present and nothing to refuse: a client that
+     * got this far is already inside the only boundary this plane has (127.0.0.1). */
     gl_reply(fd, "OK\n");
 
     while (gl_read_line(fd, line, sizeof(line)) > 0) {
@@ -326,14 +312,13 @@ static void *gl_accept_loop(void *arg)
 int gl_server_start(int port, const char *token, const char *engine_path)
 {
     int srv;
+    (void) token;   /* no auth: see the protocol note at the top of this file */
 
-    if (!token || !*token) {
-        /* No token staged: do NOT open a uid-0 listener at all (see gl_serve_client).  The
-         * caller sees GL_ERR_ARG, the app re-stages the token and retries -- a missing token is
-         * a retryable staging failure, never an escalation failure. */
-        gl_loge("gl_server: refusing to start -- empty token (fail closed)");
-        return GL_ERR_ARG;
-    }
+    /* Said out loud on every start, because this is the one property of the listener nobody
+     * should have to infer from the code: whoever can reach 127.0.0.1 can run commands as uid 0
+     * through it. */
+    gl_logw("gl_server: starting WITHOUT authentication -- 127.0.0.1:%d accepts any local client",
+            port > 0 ? port : GL_DEF_PORT);
     srv = gl_listen_socket(port);
     if (srv >= 0) {
         struct gl_accept_args *a = (struct gl_accept_args *) calloc(1, sizeof(*a));
@@ -366,11 +351,10 @@ int gl_server_start(int port, const char *token, const char *engine_path)
 int gl_server_run(int port, const char *token)
 {
     int srv;
+    (void) token;   /* no auth: see the protocol note at the top of this file */
 
-    if (!token || !*token) {
-        gl_loge("gl_server: refusing to run -- empty token (fail closed)");
-        return GL_ERR_ARG;
-    }
+    gl_logw("gl_server: serving WITHOUT authentication on 127.0.0.1:%d",
+            port > 0 ? port : GL_DEF_PORT);
     srv = gl_listen_socket(port);
 
     if (srv < 0) return GL_ERR_BIND;
@@ -398,12 +382,7 @@ int main(int argc, char **argv)
     int i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[++i];
-    }
-    if (!*token) {
-        fprintf(stderr, "glserver: --token is required -- refusing to serve uid-0 commands "
-                        "without one\n");
-        return 2;
+        else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[++i];   /* ignored */
     }
     return gl_server_run(port, token) == GL_OK ? 0 : 1;
 }

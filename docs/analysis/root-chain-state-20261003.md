@@ -42,7 +42,7 @@
 | ④b adb 通道降级为「可选」 | ✅ 已推 | `RootChain.kt`:`RootExec` 接口 + `privileged()`(adb 优先、uid-0 命令面兜底、adb 抛异常即永久切换);`adb.connect()`/identity/CapEff 全部只记日志;`ksud late-load` 也走 `privileged()` |
 | ③ 入口早期判 part | ✅ 已推 | `run()` 入口一次 `readBootFacts()` + 一行「阶段判定:**PART 1 / PART 2**」;`readFact()` 让 enforce/Seccomp/hang 标记在 uid-2000 通道没了时改读 uid-0 命令面(Seccomp 用 `/proc/1/status`);repo 侧 `resumedPart2()`(读 `ChainStateStore`,纯文件 I/O)在 part 2 续跑时**不再要求无线通道**;UI `rememberedPart2Phase()` 让 part-2 面板与「Part 2 已就绪」在 framework 重启后仍显示 |
 | ① APK 安装前移 | ✅ 已推 | 新 `ChainStep.MANAGER_INSTALL`(PART1,在 `W1` 之前),`PRIV_ENV` 里的安装删除;part 2 续跑时该步自跳过 |
-| 命令面 token 落地 | ✅ 已推 | `AndroidGhostlockRepository.prepareCommandPlane()`:随机 48 hex token → `<filesDir>/token` + `<filesDir>/port`(供 `RootCommand`),同字节 `DeviceSync.pushText()` → `/data/local/tmp/gl-w1/token`(供隔离进程内的 server);失败只记日志(空 token = 无鉴权,server 端 `if (token && *token …)` 会跳过校验) |
+| 命令面 token 落地（**已被 2026-10-03 的 no auth 取代，见 §5**） | ✅ 已推 | `AndroidGhostlockRepository.prepareCommandPlane()`:随机 48 hex token → `<filesDir>/token` + `<filesDir>/port`(供 `RootCommand`),同字节 `DeviceSync.pushText()` → `/data/local/tmp/gl-w1/token`(供隔离进程内的 server);失败只记日志(空 token = 无鉴权,server 端 `if (token && *token …)` 会跳过校验) |
 | `magica2jni` target 补回 | ✅ CI 验证 | APK 构建自 gl_server 那批提交起一直是**红的**(`make: *** No rule to make target 'magica2jni'`,run `37085075891`);`Makefile` 现在按 `app/src/main/jni/Android.mk` 手抄 `magica2`/`lsplt`/`system_properties` 三模块源码,`-static-libstdc++`(APK 不带 `libc++_shared.so`)、保留 `-fvisibility=hidden` + `-Wl,-exclude-libs,ALL`,去掉 LTO。补了 `-include bionic_compat.h`(vendored `prop_area.h` 用的 `__BIONIC_ALIGN` 只在平台私有 `<sys/cdefs.h>` 里) |
 | `bin.yml` 变成真正的 fast path | ✅ | 现在也编 `.build/jni/libmagica2.so` 并**断言**两件事:不依赖 `libc++_shared.so`、`JNI_OnLoad` 必须导出(全库 `-fvisibility=hidden`,漏了就 `UnsatisfiedLinkError`);同时开始监听 `main`,native-only 的问题 2 分钟就能看见 |
 | Magica uid-0 自检失败 → 杀进程重拉 | ✅ 已推 | `IsolatedRootShell.launch()` 改成 **3 轮**:每轮 bind + `ensureRoot()` + 3 次 × 3s 身份读取;某轮 3 次都不是 uid=0 就 `destroy()`(stopSelf,app 对别的 uid 进程没有 kill 权限)+ `unbindService()` + 2s 静置,然后 fork 新进程;第 3 轮仍失败才抛。取消(`CancellationException`)直接上抛,不再被轮询吞掉 |
@@ -106,15 +106,15 @@ part2    MAGICA_ROOT(3×3s 重试) ──► startChannel(): identity=uid=0
 **协议**(行协议,`nc` 与 Java 通用):
 
 ```
-S->C GHOSTLOCK/1 ; C->S <token> ; S->C OK
+S->C GHOSTLOCK/1 ; S->C OK          （> 2026-10-03：无鉴权，客户端连上直接发命令）
 C->S <一条命令>\n ; S->C <输出原样> ; S->C __GL_EXIT__ <rc>\n
 指令 @t <ms> / @domain <selinux> ; 内置 @id / @quit ; 失败 __GHOSTLOCK_EXEC_FAILED__: <reason>
 ```
 
-只 bind `127.0.0.1`,默认端口 **5038**;token 由 app 生成(48 hex),写 `<filesDir>/token`(给 `RootCommand`)
-并推同一份到 `/data/local/tmp/gl-w1/token`(给隔离进程;推不到就是空 token = 无鉴权,仍可用)。
+只 bind `127.0.0.1`,默认端口 **5038**;**no auth**(2026-10-03 用户决定):没有 token、也没有握手可失败项,
+127.0.0.1 就是全部边界(代价见 §5)。
 
-shell 侧用法:`printf '<token>\nid\n' | nc 127.0.0.1 5038`
+shell 侧用法:`printf 'id\n' | nc 127.0.0.1 5038`
 
 ## 3. 下一步(TODO)
 
@@ -124,10 +124,10 @@ shell 侧用法:`printf '<token>\nid\n' | nc 127.0.0.1 5038`
 | # | 任务 | 位置 / 做法 |
 |---|---|---|
 | V1 | ~~CI 转绿~~ ✅ run `37086461837` 全绿;APK:`releases/download/release/GhostLock-release.apk` | — |
-| V2 | 装机跑 part 1:应看到阶段判定 PART 1、`pm install` 在 W1 之前、`uid-0 命令面暂存：port=5038 token=…`、`Magica startChannel()（uid-0 命令面 …）-> true` | `logcat -s GhostlockRoot` |
+| V2 | 装机跑 part 1:应看到阶段判定 PART 1、`pm install` 在 W1 之前、`uid-0 命令面：port=5038`、`Magica startChannel()（uid-0 命令面 …）-> true` | `logcat -s GhostlockRoot` |
 | V3 | `am hang` 之后(part 2 续跑)必须看到:阶段判定 **PART 2**、面板标题 **「Part 2 已就绪」**、`[+] 提权通道：root adbd …` 或 `[!] root adbd 不可用 … ⇒ …uid-0 命令面` + 紧跟一行 `[*] uid-0 命令面自检（exit=0）：CapInh… CapPrm… CapEff… CapBnd… NoNewPrivs…`;**不再**出现「无线调试通道不可用 ⇒ return false」 | 同上 |
 | V3b | **看 V3 那行 `CapBnd`**:若 `000001ffffffffff`(满)⇒ part 2 真的不依赖 adb;若 `0` ⇒ 只有 `rmmod` / `ksud late-load` 还必须走 adb 门(其余仍可走命令面),这决定了要不要再补一次 W1c 把 bounding set 也填上 | 同上 |
-| V4 | 命令面自测:`printf '<filesDir>/token\nid\n' \| nc 127.0.0.1 5038` ⇒ uid=0;日志里 `startChannel: command server port=5038 rc=0`(0=listening,-1=bind failed) | adb shell |
+| V4 | 命令面自测:`printf 'id\n' \| nc 127.0.0.1 5038` ⇒ uid=0;日志里 `startChannel: command server port=5038 rc=0`(0=listening,-1=bind failed) | adb shell |
 | V5 | 重启策略实测:故意让第一轮失败(例如先占住 5038 或让 capset hook 不生效)看是否出现「第 1 轮没拿到 uid=0 ⇒ 杀掉隔离进程重新拉起(第 2/3 轮)」 | 可选 |
 | V6 | runcon 回退(bind 失败 → `runcon u:r:system_server:s0` 子进程监听)还没真机验证过 | 可选 |
 | V7 | 可选:`cleanup-parked.sh` 加 `GL_FIX_SELINUX=1` 开关(默认关) | `tools/device/cleanup-parked.sh` |
@@ -138,7 +138,7 @@ shell 侧用法:`printf '<token>\nid\n' | nc 127.0.0.1 5038`
 ```sh
 adb shell 'grep -aE "command server port|LOAD_KO|W1c: wrote|RESULT|handed to parked|killed parked" /data/local/tmp/gl-w1/w1c.log'
 adb shell 'grep -a "startChannel" <logcat -s GhostlockRoot>'      # 0=listening, -1=bind failed
-printf '<token>\nid\n' | nc 127.0.0.1 5038                        # 期望 uid=0 + 该进程的 context
+printf 'id\n' | nc 127.0.0.1 5038                                  # 期望 uid=0 + 该进程的 context
 adb shell 'cat /sys/fs/selinux/enforce /sys/fs/selinux/checkreqprot'
 adb shell 'for c in /sys/fs/selinux/policy_capabilities/*; do echo $c=$(cat $c); done'
 ```
@@ -150,12 +150,13 @@ adb shell 'for c in /sys/fs/selinux/policy_capabilities/*; do echo $c=$(cat $c);
 - `magica2jni` 的构建必须同时包含 `gl_server.cpp`(引擎的 `CXX_SRCS`、`Android.mk` 的 `LOCAL_SRC_FILES`,以及根 `Makefile` 的 `MAGICA2_SRCS` 三处);
 - parked 进程在清理验证通过前**不能退**(exit 会走伪造 PI 树 → wedge);
 - `selinux_state` 每次 W1 都会踩 `+0..+7`,需要 kread 恢复(脚本 `fix-selinux.sh`,永不自动开 enforcing);
-- 命令面 server 的 token **为空 = fail closed**（2026-10-03 改）：没有 token 时 `gl_server.cpp`
-  **不监听**（`GL_ERR_ARG` ⇒ app 日志里 `rc=-2`），有 token 的连接才放行。理由：127.0.0.1 上的
-  loopback **不是安全边界**（任何 app 都能连），空 token 等于把 uid-0 任意命令执行交给全设备。
-  空 token 现在按「可重试的暂存失败」处理：app 侧推 3 次（`prepareCommandPlane`）、`startChannel()`
-  重读 token 3 次、`RootCommand` 只重试「命令还没跑」的失败（连接 / 握手 / `__GHOSTLOCK_EXEC_FAILED__`），
-  重试期间链照常走 adb；
+- 命令面 server **无鉴权（no auth，2026-10-03 用户决定）**：`gl_server.cpp` 的协议是
+  `banner → OK → 命令`，没有 token、没有握手可失败项；**127.0.0.1 就是全部边界**。后果要写清楚：
+  在 Android 上 loopback **不是安全边界**，任何已安装的 app 都能连上来，所以**只要这个 listener 活着，
+  本机任意 app 就能通过它执行 uid-0 命令**。因此保留了两件事：bind 永远钉在 `127.0.0.1`（绝不
+  `0.0.0.0`），并且**每个被接受的连接都记一行 peer uid**（`gl_server: client uid=… connected`）——
+  出问题至少能查是谁。token 相关的代码/常量/推送/暂存已全部删除（`startChannel()` 回到无参、
+  `RootCommand` 不再发送任何握实行、`prepareCommandPlane` 只写端口文件）；
 - **重试规则（2026-10-03，用户定的）**：**只有 W1 不重试**。其余每个步骤失败都按
   `ChainSpec.STEP_ATTEMPTS = 3` / `STEP_RETRY_MS = 8s` 重放，重放完才报失败——一次错误是一个 attempt，
   不是「提权失败」。两个例外都在 `step()` 之外：`AM_HANG` 在 `step()` 层只试 1 次（它自己内部已有

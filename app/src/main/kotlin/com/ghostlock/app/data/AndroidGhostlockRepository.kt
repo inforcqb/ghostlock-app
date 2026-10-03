@@ -16,8 +16,6 @@ import com.ghostlock.app.chain.RootExec
 import com.ghostlock.app.chain.ShellResult
 import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.root.IsolatedRootShell
-import com.ghostlock.app.root.COMMAND_SERVER_ATTEMPTS
-import com.ghostlock.app.root.COMMAND_SERVER_RETRY_MS
 import com.ghostlock.app.root.RootChannel
 import com.ghostlock.app.root.RootCommand
 import android.annotation.SuppressLint
@@ -47,7 +45,6 @@ import com.ghostlock.app.domain.model.WirelessChannelStatus
 import com.ghostlock.app.wireless.WirelessPairingController
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -56,7 +53,6 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
-import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -93,9 +89,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val LastRunFileName = ".ghostlock_last_run"
         const val W3SeccompFailureMarker = "W3 seccomp clear failed"
 
-        /* The uid-0 command plane's staging contract (see `prepareCommandPlane` and
-         * `RootShellService`'s COMMAND_SERVER_* constants). */
-        const val CommandPlaneTokenName = "token"
+        /* The uid-0 command plane's staging contract: only the port is staged (there is no
+         * token any more -- the server has no authentication, see `prepareCommandPlane`). */
         const val CommandPlanePortName = "port"
     }
 
@@ -607,7 +602,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * hand-over below is what counts). */
             runCatching { prepareCommandPlane(onLog) }
             val ready = runCatching {
-                isolatedRootShell.launch(onLog, RootCommand.token())
+                isolatedRootShell.launch(onLog)
             }.onFailure { error ->
                 onLog(
                     "[!] uid-0 命令面没能在入口起来：${error::class.java.simpleName}: ${error.message}",
@@ -716,7 +711,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * isolated service from THIS process (an isolated service may only be bound by
              * the app that declares it, so it cannot be done from the Shizuku user
              * service). It used to be `am start` on an external app that is not installed. */
-            rootShell = { isolatedRootShell.launch(onLog, RootCommand.token()) },
+            rootShell = { isolatedRootShell.launch(onLog) },
             channel = channel,
             adb = adb,
             /* The uid-0 command plane: one line in, output and an exit code out (see
@@ -747,61 +742,24 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     /**
-     * Stage the uid-0 command plane's token, and hand `RootCommand` the port.
+     * Hand `RootCommand` the port the uid-0 command plane listens on.
      *
-     * Two copies of one secret on purpose: `<filesDir>/token` for [RootCommand] in this
-     * process, and [ChainSpec.COMMAND_PLANE_TOKEN] on the device for the server inside the
-     * isolated process (which has no business reading the app's private directory on an
-     * enforcing boot).
-     *
-     * **No token means no plane, never an open plane.** The server refuses to serve without one
-     * (`gl_server.cpp`, fail closed), because its listener is on loopback and every app on the
-     * device can reach loopback. So a staging failure is *retried* here -- three pushes, a second
-     * apart -- and if it still fails the run simply keeps using the root adbd, with a log line
-     * that says so; the next chain attempt stages it again.
+     * That is all there is to stage now: the server has **no authentication** (the user's call,
+     * 2026-10-03), so there is no secret to create, push or read back -- and with it the whole
+     * adb dependency of this step is gone, which is what lets part 2 come up on a device that
+     * was never paired.
      */
     private suspend fun prepareCommandPlane(onLog: (String) -> Unit): Int {
         RootCommand.attach(filesDir)
         val port = ChainSpec.COMMAND_PLANE_PORT
-        val token = runCatching {
-            val existing = File(filesDir, CommandPlaneTokenName).readText().trim()
-            /* Reuse a good token: the *server* may still be running from an earlier part of the
-             * run and holding the old one. */
-            if (existing.length >= 32) existing else newToken()
-        }.getOrElse { newToken() }
         val local = runCatching {
-            File(filesDir, CommandPlaneTokenName).writeText(token, StandardCharsets.UTF_8)
             File(filesDir, CommandPlanePortName).writeText("$port\n", StandardCharsets.UTF_8)
             true
         }.getOrDefault(false)
-        /* Three pushes, a second apart: the first one loses to a busy adb server or to the
-         * isolated process still reading the old file, and a missing token now costs the whole
-         * fallback transport (the server fails closed). */
-        var pushed = false
-        for (attempt in 1..COMMAND_SERVER_ATTEMPTS) {
-            pushed = runCatching {
-                DeviceSync.pushText(appContext, ChainSpec.COMMAND_PLANE_TOKEN, "$token\n", "644", onLog)
-            }.getOrDefault(false)
-            if (pushed) break
-            if (attempt < COMMAND_SERVER_ATTEMPTS) {
-                onLog("[*] token 推送失败（第 $attempt/$COMMAND_SERVER_ATTEMPTS 次）⇒ 重试")
-                delay(COMMAND_SERVER_RETRY_MS)
-            }
-        }
-        onLog(
-            "[*] uid-0 命令面暂存：port=$port token=${token.take(6)}…（本机文件 ${if (local) "ok" else "失败"}，" +
-                "设备侧 ${if (pushed) "已推送" else "没推送 ⇒ 命令面会拒绝所有连接（fail closed），本次只走 adb"}" +
-                "）",
-        )
+        if (!local) onLog("[!] 端口文件写不进去（${filesDir.name}/$CommandPlanePortName）—— " +
+            "RootCommand 会用默认端口 $port")
         return port
     }
-
-    private fun newToken(): String {
-        val bytes = ByteArray(24)
-        SecureRandom().nextBytes(bytes)
-        return bytes.joinToString("") { byte -> byte.toUByte().toString(16).padStart(2, '0') }
-    }
-
     /**
      * Is this run the second half of a chain that `am hang --allow-restart` interrupted?
      *
