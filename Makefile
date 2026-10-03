@@ -125,8 +125,13 @@ MAGICA2_SRCS := \
   $(JNI_DIR)/system_properties/system_property_api.cpp \
   $(JNI_DIR)/system_properties/system_property_set.cpp
 MAGICA2_INCLUDES := -I$(JNI_DIR) -I$(JNI_DIR)/lsplt/include -I$(JNI_DIR)/system_properties/include
+# The vendored AOSP system_properties sources use a couple of bionic-internal
+# helpers (`__BIONIC_ALIGN`) that only exist in the platform build's private
+# <sys/cdefs.h>; the NDK's public sysroot has no such thing.  The shim is
+# force-included rather than patched into the upstream files.
+MAGICA2_COMPAT := -include $(JNI_DIR)/bionic_compat.h
 MAGICA2_FLAGS := -O2 -fPIC -Wall -Wextra -Wno-unused-function -Wno-unused-parameter \
-  -fvisibility=hidden -fvisibility-inlines-hidden $(MAGICA2_INCLUDES)
+  -fvisibility=hidden -fvisibility-inlines-hidden $(MAGICA2_INCLUDES) $(MAGICA2_COMPAT)
 
 magica2jni: $(MAGICA2_SO)
 
