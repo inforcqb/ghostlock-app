@@ -43,13 +43,20 @@
 | ③ 入口早期判 part | ✅ 已推 | `run()` 入口一次 `readBootFacts()` + 一行「阶段判定:**PART 1 / PART 2**」;`readFact()` 让 enforce/Seccomp/hang 标记在 uid-2000 通道没了时改读 uid-0 命令面(Seccomp 用 `/proc/1/status`);repo 侧 `resumedPart2()`(读 `ChainStateStore`,纯文件 I/O)在 part 2 续跑时**不再要求无线通道**;UI `rememberedPart2Phase()` 让 part-2 面板与「Part 2 已就绪」在 framework 重启后仍显示 |
 | ① APK 安装前移 | ✅ 已推 | 新 `ChainStep.MANAGER_INSTALL`(PART1,在 `W1` 之前),`PRIV_ENV` 里的安装删除;part 2 续跑时该步自跳过 |
 | 命令面 token 落地 | ✅ 已推 | `AndroidGhostlockRepository.prepareCommandPlane()`:随机 48 hex token → `<filesDir>/token` + `<filesDir>/port`(供 `RootCommand`),同字节 `DeviceSync.pushText()` → `/data/local/tmp/gl-w1/token`(供隔离进程内的 server);失败只记日志(空 token = 无鉴权,server 端 `if (token && *token …)` 会跳过校验) |
-| `magica2jni` target 补回 | ✅ 已推 | APK 构建自 gl_server 那批提交起一直是**红的**(`make: *** No rule to make target 'magica2jni'`,run `37085075891`);`Makefile` 现在按 `app/src/main/jni/Android.mk` 手抄 `magica2`/`lsplt`/`system_properties` 三模块源码,`-static-libstdc++`(APK 不带 `libc++_shared.so`)、保留 `-fvisibility=hidden` + `-Wl,-exclude-libs,ALL`,去掉 LTO |
+| `magica2jni` target 补回 | ✅ CI 验证 | APK 构建自 gl_server 那批提交起一直是**红的**(`make: *** No rule to make target 'magica2jni'`,run `37085075891`);`Makefile` 现在按 `app/src/main/jni/Android.mk` 手抄 `magica2`/`lsplt`/`system_properties` 三模块源码,`-static-libstdc++`(APK 不带 `libc++_shared.so`)、保留 `-fvisibility=hidden` + `-Wl,-exclude-libs,ALL`,去掉 LTO。补了 `-include bionic_compat.h`(vendored `prop_area.h` 用的 `__BIONIC_ALIGN` 只在平台私有 `<sys/cdefs.h>` 里) |
+| `bin.yml` 变成真正的 fast path | ✅ | 现在也编 `.build/jni/libmagica2.so` 并**断言**两件事:不依赖 `libc++_shared.so`、`JNI_OnLoad` 必须导出(全库 `-fvisibility=hidden`,漏了就 `UnsatisfiedLinkError`);同时开始监听 `main`,native-only 的问题 2 分钟就能看见 |
+| Magica uid-0 自检失败 → 杀进程重拉 | ✅ 已推 | `IsolatedRootShell.launch()` 改成 **3 轮**:每轮 bind + `ensureRoot()` + 3 次 × 3s 身份读取;某轮 3 次都不是 uid=0 就 `destroy()`(stopSelf,app 对别的 uid 进程没有 kill 权限)+ `unbindService()` + 2s 静置,然后 fork 新进程;第 3 轮仍失败才抛。取消(`CancellationException`)直接上抛,不再被轮询吞掉 |
+| `startChannel()` 真正被调用 | ✅ 已推 | 之前**没人调用**它 ⇒ `gl_server` 从来没被启动过,整个 uid-0 命令面是死代码(服务 bind 了、身份读了,但 5038 上没有 listener)。现在在 `launch()` 里 uid=0 确认之后调用,`false` 判为本轮失败(下一轮会重启进程) |
 
 ### 关键 commit(main)
 
 ```
+4850d5163  root: restart the isolated process when it never becomes uid 0; start the command plane
+4911dd7e3  build: force-include bionic_compat.h in the magica2jni target
+af7faead1  build: fix the magica2jni source list typo, and build it in the fast workflow
 2e148a076  build: add the missing `magica2jni` target (libmagica2.so)
 57d4b6c1b  chain: part 2 runs on the uid-0 command plane, install moves to part 1   ← ④b + ① + ③ + token
+2dd219c43  docs: state / objective / next（本轮更新）
 bbb27f5c7  docs: state / objective / next for the root-chain work (2026-10-03)
 232ea2495  root service: start the uid-0 command server as part of startChannel()
 092a9bebd  jni: start_command_server(port, token, engine) -- the uid-0 command server entry
@@ -61,6 +68,9 @@ bbb27f5c7  docs: state / objective / next for the root-chain work (2026-10-03)
 48c8d9670 / 4d0b8f4b7 / 51da942ff  build: gl_server.cpp 链进引擎与 libmagica2.so
 d42f2e39b  app/jni: gl_server.cpp（server 本体 + 协议）
 ```
+
+**CI**:run `37086461837`(main = `4850d5163`)**全绿**(Build APK 9m36s + 两个 extractor + Release)。
+签名 APK 在 release 资产里:`https://github.com/inforcqb/ghostlock-app/releases/download/release/GhostLock-release.apk`(tag `release`,资产每次构建覆盖);原始件也可从 run 页面下(`GhostLock-release.apk` / `ghostlock` / `libmagica2`,后两个 `archive:false` 得用 `gh api .../artifacts/<id>/zip`)。
 
 ## 2. 当前形态(数据流)
 
@@ -95,23 +105,26 @@ C->S <一条命令>\n ; S->C <输出原样> ; S->C __GL_EXIT__ <rc>\n
 指令 @t <ms> / @domain <selinux> ; 内置 @id / @quit ; 失败 __GHOSTLOCK_EXEC_FAILED__: <reason>
 ```
 
-只 bind `127.0.0.1`,默认端口 **5038**;`RootCommand` 从 `<filesDir>/port`、`<filesDir>/token` 读(缺省回落 5038 + 空 token)。
+只 bind `127.0.0.1`,默认端口 **5038**;token 由 app 生成(48 hex),写 `<filesDir>/token`(给 `RootCommand`)
+并推同一份到 `/data/local/tmp/gl-w1/token`(给隔离进程;推不到就是空 token = 无鉴权,仍可用)。
 
 shell 侧用法:`printf '<token>\nid\n' | nc 127.0.0.1 5038`
 
 ## 3. 下一步(TODO)
 
-**代码侧本轮的 ④b / ① / ③ 与 token 落地已经推完**(`57d4b6c1b` + `2e148a076`),剩下的是**验证**:
+**代码侧本轮的 ④b / ① / ③ + token 落地 + Magica 重启策略 + 构建修复都已推完并且 CI 全绿**(见上),
+剩下的是**真机验证**:
 
 | # | 任务 | 位置 / 做法 |
 |---|---|---|
-| V1 | CI 转绿:run `37085729678`(`Build`,main,含 `Makefile` 修复)必须 `Build APK` 全绿 —— 之前 `magica2jni` 缺失让 APK 构建一直是红的,这轮是第一次真正编译 `libmagica2.so` + 新增 Kotlin | `gh run watch 37085729678` 或 `gh run view --log-failed` |
-| V2 | 装机跑一遍 part 1,看新增日志:阶段判定 PART 1、`pm install` 在 W1 之前、`uid-0 命令面暂存：port=5038 token=…` | `logcat -s GhostlockRoot` |
-| V3 | `am hang` 之后(part 2 续跑)必须看到:阶段判定 **PART 2**、面板标题 **「Part 2 已就绪」**、`[+] 提权通道：root adbd …` 或 `[!] root adbd 不可用 … ⇒ 本阶段剩余命令全部走 uid-0 命令面`;**不再**出现「无线调试通道不可用 ⇒ return false」 | 同上 |
-| V4 | 命令面自测(设备侧):`printf '<filesDir>/token\nid\n' \| nc 127.0.0.1 5038` ⇒ uid=0;或直接看 `startChannel: command server port=5038 rc=0` | adb shell |
-| V5 | runcon 回退(监听失败)在真机上还没验证过:需要制造 bind 失败(例如先占住 5038)看是否出现 `u:r:system_server:s0` 的 listener | 可选 |
-| V6 | 可选:`cleanup-parked.sh` 里加 `GL_FIX_SELINUX=1` 开关(默认关),让清理顺手修 selinux | `tools/device/cleanup-parked.sh` |
-| V7 | 可选:设备没有 `/data/local/tmp` 时,命令面 token / engine 路径仍是硬编码 —— server 端读不到 token 就是空 token(无鉴权,仍能用),但 runcon 回退的 engine 路径会找不到 | `ChainSpec.DEVICE_DIR` / `RootShellService.COMMAND_SERVER_*` |
+| V1 | ~~CI 转绿~~ ✅ run `37086461837` 全绿;APK:`releases/download/release/GhostLock-release.apk` | — |
+| V2 | 装机跑 part 1:应看到阶段判定 PART 1、`pm install` 在 W1 之前、`uid-0 命令面暂存：port=5038 token=…`、`Magica startChannel()（uid-0 命令面 …）-> true` | `logcat -s GhostlockRoot` |
+| V3 | `am hang` 之后(part 2 续跑)必须看到:阶段判定 **PART 2**、面板标题 **「Part 2 已就绪」**、`[+] 提权通道：root adbd …` 或 `[!] root adbd 不可用 … ⇒ …uid-0 命令面`;**不再**出现「无线调试通道不可用 ⇒ return false」 | 同上 |
+| V4 | 命令面自测:`printf '<filesDir>/token\nid\n' \| nc 127.0.0.1 5038` ⇒ uid=0;日志里 `startChannel: command server port=5038 rc=0`(0=listening,-1=bind failed) | adb shell |
+| V5 | 重启策略实测:故意让第一轮失败(例如先占住 5038 或让 capset hook 不生效)看是否出现「第 1 轮没拿到 uid=0 ⇒ 杀掉隔离进程重新拉起(第 2/3 轮)」 | 可选 |
+| V6 | runcon 回退(bind 失败 → `runcon u:r:system_server:s0` 子进程监听)还没真机验证过 | 可选 |
+| V7 | 可选:`cleanup-parked.sh` 加 `GL_FIX_SELINUX=1` 开关(默认关) | `tools/device/cleanup-parked.sh` |
+| V8 | 可选:设备没有 `/data/local/tmp` 时 `ChainSpec.DEVICE_DIR` / `RootShellService.COMMAND_SERVER_*` 仍是硬编码(token 读不到 = 空 token 仍能用,但 runcon 回退的 engine 路径会找不到) | — |
 
 ## 4. 设备侧检查清单(跑完一条链后看)
 
