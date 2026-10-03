@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -204,21 +205,84 @@ static void gl_serve_client(int fd, const char *token)
  * AdbService gate).  Returns GL_ERR_BIND when the listener cannot be created --
  * the caller then re-execs this program under another domain.
  */
-int gl_server_run(int port, const char *token)
+static int gl_listen_socket(int port)
 {
     int srv, on = 1;
     struct sockaddr_in sa;
 
     signal(SIGPIPE, SIG_IGN);
     srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) return GL_ERR_BIND;
+    if (srv < 0) return -1;
     (void) setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t) (port > 0 ? port : GL_DEF_PORT));
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      /* 127.0.0.1 only */
-    if (bind(srv, (struct sockaddr *) &sa, sizeof(sa)) != 0) { close(srv); return GL_ERR_BIND; }
-    if (listen(srv, 4) != 0) { close(srv); return GL_ERR_BIND; }
+    if (bind(srv, (struct sockaddr *) &sa, sizeof(sa)) != 0) { close(srv); return -1; }
+    if (listen(srv, 4) != 0) { close(srv); return -1; }
+    return srv;
+}
+
+struct gl_accept_args { int srv; char token[256]; };
+
+static void *gl_accept_loop(void *arg)
+{
+    struct gl_accept_args *a = (struct gl_accept_args *) arg;
+    for (;;) {
+        int c = accept(a->srv, NULL, NULL);
+        if (c < 0) { if (errno == EINTR) continue; break; }
+        gl_serve_client(c, a->token);
+        close(c);
+    }
+    close(a->srv);
+    free(a);
+    return NULL;
+}
+
+/*
+ * Start the listener without blocking the caller: the bind happens here (so the
+ * caller learns whether it worked), the accept loop runs in a detached thread.
+ * When the bind fails, fork a child that keeps uid 0, switches to the
+ * system_server domain and re-execs the (already staged) engine in --glserver
+ * mode -- runcon is the fallback for *listening*, nothing else.  Returns 0 when
+ * a listener exists in either place, GL_ERR_BIND otherwise.
+ */
+int gl_server_start(int port, const char *token, const char *engine_path)
+{
+    int srv = gl_listen_socket(port);
+    if (srv >= 0) {
+        struct gl_accept_args *a = (struct gl_accept_args *) calloc(1, sizeof(*a));
+        pthread_t th;
+        if (!a) { close(srv); return GL_ERR_BIND; }
+        a->srv = srv;
+        snprintf(a->token, sizeof(a->token), "%s", token ? token : "");
+        if (pthread_create(&th, NULL, gl_accept_loop, a) != 0) { close(srv); free(a); return GL_ERR_BIND; }
+        pthread_detach(th);
+        return GL_OK;
+    }
+    if (engine_path && *engine_path) {
+        pid_t p = fork();
+        if (p == 0) {
+            char ports[16];
+            snprintf(ports, sizeof(ports), "%d", port > 0 ? port : GL_DEF_PORT);
+            (void) setgroups(0, NULL);
+            (void) setresgid(0, 0, 0);
+            (void) setresuid(0, 0, 0);
+            execl("/system/bin/runcon", "runcon", "u:r:system_server:s0",
+                  engine_path, "--glserver", "--port", ports,
+                  "--token", token ? token : "", (char *) NULL);
+            _exit(127);
+        }
+        if (p > 0) return GL_OK;      /* the child owns the listener now */
+    }
+    return GL_ERR_BIND;
+}
+
+int gl_server_run(int port, const char *token)
+{
+    int srv = gl_listen_socket(port);
+
+    if (srv < 0) return GL_ERR_BIND;
 
     for (;;) {
         int c = accept(srv, NULL, NULL);
