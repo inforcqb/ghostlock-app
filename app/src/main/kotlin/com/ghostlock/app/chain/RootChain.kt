@@ -2,6 +2,7 @@ package com.ghostlock.app.chain
 
 import com.ghostlock.app.domain.model.ChainPhase
 import com.ghostlock.app.root.RootChannel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -359,6 +360,22 @@ object ChainSpec {
 
     /** How often `am hang --allow-restart` may be issued (the watchdog needs ~93s). */
     const val HANG_ATTEMPTS = 3
+
+    /**
+     * How often a failing **step** is repeated, and how long the chain waits in between.
+     *
+     * The rule (explicit, 2026-10-03): only [ChainStep.W1] is never repeated -- it forges kernel
+     * PI state, and a second parked victim is worse than a stopped run.  Everything else is an
+     * attempt, not a verdict: a refused property write, an adbd that has not come up yet, a
+     * `rmmod` that lost a race with the OPPO guard, a `late-load` issued too early.
+     *
+     * [STEP_RETRY_MS] is long enough for an adbd restart or a `pm install` to settle and short
+     * enough to stay inside one run.  [ChainStep.AM_HANG] is the exception at this level: it
+     * retries internally ([HANG_ATTEMPTS], ~93s each), so repeating it here would mean up to
+     * 9 issues of `am hang`.
+     */
+    const val STEP_ATTEMPTS = 3
+    const val STEP_RETRY_MS = 8_000L
 }
 
 /**
@@ -682,22 +699,65 @@ class RootChain(
         return chanExec(fallbackCommand, timeoutMs)
     }
 
+    /**
+     * Run one step, and **repeat it when it fails**.
+     *
+     * The chain's rule (explicit, 2026-10-03): **only [ChainStep.W1] is never repeated** -- it
+     * forges kernel PI state, and parking a second victim would be worse than stopping.  Every
+     * other step is tried [ChainSpec.STEP_ATTEMPTS] times, [ChainSpec.STEP_RETRY_MS] apart,
+     * before its failure is reported.  An error anywhere else is one attempt, not 「提权失败」:
+     * a property write refused because the gate is not open yet, an adbd that needs another
+     * second, a bind that lost a race with the previous isolated process, a `late-load` issued
+     * before the module was there.
+     *
+     * [ChainStep.AM_HANG] keeps its own internal retry ([ChainSpec.HANG_ATTEMPTS], ~93 s each)
+     * and is therefore not repeated at this level.
+     *
+     * Repeating a step re-runs its sub-phases, which is deliberate: every command those phases
+     * issue is idempotent (`setprop`, `pm install -r`, `rmmod` followed by a module-list check,
+     * `insmod` after an `rmmod`), and the ones that are not are judged by their *effect* rather
+     * than assumed (`ksud late-load`, the listener wait).
+     *
+     * A real cancellation (the user stopped the run) is never "retried" -- it is rethrown.  A
+     * *timeout* is not a cancellation: it is one more failure to repeat.
+     */
     private suspend fun step(
         step: ChainStep,
         detail: String = "",
         body: suspend () -> String,
     ): String? {
-        onProgress(ChainProgress(step, step.ordinal + 1, total, StepState.RUNNING, detail))
-        return try {
-            val outcome = body()
-            onProgress(ChainProgress(step, step.ordinal + 1, total, StepState.OK, outcome))
-            outcome
-        } catch (t: Throwable) {
-            val message = t.message ?: t.javaClass.simpleName
-            onLog("[!] ${step.label} failed: $message")
-            onProgress(ChainProgress(step, step.ordinal + 1, total, StepState.FAILED, message))
-            null
+        val attempts = when (step) {
+            ChainStep.W1 -> 1
+            ChainStep.AM_HANG -> 1
+            else -> ChainSpec.STEP_ATTEMPTS
         }
+        var failure: Throwable? = null
+        for (attempt in 1..attempts) {
+            val suffix = if (attempts > 1) "（第 $attempt/$attempts 次尝试）" else ""
+            onProgress(
+                ChainProgress(step, step.ordinal + 1, total, StepState.RUNNING, "$detail$suffix"),
+            )
+            try {
+                val outcome = body()
+                onProgress(ChainProgress(step, step.ordinal + 1, total, StepState.OK, outcome))
+                return outcome
+            } catch (t: Throwable) {
+                if (t is CancellationException && t !is TimeoutCancellationException) throw t
+                failure = t
+                val message = t.message ?: t.javaClass.simpleName
+                onLog("[!] ${step.label} 第 $attempt/$attempts 次失败：$message")
+                if (attempt < attempts) {
+                    onLog(
+                        "[*] ${step.label} 重试：${ChainSpec.STEP_RETRY_MS / 1000}s 后第 " +
+                            "${attempt + 1}/$attempts 次（只有 W1 不重试）",
+                    )
+                    delay(ChainSpec.STEP_RETRY_MS)
+                }
+            }
+        }
+        val message = failure?.message ?: failure?.javaClass?.simpleName ?: "未知错误"
+        onProgress(ChainProgress(step, step.ordinal + 1, total, StepState.FAILED, message))
+        return null
     }
 
     /** Poll [read] until it satisfies [check], or let [withTimeout] abort the step. */
@@ -975,26 +1035,41 @@ class RootChain(
             if (w1AlreadyDone) {
                 return@step "PART 2 恢复：安装属于 part 1，跳过（uid-2000 通道在 part 2 不一定还在）"
             }
-            val result = runCatching {
-                sh("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
-            }.getOrNull()
-            if (result == null) {
-                onLog("[!] 管理端安装没能执行（uid-2000 通道读不到）—— 不阻断后面的步骤")
-                return@step "管理端安装跳过"
+            /* Three attempts before it counts as "not installed".  The manager is optional, so
+             * the retry lives here instead of failing the step -- but a package manager that is
+             * busy with the framework restart, or an adb CLI still reconnecting, is one attempt,
+             * never a verdict (the same rule as everywhere else: only W1 is not retried). */
+            var output = ""
+            var exit = -1
+            for (attempt in 1..ChainSpec.STEP_ATTEMPTS) {
+                val result = runCatching {
+                    sh("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
+                }.getOrNull()
+                if (result == null) {
+                    onLog(
+                        "[!] 管理端安装第 $attempt/${ChainSpec.STEP_ATTEMPTS} 次没能执行" +
+                            "（uid-2000 通道读不到）",
+                    )
+                } else {
+                    output = result.output.trim()
+                    exit = result.exitCode
+                    if (exit == 0) break
+                    onLog("[!] pm install 第 $attempt/${ChainSpec.STEP_ATTEMPTS} 次退出码 $exit")
+                }
+                if (attempt < ChainSpec.STEP_ATTEMPTS) delay(ChainSpec.STEP_RETRY_MS)
             }
-            val output = result.output.trim()
             if (output.isNotEmpty()) {
                 output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
             }
-            if (result.exitCode == 0) {
+            if (exit == 0) {
                 onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
             } else {
                 onLog(
-                    "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
-                        "不阻断后面的步骤",
+                    "[!] pm install 最终退出码 $exit（试了 ${ChainSpec.STEP_ATTEMPTS} 次）" +
+                        " —— 管理端可能已经装过或没装成功，不阻断后面的步骤",
                 )
             }
-            "pm install exit=${result.exitCode}"
+            "pm install exit=$exit"
         } != null
         if (!ok) return false
 

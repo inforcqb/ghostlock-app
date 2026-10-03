@@ -16,6 +16,8 @@ import com.ghostlock.app.chain.RootExec
 import com.ghostlock.app.chain.ShellResult
 import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.root.IsolatedRootShell
+import com.ghostlock.app.root.COMMAND_SERVER_ATTEMPTS
+import com.ghostlock.app.root.COMMAND_SERVER_RETRY_MS
 import com.ghostlock.app.root.RootChannel
 import com.ghostlock.app.root.RootCommand
 import android.annotation.SuppressLint
@@ -45,6 +47,7 @@ import com.ghostlock.app.domain.model.WirelessChannelStatus
 import com.ghostlock.app.wireless.WirelessPairingController
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -658,11 +661,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * Two copies of one secret on purpose: `<filesDir>/token` for [RootCommand] in this
      * process, and [ChainSpec.COMMAND_PLANE_TOKEN] on the device for the server inside the
      * isolated process (which has no business reading the app's private directory on an
-     * enforcing boot). Without this the server falls back to an empty token, i.e. no
-     * authentication at all on 127.0.0.1:5038.
+     * enforcing boot).
      *
-     * Every step is failure-tolerant: the chain must never break over staging, and an empty
-     * token file simply means "no auth" as before.
+     * **No token means no plane, never an open plane.** The server refuses to serve without one
+     * (`gl_server.cpp`, fail closed), because its listener is on loopback and every app on the
+     * device can reach loopback. So a staging failure is *retried* here -- three pushes, a second
+     * apart -- and if it still fails the run simply keeps using the root adbd, with a log line
+     * that says so; the next chain attempt stages it again.
      */
     private suspend fun prepareCommandPlane(onLog: (String) -> Unit): Int {
         RootCommand.attach(filesDir)
@@ -678,12 +683,24 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             File(filesDir, CommandPlanePortName).writeText("$port\n", StandardCharsets.UTF_8)
             true
         }.getOrDefault(false)
-        val pushed = runCatching {
-            DeviceSync.pushText(appContext, ChainSpec.COMMAND_PLANE_TOKEN, "$token\n", "644", onLog)
-        }.getOrDefault(false)
+        /* Three pushes, a second apart: the first one loses to a busy adb server or to the
+         * isolated process still reading the old file, and a missing token now costs the whole
+         * fallback transport (the server fails closed). */
+        var pushed = false
+        for (attempt in 1..COMMAND_SERVER_ATTEMPTS) {
+            pushed = runCatching {
+                DeviceSync.pushText(appContext, ChainSpec.COMMAND_PLANE_TOKEN, "$token\n", "644", onLog)
+            }.getOrDefault(false)
+            if (pushed) break
+            if (attempt < COMMAND_SERVER_ATTEMPTS) {
+                onLog("[*] token 推送失败（第 $attempt/$COMMAND_SERVER_ATTEMPTS 次）⇒ 重试")
+                delay(COMMAND_SERVER_RETRY_MS)
+            }
+        }
         onLog(
             "[*] uid-0 命令面暂存：port=$port token=${token.take(6)}…（本机文件 ${if (local) "ok" else "失败"}，" +
-                "设备侧 ${if (pushed) "已推送" else "没推送（服务端会用空 token = 无鉴权）"}）",
+                "设备侧 ${if (pushed) "已推送" else "没推送 ⇒ 命令面会拒绝所有连接（fail closed），本次只走 adb"}" +
+                "）",
         )
         return port
     }

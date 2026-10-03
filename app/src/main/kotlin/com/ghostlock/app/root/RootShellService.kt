@@ -29,12 +29,23 @@ internal const val NATIVE_LIB_NAME = "magica2"
  * device scripts, or plain `nc`.  The paths are the staging contract: the app writes
  * the token it wants clients to present, and stages the engine that a failed bind
  * re-execs as `runcon u:r:system_server:s0 <engine> --glserver` (runcon is only the
- * *listening* fallback).  Defaults keep working even before the app writes anything:
- * [RootCommand] falls back to the same port and an empty token.
+ * *listening* fallback).  The port has a default, the token does not: with no token
+ * staged the server refuses to serve at all ([RootCommand] does the same on the client
+ * side), because a loopback listener is reachable by every app on the device.
  */
 internal const val COMMAND_SERVER_PORT = 5038
 internal const val COMMAND_SERVER_ENGINE = "/data/local/tmp/gl-w1/ghostlock"
 internal const val COMMAND_SERVER_TOKEN = "/data/local/tmp/gl-w1/token"
+
+/**
+ * How often the command plane is (re)tried before the attempt is called a miss.
+ *
+ * The rule for the whole chain: only W1 is never repeated.  Everything else -- a stale listener
+ * on the port, a token file that has not landed yet, a bind that lost a race with the previous
+ * isolated process -- is retried.
+ */
+internal const val COMMAND_SERVER_ATTEMPTS = 3
+internal const val COMMAND_SERVER_RETRY_MS = 1_000L
 
 /**
  * The logcat tag of the port (`TAG` in `app/src/main/jni/logging.h`), shared by
@@ -113,20 +124,56 @@ class RootShellService : Service() {
             val rooted = identity.contains("uid=0")
             Log.i(TAG, "startChannel: identity=${identity.trim()} -> $rooted")
             if (!rooted) return false
-            /* Same self-test, one more statement: bring up the command server.  A bind
-             * failure is not fatal -- the native side already forked a child into
-             * u:r:system_server:s0 to listen -- so rc==-1 only means "check again". */
-            val token = runCatching { File(COMMAND_SERVER_TOKEN).readText().trim() }.getOrDefault("")
-            val rc = runCatching {
-                start_command_server(COMMAND_SERVER_PORT, token, COMMAND_SERVER_ENGINE)
-            }.getOrElse { error ->
-                Log.e(TAG, "startChannel: start_command_server 抛异常 " +
-                    "${error::class.java.simpleName}: ${error.message}")
-                -1
+            /* Same self-test, one more statement: bring up the command server.
+             *
+             * rc  0 = listening (in this process, or in the runcon child the native side forked)
+             *    -1 = bind failed -- the native log line carries the errno (98: a listener from a
+             *         previous isolated process still holds the port; 13: seccomp or SELinux)
+             *    -2 = no token staged: the server refuses to serve uid-0 commands without one,
+             *         because loopback is not a security boundary (any app may connect)
+             *
+             * Every one of those is *retried* here instead of being reported as a failure: the
+             * token file may still be landing, and a stale listener disappears on its own.  See
+             * the chain's rule -- only W1 is never retried.
+             */
+            var last = Int.MIN_VALUE
+            var used = ""
+            for (attempt in 1..COMMAND_SERVER_ATTEMPTS) {
+                used = readCommandToken()
+                last = runCatching {
+                    start_command_server(COMMAND_SERVER_PORT, used, COMMAND_SERVER_ENGINE)
+                }.getOrElse { error ->
+                    Log.e(TAG, "startChannel: start_command_server 抛异常 " +
+                        "${error::class.java.simpleName}: ${error.message}")
+                    -1
+                }
+                Log.i(TAG, "startChannel: command server port=$COMMAND_SERVER_PORT token=" +
+                    "${if (used.isEmpty()) "空（fail closed）" else "${used.take(4)}…"} " +
+                    "rc=$last（第 $attempt/$COMMAND_SERVER_ATTEMPTS 次）")
+                if (last == 0) break
+                if (attempt < COMMAND_SERVER_ATTEMPTS) Thread.sleep(COMMAND_SERVER_RETRY_MS)
             }
-            Log.i(TAG, "startChannel: command server port=$COMMAND_SERVER_PORT rc=$rc " +
-                "(0=listening, -1=bind failed)")
+            /* Still non-fatal: the chain prefers the root adbd and treats the command plane as
+             * its fallback, so "no listener yet" is one attempt, not a failed escalation. */
             return true
+        }
+
+        /**
+         * The staged token, with a short retry.
+         *
+         * The app pushes it immediately before the launch, so an empty read usually means "not
+         * there yet" rather than "never" -- and an empty token now means the server refuses
+         * everyone (fail closed), which is worth two more reads.
+         */
+        private fun readCommandToken(): String {
+            for (attempt in 1..COMMAND_SERVER_ATTEMPTS) {
+                val token = runCatching {
+                    File(COMMAND_SERVER_TOKEN).readText().trim()
+                }.getOrDefault("")
+                if (token.isNotEmpty()) return token
+                if (attempt < COMMAND_SERVER_ATTEMPTS) Thread.sleep(COMMAND_SERVER_RETRY_MS)
+            }
+            return ""
         }
 
         override fun adbRoot(): Boolean = root() && adb_root()

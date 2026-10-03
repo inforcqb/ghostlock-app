@@ -150,5 +150,18 @@ adb shell 'for c in /sys/fs/selinux/policy_capabilities/*; do echo $c=$(cat $c);
 - `magica2jni` 的构建必须同时包含 `gl_server.cpp`(引擎的 `CXX_SRCS`、`Android.mk` 的 `LOCAL_SRC_FILES`,以及根 `Makefile` 的 `MAGICA2_SRCS` 三处);
 - parked 进程在清理验证通过前**不能退**(exit 会走伪造 PI 树 → wedge);
 - `selinux_state` 每次 W1 都会踩 `+0..+7`,需要 kread 恢复(脚本 `fix-selinux.sh`,永不自动开 enforcing);
-- 命令面 server 的 token 为空时**任何** token 都通过(`if (token && *token …)`),所以「推送失败」不会把链条卡死,只是没鉴权;
+- 命令面 server 的 token **为空 = fail closed**（2026-10-03 改）：没有 token 时 `gl_server.cpp`
+  **不监听**（`GL_ERR_ARG` ⇒ app 日志里 `rc=-2`），有 token 的连接才放行。理由：127.0.0.1 上的
+  loopback **不是安全边界**（任何 app 都能连），空 token 等于把 uid-0 任意命令执行交给全设备。
+  空 token 现在按「可重试的暂存失败」处理：app 侧推 3 次（`prepareCommandPlane`）、`startChannel()`
+  重读 token 3 次、`RootCommand` 只重试「命令还没跑」的失败（连接 / 握手 / `__GHOSTLOCK_EXEC_FAILED__`），
+  重试期间链照常走 adb；
+- **重试规则（2026-10-03，用户定的）**：**只有 W1 不重试**。其余每个步骤失败都按
+  `ChainSpec.STEP_ATTEMPTS = 3` / `STEP_RETRY_MS = 8s` 重放，重放完才报失败——一次错误是一个 attempt，
+  不是「提权失败」。两个例外都在 `step()` 之外：`AM_HANG` 在 `step()` 层只试 1 次（它自己内部已有
+  `HANG_ATTEMPTS = 3`，每次约 93s），管理端安装自己内部重试 3 次（它本来就不阻断链）。超时
+  （`TimeoutCancellationException`）算「再试一次」；真正的取消不算，直接上抛；
+- gl_server 的 bind/listen/socket 失败**带 errno**进 logcat（`gl_server: bind 127.0.0.1:5038 failed:
+  Address already in use (98)`）：98 = 上一轮隔离进程还占着端口（可重试），13 = seccomp/SELinux 没放开
+  （说明 part 2 前提不成立）、97 = 内核不给 AF_INET（只能走 runcon 回退）；每个 client 的 uid 也会记一行。
 - `readBootFacts()` 现在会在 uid-2000 通道不通时改读命令面,Seccomp 用 `/proc/1/status`(init 的),因为命令面里的 `/proc/self` 是**它自己**那个进程。

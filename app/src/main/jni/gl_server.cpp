@@ -22,6 +22,12 @@
  *   S->C  "GHOSTLOCK/1\n"                 banner
  *   C->S  "<token>\n"                     first line
  *   S->C  "OK\n" | "ERR token\n"          (ERR: server closes)
+ *         "ERR no-token\n"                the server holds NO token -> it refuses everyone
+ *
+ *   FAIL CLOSED: the listener is 127.0.0.1, and on Android loopback is not a security boundary
+ *   (any installed app may connect).  An empty token therefore means "nobody", not "anybody":
+ *   with no token staged the server does not even start (GL_ERR_ARG), and a client that reaches
+ *   a server without one is refused.  The app treats that as a retryable staging failure.
  *   then, once per command:
  *   C->S  "<command line>\n"              e.g.  rmmod oplus_security_guard
  *   S->C  <command output, verbatim>      stdout+stderr, no framing
@@ -68,6 +74,28 @@
 #define GL_LINE_MAX    4096
 #define GL_DEF_TIMEOUT 30000
 #define GL_DEF_PORT    5038
+
+/*
+ * One log line per interesting event, into logcat.
+ *
+ * This file is loaded into the isolated process (where stderr goes nowhere) and also builds as
+ * the standalone engine server, so: logcat on Android, stderr otherwise.  Without it a failed
+ * `bind` reached the caller as a bare `rc=-1`, and "-1" cannot be told from "-1" -- while
+ * EADDRINUSE (a listener left behind by a previous isolated process) and EACCES (a seccomp
+ * filter or a MAC denial that "Seccomp 0 + permissive" was supposed to have removed) need
+ * opposite reactions.
+ */
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define GL_TAG "GhostlockRoot"
+#define gl_loge(...) __android_log_print(ANDROID_LOG_ERROR, GL_TAG, __VA_ARGS__)
+#define gl_logw(...) __android_log_print(ANDROID_LOG_WARN, GL_TAG, __VA_ARGS__)
+#define gl_logi(...) __android_log_print(ANDROID_LOG_INFO, GL_TAG, __VA_ARGS__)
+#else
+#define gl_loge(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define gl_logw(...) gl_loge(__VA_ARGS__)
+#define gl_logi(...) gl_loge(__VA_ARGS__)
+#endif
 
 enum { GL_OK = 0, GL_ERR_BIND = -1, GL_ERR_ARG = -2 };
 
@@ -175,7 +203,22 @@ static void gl_serve_client(int fd, const char *token)
 
     gl_reply(fd, GL_BANNER);
     if (gl_read_line(fd, line, sizeof(line)) <= 0) return;
-    if (token && *token && strcmp(line, token) != 0) {
+    if (!token || !*token) {
+        /* FAIL CLOSED, and this check is the point of the whole handshake.
+         *
+         * The listener is on 127.0.0.1, which on Android is NOT a security boundary: every
+         * installed app may connect to loopback without any permission.  So "no token was
+         * staged" must never mean "anyone may drive uid 0" -- it means nobody may.  The app
+         * side treats an empty token as a *retryable staging failure* (it re-pushes the token)
+         * and the chain still has the root-adbd transport, so refusing here costs a fallback,
+         * while accepting would hand uid-0 command execution to any local process. */
+        gl_loge("gl_server: refusing a client -- no token was staged (fail closed); "
+                "the app must push the token file first");
+        gl_reply(fd, "ERR no-token\n");
+        return;
+    }
+    if (strcmp(line, token) != 0) {
+        gl_logw("gl_server: refusing a client -- wrong token");
         gl_reply(fd, "ERR token\n");
         return;
     }
@@ -209,28 +252,61 @@ static int gl_listen_socket(int port)
 {
     int srv, on = 1;
     struct sockaddr_in sa;
+    const int use_port = port > 0 ? port : GL_DEF_PORT;
 
     signal(SIGPIPE, SIG_IGN);
     srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) return -1;
+    if (srv < 0) {
+        /* EACCES/EPERM here means this process still has a seccomp filter (or a MAC denial):
+         * exactly the preconditions part 2 is supposed to have removed. */
+        gl_loge("gl_server: socket(AF_INET) failed: %s (%d)", strerror(errno), errno);
+        return -1;
+    }
     (void) setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t) (port > 0 ? port : GL_DEF_PORT));
+    sa.sin_port = htons((uint16_t) use_port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      /* 127.0.0.1 only */
-    if (bind(srv, (struct sockaddr *) &sa, sizeof(sa)) != 0) { close(srv); return -1; }
-    if (listen(srv, 4) != 0) { close(srv); return -1; }
+    if (bind(srv, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+        /* EADDRINUSE(98): a listener from an earlier isolated process still holds the port --
+         * the 3-round restart can leave one behind for a moment, so this is retryable and has
+         * to be readable as such; EACCES(13): the listener is not allowed here at all. */
+        gl_loge("gl_server: bind 127.0.0.1:%d failed: %s (%d)", use_port, strerror(errno), errno);
+        close(srv);
+        return -1;
+    }
+    if (listen(srv, 4) != 0) {
+        gl_loge("gl_server: listen(127.0.0.1:%d) failed: %s (%d)", use_port, strerror(errno),
+                errno);
+        close(srv);
+        return -1;
+    }
+    gl_logi("gl_server: listening on 127.0.0.1:%d", use_port);
     return srv;
 }
 
 struct gl_accept_args { int srv; char token[256]; };
+
+/** Who is on the other end, for the log: loopback has no other identity to show. */
+static int gl_peer_uid(int fd)
+{
+    struct ucred cr;
+    socklen_t len = sizeof(cr);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) != 0) return -1;
+    return (int) cr.uid;
+}
 
 static void *gl_accept_loop(void *arg)
 {
     struct gl_accept_args *a = (struct gl_accept_args *) arg;
     for (;;) {
         int c = accept(a->srv, NULL, NULL);
-        if (c < 0) { if (errno == EINTR) continue; break; }
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            gl_loge("gl_server: accept failed: %s (%d)", strerror(errno), errno);
+            break;
+        }
+        gl_logi("gl_server: client uid=%d connected", gl_peer_uid(c));
         gl_serve_client(c, a->token);
         close(c);
     }
@@ -249,7 +325,16 @@ static void *gl_accept_loop(void *arg)
  */
 int gl_server_start(int port, const char *token, const char *engine_path)
 {
-    int srv = gl_listen_socket(port);
+    int srv;
+
+    if (!token || !*token) {
+        /* No token staged: do NOT open a uid-0 listener at all (see gl_serve_client).  The
+         * caller sees GL_ERR_ARG, the app re-stages the token and retries -- a missing token is
+         * a retryable staging failure, never an escalation failure. */
+        gl_loge("gl_server: refusing to start -- empty token (fail closed)");
+        return GL_ERR_ARG;
+    }
+    srv = gl_listen_socket(port);
     if (srv >= 0) {
         struct gl_accept_args *a = (struct gl_accept_args *) calloc(1, sizeof(*a));
         pthread_t th;
@@ -280,13 +365,24 @@ int gl_server_start(int port, const char *token, const char *engine_path)
 
 int gl_server_run(int port, const char *token)
 {
-    int srv = gl_listen_socket(port);
+    int srv;
+
+    if (!token || !*token) {
+        gl_loge("gl_server: refusing to run -- empty token (fail closed)");
+        return GL_ERR_ARG;
+    }
+    srv = gl_listen_socket(port);
 
     if (srv < 0) return GL_ERR_BIND;
 
     for (;;) {
         int c = accept(srv, NULL, NULL);
-        if (c < 0) { if (errno == EINTR) continue; break; }
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            gl_loge("gl_server: accept failed: %s (%d)", strerror(errno), errno);
+            break;
+        }
+        gl_logi("gl_server: client uid=%d connected", gl_peer_uid(c));
         gl_serve_client(c, token);
         close(c);
     }
@@ -303,6 +399,11 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) token = argv[++i];
+    }
+    if (!*token) {
+        fprintf(stderr, "glserver: --token is required -- refusing to serve uid-0 commands "
+                        "without one\n");
+        return 2;
     }
     return gl_server_run(port, token) == GL_OK ? 0 : 1;
 }

@@ -23,8 +23,10 @@ import java.nio.charset.StandardCharsets
  * `__GHOSTLOCK_EXEC_FAILED__: <reason>` instead of the terminator.
  *
  * `port` is read from `<filesDir>/port` (the run writes the real one there, in
- * case 5038 was taken), `token` from `<filesDir>/token`; both fall back to
- * sane defaults so a call site never has to care.
+ * case 5038 was taken), `token` from `<filesDir>/token`.  There is no default token:
+ * an empty one means the server refuses to serve at all (loopback is reachable by
+ * every app on the device), so an empty read is treated as "not staged yet" and
+ * retried -- see [exec].
  */
 object RootCommand {
 
@@ -32,6 +34,17 @@ object RootCommand {
     private const val BANNER = "GHOSTLOCK/1"
     private const val TAG_EXIT = "__GL_EXIT__ "
     private const val TAG_FAIL = "__GHOSTLOCK_EXEC_FAILED__: "
+
+    /**
+     * How often [exec] retries a failure that provably happened **before** the command could run,
+     * and how long it waits in between.
+     *
+     * Only unambiguous cases are retried here (connect refused, handshake refused, or the server
+     * saying the command never started): after a mid-command I/O error the command may well have
+     * executed, and repeating it is the caller's decision, not this client's.
+     */
+    private const val ATTEMPTS = 3
+    private const val RETRY_MS = 1_000L
 
     data class Result(val exitCode: Int, val output: String, val failed: String?) {
         val ok: Boolean get() = failed == null && exitCode == 0
@@ -54,12 +67,49 @@ object RootCommand {
      * Run one command and wait for its terminator.  [domain] runs it through
      * `/system/bin/runcon <domain> sh -c <command>`, which is what commands that
      * need a domain of their own (property writes) require.
+     *
+     * Failures that cannot have executed anything are retried [ATTEMPTS] times: a plane that is
+     * still coming up, a token file that has not landed yet, or a server that reports the
+     * command never started.  A mid-command I/O error is returned as-is (the command may have
+     * run), and the chain decides whether to repeat it.
      */
     fun exec(
         command: String,
         timeoutMs: Int = 30_000,
         domain: String? = null,
         connectMs: Int = 3_000,
+    ): Result {
+        var last: Result? = null
+        for (attempt in 1..ATTEMPTS) {
+            val result = runOnce(command, timeoutMs, domain, connectMs)
+            if (!retryable(result.failed) || attempt == ATTEMPTS) return result
+            last = result
+            Thread.sleep(RETRY_MS)
+        }
+        return last ?: Result(-1, "", "no attempt was made")
+    }
+
+    /**
+     * Which failures are known to have happened before the command could run.
+     *
+     * Deliberately narrow: `IOException`/`SocketException` are NOT here, because a dropped
+     * connection may mean the command executed and its output was lost.
+     */
+    private fun retryable(failed: String?): Boolean = when {
+        failed == null -> false
+        failed.startsWith(TAG_FAIL) -> true                       // the server says it never started
+        failed.startsWith("handshake:") -> true                    // refused before any command
+        failed.startsWith("ConnectException") -> true
+        failed.startsWith("NoRouteToHostException") -> true
+        failed == "no banner" -> true
+        else -> false
+    }
+
+    private fun runOnce(
+        command: String,
+        timeoutMs: Int,
+        domain: String?,
+        connectMs: Int,
     ): Result {
         val socket = Socket()
         return try {
