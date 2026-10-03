@@ -1,6 +1,6 @@
 # GhostLock 链条:任务目标 / 当前状态 / 下一步
 
-> 记录时间:2026-10-03(第二轮更新:同日,`bb8d8c94b` 文档对应 main = `4850d5163`)· 仓库 `inforcqb/ghostlock-app`(main)· 相关仓库 `inforcqb/kp_rmap_guard_lkm`(kread_min)、`inforcqb/oneplus-susfs4ksu-lkm`、`inforcqb/Magica`
+> 记录时间:2026-10-03(第二轮更新:同日,`bb8d8c94b` 文档对应 main = `05310b4e3`)· 仓库 `inforcqb/ghostlock-app`(main)· 相关仓库 `inforcqb/kp_rmap_guard_lkm`(kread_min)、`inforcqb/oneplus-susfs4ksu-lkm`、`inforcqb/Magica`
 
 ## 0. 任务目标
 
@@ -47,10 +47,12 @@
 | `bin.yml` 变成真正的 fast path | ✅ | 现在也编 `.build/jni/libmagica2.so` 并**断言**两件事:不依赖 `libc++_shared.so`、`JNI_OnLoad` 必须导出(全库 `-fvisibility=hidden`,漏了就 `UnsatisfiedLinkError`);同时开始监听 `main`,native-only 的问题 2 分钟就能看见 |
 | Magica uid-0 自检失败 → 杀进程重拉 | ✅ 已推 | `IsolatedRootShell.launch()` 改成 **3 轮**:每轮 bind + `ensureRoot()` + 3 次 × 3s 身份读取;某轮 3 次都不是 uid=0 就 `destroy()`(stopSelf,app 对别的 uid 进程没有 kill 权限)+ `unbindService()` + 2s 静置,然后 fork 新进程;第 3 轮仍失败才抛。取消(`CancellationException`)直接上抛,不再被轮询吞掉 |
 | `startChannel()` 真正被调用 | ✅ 已推 | 之前**没人调用**它 ⇒ `gl_server` 从来没被启动过,整个 uid-0 命令面是死代码(服务 bind 了、身份读了,但 5038 上没有 listener)。现在在 `launch()` 里 uid=0 确认之后调用,`false` 判为本轮失败(下一轮会重启进程) |
+| 命令面可用性自检 | ✅ 已推 | adb 不可用时,`PRIV_ENV` 在建命令之前先通过命令面读一次 `grep -E '^(Cap\|NoNewPrivs\|Seccomp)' /proc/self/status` 并打进日志 —— **这一行决定 part 2 是否真的能脱离 adb**:uid-0 子进程若 `CapBnd 0`(隔离进程的初始状态),文件/属性类工作能跑,但 `rmmod` / `ksud late-load` 需要满 cap。失败非致命,只记日志 |
 
 ### 关键 commit(main)
 
 ```
+05310b4e3  chain: self-check the uid-0 command plane before it carries part 2
 4850d5163  root: restart the isolated process when it never becomes uid 0; start the command plane
 4911dd7e3  build: force-include bionic_compat.h in the magica2jni target
 af7faead1  build: fix the magica2jni source list typo, and build it in the fast workflow
@@ -69,8 +71,8 @@ bbb27f5c7  docs: state / objective / next for the root-chain work (2026-10-03)
 d42f2e39b  app/jni: gl_server.cpp（server 本体 + 协议）
 ```
 
-**CI**:run `37086461837`(main = `4850d5163`)**全绿**(Build APK 9m36s + 两个 extractor + Release)。
-签名 APK 在 release 资产里:`https://github.com/inforcqb/ghostlock-app/releases/download/release/GhostLock-release.apk`(tag `release`,资产每次构建覆盖);原始件也可从 run 页面下(`GhostLock-release.apk` / `ghostlock` / `libmagica2`,后两个 `archive:false` 得用 `gh api .../artifacts/<id>/zip`)。
+**CI**:run `37093300295`(main = `05310b4e3`)**全绿**(Build APK 6m48s + 两个 extractor + Release);同一提交的 Bin fast path `37093300360` ✅ 48s。
+签名 APK 在 release 资产里:`https://github.com/inforcqb/ghostlock-app/releases/download/release/GhostLock-release.apk`(tag `release`,资产每次构建覆盖;最近一次 2026-10-03T03:34Z,23.5MB);原始件也可从 run 页面下(`GhostLock-release.apk` / `ghostlock` / `libmagica2`,后两个 `archive:false` 得用 `gh api .../artifacts/<id>/zip`)。
 
 APK 内容已核对(下载后直接看 zip):
 `lib/arm64-v8a/` 里有 `libghostlock.so` / `libmagica2.so`(111848B,与 Bin 产物一致)/ `libksud.so` / `libextract.so` / `libadbcli.so`,
@@ -123,7 +125,8 @@ shell 侧用法:`printf '<token>\nid\n' | nc 127.0.0.1 5038`
 |---|---|---|
 | V1 | ~~CI 转绿~~ ✅ run `37086461837` 全绿;APK:`releases/download/release/GhostLock-release.apk` | — |
 | V2 | 装机跑 part 1:应看到阶段判定 PART 1、`pm install` 在 W1 之前、`uid-0 命令面暂存：port=5038 token=…`、`Magica startChannel()（uid-0 命令面 …）-> true` | `logcat -s GhostlockRoot` |
-| V3 | `am hang` 之后(part 2 续跑)必须看到:阶段判定 **PART 2**、面板标题 **「Part 2 已就绪」**、`[+] 提权通道：root adbd …` 或 `[!] root adbd 不可用 … ⇒ …uid-0 命令面`;**不再**出现「无线调试通道不可用 ⇒ return false」 | 同上 |
+| V3 | `am hang` 之后(part 2 续跑)必须看到:阶段判定 **PART 2**、面板标题 **「Part 2 已就绪」**、`[+] 提权通道：root adbd …` 或 `[!] root adbd 不可用 … ⇒ …uid-0 命令面` + 紧跟一行 `[*] uid-0 命令面自检（exit=0）：CapInh… CapPrm… CapEff… CapBnd… NoNewPrivs…`;**不再**出现「无线调试通道不可用 ⇒ return false」 | 同上 |
+| V3b | **看 V3 那行 `CapBnd`**:若 `000001ffffffffff`(满)⇒ part 2 真的不依赖 adb;若 `0` ⇒ 只有 `rmmod` / `ksud late-load` 还必须走 adb 门(其余仍可走命令面),这决定了要不要再补一次 W1c 把 bounding set 也填上 | 同上 |
 | V4 | 命令面自测:`printf '<filesDir>/token\nid\n' \| nc 127.0.0.1 5038` ⇒ uid=0;日志里 `startChannel: command server port=5038 rc=0`(0=listening,-1=bind failed) | adb shell |
 | V5 | 重启策略实测:故意让第一轮失败(例如先占住 5038 或让 capset hook 不生效)看是否出现「第 1 轮没拿到 uid=0 ⇒ 杀掉隔离进程重新拉起(第 2/3 轮)」 | 可选 |
 | V6 | runcon 回退(bind 失败 → `runcon u:r:system_server:s0` 子进程监听)还没真机验证过 | 可选 |
