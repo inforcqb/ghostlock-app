@@ -800,6 +800,25 @@ static jstring channel_listeners(JNIEnv *env, jobject thiz __unused) {
  * .dynsym and ART would never call it -- the registrations below would then be
  * missing and every native call would throw UnsatisfiedLinkError.
  */
+/* app/src/main/jni/gl_server.cpp -- binds 127.0.0.1:<port> in this process and
+ * serves the uid-0 command line protocol.  On a bind failure it forks a child
+ * that keeps uid 0, switches to u:r:system_server:s0 and re-execs the engine in
+ * --glserver mode: runcon is the *listening* fallback, never a command path. */
+int gl_server_start(int port, const char *token, const char *engine_path);
+
+/* Java entry: start the uid-0 command server.  port/token/engine come from the
+ * app, which owns the private directory its clients read.  0 = a listener now
+ * exists (here or in the runcon child), -1 = GL_ERR_BIND. */
+static jint start_command_server(JNIEnv *env, jclass, jint port, jstring jtoken, jstring jengine)
+{
+    const char *token = jtoken ? env->GetStringUTFChars(jtoken, nullptr) : nullptr;
+    const char *engine = jengine ? env->GetStringUTFChars(jengine, nullptr) : nullptr;
+    const int rc = gl_server_start((int) port, token ? token : "", engine ? engine : "");
+    if (token) env->ReleaseStringUTFChars(jtoken, token);
+    if (engine) env->ReleaseStringUTFChars(jengine, engine);
+    return (jint) rc;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -832,6 +851,13 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *v __unused) {
             {"channel_open_gate",    "()Ljava/lang/String;", (void *) channel_open_adb_gate},
             {"channel_restart_adbd", "()Ljava/lang/String;", (void *) channel_restart_adbd},
             {"channel_listeners",    "()Ljava/lang/String;", (void *) channel_listeners},
+            /* The interactive model is back in the adb module's shape: ONE process
+             * holds the link (this isolated uid-0 process) and everyone else submits
+             * commands -- over 127.0.0.1, not a per-user AF_UNIX socket.  gl_server.cpp
+             * is the implementation; the engine carries the same code in --glserver
+             * mode for the runcon fallback. */
+            {"start_command_server", "(ILjava/lang/String;Ljava/lang/String;)I",
+             (void *) start_command_server},
  };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         LOGE("JNI_OnLoad: RegisterNatives failed");
