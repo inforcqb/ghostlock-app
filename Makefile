@@ -68,7 +68,7 @@ HOST_CXX ?= c++
 HOST_CXXFLAGS := -std=c++20 -fno-rtti -Wall -Wextra -Wconversion -Wsign-conversion
 HOST_BUILD_DIR := .build/host
 
-.PHONY: all clean product
+.PHONY: all clean product magica2jni
 
 all: ghostlock
 
@@ -85,6 +85,60 @@ $(NATIVE_BUILD_DIR)/%.o: %.c $(HDRS)
 $(NATIVE_BUILD_DIR)/%.o: %.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NDK_CXX) $(CXXFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# libmagica2.so -- the ported Magica root-shell JNI library.
+#
+# This is option (b) of the port brief: the same NDK clang++ that builds the
+# app's own binary links the .so here, and the root Gradle task
+# `prepareMagica2JniLibs` copies it into the APK's generated jniLibs.  It is
+# deliberately NOT ndk-build: CI's NDK is ONDK, which AGP cannot resolve, and
+# ndk-build would additionally need prefab plus org.lsposed.libcxx:libcxx (see
+# app/src/main/jni/Android.mk).
+#
+# The source list mirrors the three vendored modules of that Android.mk by hand
+# (`magica2`, `lsplt`, `system_properties`), and the flags mirror
+# Application.mk's, with three deliberate differences:
+#
+#   * no LTO: it buys nothing for one .so and costs CI time;
+#   * `-static-libstdc++`: the APK ships no libc++_shared.so, so a dynamic
+#     libc++ would make System.loadLibrary("magica2") fail -- the app's own
+#     binary is linked the same way;
+#   * `-fvisibility=hidden` + `-Wl,-exclude-libs,ALL` are kept: together they
+#     stop the vendored resetprop (and libc++) from exporting their symbols, so
+#     libc's own __system_property_* cannot be interposed.
+# ---------------------------------------------------------------------------
+JNI_DIR := app/src/main/jni
+MAGICA2_SO := .build/jni/libmagica2.so
+MAGICA2_SRCS := \
+  $(JNI_DIR)/magica2.cpp \
+  $(JNI_DIR)/gl_server.cpp \
+  $(JNI_DIR)/lsplt/elf_util.cc \
+  $(JNI_DIR)/lsplt/lsplt.cc \
+  $(JNI_DIR)/system_properties/context_node.cpp \
+  $(JNI_DIR)/system_properties/contexts_serialized.cpp \
+  $(JNI_DIR)/system_properties/contexts_split.cpp \
+  $(JNI_DIR)/system_properties/prop_area.cpp \
+  $(JNI_DIR)/system_properties/prop_info.cpp \
+  $(JNI_DIR)/system_properties/property_info_parser.cpp \
+  $(JNI_DIR)/system_properties/system_properties.cpp \
+  $(JNI_DIR)/system_properties/system_property_api.cpp \
+  $(JNI_DIR)/system_properties/system_property_set.cpp
+MAGICA2_INCLUDES := -I$(JNI_DIR) -I$(JNI_DIR)/lsplt/include -I$(JNI_DIR)/system_properties/include
+MAGICA2_FLAGS := -O2 -fPIC -Wall -Wextra -Wno-unused-function -Wno-unused-parameter \
+  -fvisibility=hidden -fvisibility-inlines-hidden $(MAGICA2_INCLUDES)
+
+magica2jni: $(MAGICA2_SO)
+
+$(MAGICA2_SO): $(MAGICA2_SRCS) $(wildcard $(JNI_DIR)/*.h) $(wildcard $(JNI_DIR)/lsplt/*.h* ) \
+  $(wildcard $(JNI_DIR)/lsplt/include/*) $(wildcard $(JNI_DIR)/system_properties/include/*) Makefile
+	@echo "Using NDK C++ compiler/linker: $(NDK_CXX)"
+	@mkdir -p $(dir $@)
+	$(NDK_CXX) $(MAGICA2_FLAGS) -std=gnu++20 -shared $(MAGICA2_SRCS) \
+	  -llog -static-libstdc++ \
+	  -Wl,-exclude-libs,ALL -Wl,--gc-sections -Wl,--strip-all -Wl,--icf=all \
+	  -o $@
+	@ls -l $@
 
 .PHONY: cpp-link-probe-test target-constants-test native-resource-test native-host-tests lint-tidy
 cpp-link-probe-test: $(HOST_BUILD_DIR)/cpp_link_probe_test
