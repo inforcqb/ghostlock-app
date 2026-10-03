@@ -310,6 +310,17 @@ object ChainSpec {
     const val READ_STATUS = "cat /proc/self/status"
 
     /**
+     * The same boot fact as [READ_STATUS]'s `Seccomp:` line, read from **pid 1**.
+     *
+     * Needed because the uid-0 command plane's `/proc/self` is the *plane's* process, not the
+     * shell's: on a part-2 resume (no uid-2000 channel) the readonly fallback gives us the
+     * plane's Seccomp, which is not the fact this chain is looking for. `init` is the one
+     * process whose Seccomp is a property of the boot itself, and reading it needs nothing
+     * the shell channel has and the plane lacks (root + `CAP_SYS_PTRACE`).
+     */
+    const val READ_BOOT_SECCOMP = "grep -m1 '^Seccomp:' /proc/1/status"
+
+    /**
      * How often the boot facts are read before the chain refuses to guess. The wireless
      * channel drops connections on its own schedule, so a single failed read must not
      * decide anything.
@@ -318,6 +329,22 @@ object ChainSpec {
     const val READ_MODULES = "cat /proc/modules"
     const val READ_IDENTITY = "id"
     const val READ_CAPS = "cat /proc/self/status"
+
+    /** `CapEff` of the root adbd (`0x1ffffffffff` = the full set), as the chain prints it. */
+    const val FULL_CAPS = "000001ffffffffff"
+
+    /** The uid-0 command plane's port, as a line the app writes into `<filesDir>/port`. */
+    const val COMMAND_PLANE_PORT = 5038
+
+    /**
+     * Where the isolated process reads the plane's token from.
+     *
+     * The plane's own staging contract (`RootShellService.COMMAND_SERVER_TOKEN`): the app
+     * writes the token it generated into `<filesDir>/token` (for [com.ghostlock.app.root.RootCommand])
+     * and pushes the same bytes to this device path, because an isolated process has no
+     * business reading the app's private directory on an enforcing boot.
+     */
+    const val COMMAND_PLANE_TOKEN = "$DEVICE_DIR/token"
 
     const val ADB_PORT = 5555
 
@@ -338,13 +365,19 @@ object ChainSpec {
  * One step of the chain. [phase] is null for the step that is not part of the split
  * ([PREFLIGHT]): it runs in both halves and is always shown.
  *
+ * The APK install is its own step in **part 1** ([MANAGER_INSTALL], before [W1]): `pm
+ * install` needs neither root nor permissive SELinux, and the uid-2000 channel it runs on
+ * is alive before W1 but not necessarily after the framework restart -- so part 2 (which
+ * may have no wireless channel at all) must not be the place that installs the manager.
+ *
  * Everything between the uid-0 channel and `ksud late-load` is a single step, [PRIV_ENV]
  * 「提权环境恢复」: opening the adb gate, connecting to the root adbd, removing the security
- * module, installing the manager, repairing `selinux_state` and putting the debug properties
- * back are one phase, and six rows of the same phase told the user nothing extra.
+ * module, repairing `selinux_state` and putting the debug properties back are one phase,
+ * and six rows of the same phase told the user nothing extra.
  */
 enum class ChainStep(val label: String, val phase: ChainPhase?) {
     PREFLIGHT("预检：通道与文件", null),
+    MANAGER_INSTALL("安装管理端（part 1）", ChainPhase.PART1),
     W1("W1：SELinux 转宽容", ChainPhase.PART1),
     AM_HANG("重启 framework（am hang）", ChainPhase.PART1),
     MAGICA_ROOT("Magica：uid-0 通道", ChainPhase.PART2),
@@ -375,6 +408,26 @@ fun interface ShellExec {
 /** Runs the W1 stage through the exploit binary (uid 2000: the wireless-debugging channel). */
 fun interface W1Runner {
     suspend fun runW1Only(onLog: (String) -> Unit): Boolean
+}
+
+/**
+ * Runs one command on the **uid-0 command plane** (`gl_server`, `127.0.0.1:5038`).
+ *
+ * This is the second privileged transport, and part 2 must work with it *alone*:
+ * [RootAdbRunner] needs the adbd gate to have opened and a root adbd to be alive on
+ * loopback, while the command plane needs nothing but the isolated root service that is
+ * already running -- which is what makes the chain survive a device where the gate is
+ * refused, where `setprop` does not take, or where the adbd restart kills the transport.
+ *
+ * [domain] runs the command through `runcon <domain>` (the two property writes), exactly
+ * like the server's `@domain` directive. The implementation in the app is
+ * `com.ghostlock.app.root.RootCommand`.
+ *
+ * A command that never ran must **throw**; a real non-zero exit code is returned as a
+ * [ShellResult]. Callers rely on that distinction (see [privileged]).
+ */
+fun interface RootExec {
+    suspend fun exec(command: String, timeoutMs: Long, domain: String?): ShellResult
 }
 
 /**
@@ -429,6 +482,12 @@ class RootChain(
     private val rootShell: RootShellLauncher,
     private val channel: RootChannel,
     private val adb: RootAdbRunner,
+    /**
+     * The uid-0 command plane (see [RootExec]). Null only when the host did not wire one
+     * (tests): every privileged step then depends on the adb transport, as it did before
+     * the plane existed.
+     */
+    private val root: RootExec? = null,
     /**
      * Absolute path of the `ksud` the property step (8b) must use: the app's own copy in
      * [ChainSpec.KSUD] when it was pushed, else the device's [ChainSpec.KSUD_FALLBACK].
@@ -525,6 +584,104 @@ class RootChain(
         channel.listeners()
     }
 
+    /*
+     * The uid-0 **command plane**, from part 2 on: a real command transport, unlike the four
+     * fixed intents above.
+     *
+     * `gl_server` (in the isolated process, or in the `runcon u:r:system_server:s0` child it
+     * re-execs when the bind fails) listens on 127.0.0.1 and runs whatever line it is given in
+     * a `fork`+`execve` child -- root and with this process's capabilities, which is why the
+     * JVM must not be the one spawning (`ProcessBuilder` children drop to the app uid).
+     *
+     * It exists so that part 2 can finish with **no** root adbd: `adb connect 127.0.0.1:5555`
+     * is a convenience, not the authority (see [privileged]).
+     */
+
+    /**
+     * True once [ChainStep.PRIV_ENV] has a working root adbd on [ChainSpec.ADB_ENDPOINT].
+     *
+     * Flipped back to false the moment that transport dies under us, so the rest of the phase
+     * runs on the plane instead of retrying a corpse.
+     */
+    @Volatile
+    private var adbRoot = false
+
+    /**
+     * One command on the uid-0 command plane.
+     *
+     * Throws when the plane never ran the command (no plane wired, dial/handshake failure,
+     * `__GHOSTLOCK_EXEC_FAILED__`); a real exit code is returned as a [ShellResult]. The
+     * caller must be able to tell those apart -- see [privileged].
+     */
+    private suspend fun chanExec(
+        command: String,
+        timeoutMs: Long = 60_000L,
+        domain: String? = null,
+    ): ShellResult {
+        val plane = root
+            ?: throw IllegalStateException("uid-0 命令面没有接线（RootExec == null），无法执行：$command")
+        return plane.exec(command, timeoutMs, domain)
+    }
+
+    /**
+     * One privileged command: the root adbd when the gate opened, the uid-0 command plane
+     * otherwise (and whenever the adb transport dies later in the phase).
+     *
+     * [RootAdbRunner.exec] throws **only** when the command never ran, so the fall-over cannot
+     * execute anything twice; a non-zero exit code is a real verdict and is returned as-is.
+     * This is what makes 「part 2 不依赖 adb 通道」 true rather than aspirational: every command
+     * in [ChainStep.PRIV_ENV] runs on whichever transport is alive.
+     */
+    private suspend fun privileged(
+        command: String,
+        timeoutMs: Long = 60_000L,
+        domain: String? = null,
+    ): ShellResult {
+        if (adbRoot) {
+            try {
+                val result = adb.exec(command, timeoutMs)
+                return ShellResult(result.exitCode, result.output)
+            } catch (error: Exception) {
+                adbRoot = false
+                onLog(
+                    "[!] adb 通道断了（命令没有运行：${error.message}）" +
+                        " ⇒ 剩余命令全部走 uid-0 命令面",
+                )
+            }
+        }
+        return chanExec(command, timeoutMs, domain)
+    }
+
+    /** Which transport [privileged] is using right now, for the log. */
+    private fun transport(): String = if (adbRoot) "adb" else "uid-0 命令面"
+
+    /**
+     * One **read-only** fact, from whichever transport answers: the shell-uid channel when it
+     * is alive, else the uid-0 command plane.
+     *
+     * Reads are the one thing both transports can do, and on a part-2 resume the uid-2000
+     * channel may legitimately be gone (adbd was restarted by the gate / `late-load`, and the
+     * wireless session died with it). Before this fallback existed the chain refused to guess
+     * and stopped -- "请再点一次" -- on a device that only needed to finish part 2.
+     *
+     * [fallbackCommand] is the same fact expressed for the *other* process: `/proc/self` means
+     * different things on two transports.
+     */
+    private suspend fun readFact(
+        command: String,
+        fallbackCommand: String = command,
+        timeoutMs: Long = 30_000L,
+    ): ShellResult {
+        val viaShell = runCatching { sh(command, timeoutMs, transportRetries = 1) }
+        viaShell.getOrNull()?.let { return it }
+        val why = viaShell.exceptionOrNull()?.message ?: "未知错误"
+        if (root == null) {
+            throw IllegalStateException("读 $command 失败，且没有 uid-0 命令面可换：$why")
+        }
+        onLog("[*] $command：uid-2000 通道读不到（$why）⇒ 换 uid-0 命令面")
+        return chanExec(fallbackCommand, timeoutMs)
+    }
+
     private suspend fun step(
         step: ChainStep,
         detail: String = "",
@@ -586,6 +743,10 @@ class RootChain(
      * when BOTH say so: SELinux permissive alone could in principle be the vendor's own
      * doing, while the shell context having no seccomp filter is the state the exploit
      * needs to still be able to run at all.
+     *
+     * Both reads go through [readFact], so a part-2 resume whose uid-2000 channel is gone
+     * still gets its facts -- from the uid-0 command plane (`/proc/1/status` for the
+     * boot-wide Seccomp).
      */
     private data class BootFacts(val enforce: String, val seccomp: String, val w1Landed: Boolean)
 
@@ -612,12 +773,12 @@ class RootChain(
             attempts++
             if (enforce == null) {
                 enforce = runCatching {
-                    lastLineOf(sh(ChainSpec.READ_ENFORCE).output).takeIf { it.isNotEmpty() }
+                    lastLineOf(readFact(ChainSpec.READ_ENFORCE).output).takeIf { it.isNotEmpty() }
                 }.onFailure { lastError = it.message }.getOrNull()
             }
             if (seccomp == null) {
                 seccomp = runCatching {
-                    sh(ChainSpec.READ_STATUS).output.lineSequence()
+                    readFact(ChainSpec.READ_STATUS, ChainSpec.READ_BOOT_SECCOMP).output.lineSequence()
                         .firstOrNull { it.startsWith("Seccomp:") }
                         ?.substringAfter(':')
                         ?.trim()
@@ -762,7 +923,7 @@ class RootChain(
             return true
         }
 
-        // step 1: W1 ---------------------------------------------------------------
+        // the phase, decided once, before any step runs ---------------------------
         /* Live facts decide whether W1 has to run at all -- see [readBootFacts]:
          *  - `enforce == 0` AND `Seccomp: 0` together mean this boot already ran W1 (a
          *    framework restart does NOT restore enforcing; only a reboot does), and the
@@ -773,21 +934,71 @@ class RootChain(
          *    absent or invisible in the next launch).
          *  - otherwise this is a fresh boot: clear the step markers, they describe the
          *    previous boot.
-         * If neither can be established, [readBootFacts] throws rather than guessing. */
+         * If neither can be established, [readBootFacts] throws rather than guessing.
+         *
+         * This runs at the *entry*, before the first part-1 step is even entered, and the
+         * verdict is printed as such: the user's requirement is that a part-2 resume (the
+         * relaunch after `am hang` restarted the framework) starts with MAGICA_ROOT and
+         * nothing else -- see [ChainStep.MANAGER_INSTALL] and [ChainStep.W1] for the two
+         * steps that skip themselves on this verdict. */
         val boot = readBootFacts()
         val w1AlreadyDone = boot.w1Landed
         if (w1AlreadyDone) {
             onLog(
-                "[*] 现场事实 enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ 本次开机已做过 W1：" +
-                    "无条件跳过 W1 与 am hang（不看标记文件）",
+                "[*] 阶段判定：**PART 2**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
+                    "本次开机已做过 W1）—— 第一件事就是 MAGICA_ROOT；管理端安装 / W1 / am hang 全部跳过",
             )
         } else {
-            sh("rm -f ${ChainSpec.MARKER_HANG}")
+            /* A stale marker from an earlier boot must not survive into this one: it is only
+             * ever written *after* W1 landed, and a reboot restores enforcing, so on this
+             * branch it describes a run that no longer exists. */
+            runCatching { sh("rm -f ${ChainSpec.MARKER_HANG}") }
             onLog(
-                "[*] 现场事实 enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ 未做过 W1：" +
-                    "清掉旧步骤标记，W1 照常执行",
+                "[*] 阶段判定：**PART 1**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
+                    "本次开机未做过 W1）—— 管理端安装 → W1 → am hang → Magica；已清掉旧步骤标记",
             )
         }
+
+        // step 1: the manager, before W1 and before the framework restart ----------
+        /* The APK install is a **part-1** step, ahead of W1 (the user's call, 2026-10-03).
+         *
+         * It needs neither root nor permissive SELinux: `pm install -r` is an ordinary
+         * package operation over the uid-2000 channel, which is alive *here* and may not be
+         * alive at all in part 2 (the gate restarts adbd, `ksud late-load` restarts it
+         * again, and the wireless session dies with it). Installing after `rmmod
+         * oplus_security_guard` -- where it used to sit, inside PRIV_ENV -- only helped a
+         * device whose part 2 got that far.
+         *
+         * Non-fatal in every direction: a manager that is already installed makes it a
+         * no-op, a device without the APK logs it, and no later step depends on it. */
+        ok = step(ChainStep.MANAGER_INSTALL, "pm install -r ${ChainSpec.KSU_MANAGER_APK}") {
+            if (w1AlreadyDone) {
+                return@step "PART 2 恢复：安装属于 part 1，跳过（uid-2000 通道在 part 2 不一定还在）"
+            }
+            val result = runCatching {
+                sh("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
+            }.getOrNull()
+            if (result == null) {
+                onLog("[!] 管理端安装没能执行（uid-2000 通道读不到）—— 不阻断后面的步骤")
+                return@step "管理端安装跳过"
+            }
+            val output = result.output.trim()
+            if (output.isNotEmpty()) {
+                output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
+            }
+            if (result.exitCode == 0) {
+                onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
+            } else {
+                onLog(
+                    "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
+                        "不阻断后面的步骤",
+                )
+            }
+            "pm install exit=${result.exitCode}"
+        } != null
+        if (!ok) return false
+
+        // step 2: W1 ---------------------------------------------------------------
         ok = step(ChainStep.W1, "GHOSTLOCK_W1_ONLY + GHOSTLOCK_PARK_AFTER_W1") {
             if (w1AlreadyDone) {
                 return@step "enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ W1 已做过，跳过"
@@ -835,7 +1046,9 @@ class RootChain(
              * glitch here would otherwise stop a chain whose skip decision is already
              * made. */
             val hangMarkerPresent = runCatching {
-                lastLineOf(sh("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output) == "yes"
+                lastLineOf(
+                    readFact("test -f ${ChainSpec.MARKER_HANG} && echo yes || echo no").output,
+                ) == "yes"
             }.getOrDefault(false)
             /* Skip the hang for the SAME reason W1 was skipped -- enforce == 0 means this
              * boot already went past it, and the hang is the step right after W1 -- and
@@ -938,20 +1151,19 @@ class RootChain(
 
         // step 4 +: turn the device into a usable root environment -------------------
         /* ONE step on purpose (the user's call, 2026-10-01): opening the adb gate, becoming an
-         * adb client, removing the security module, installing the manager, repairing
-         * selinux_state and putting the debug properties back are one *phase* --
-         * 「提权环境恢复」. The order inside it is the verified one, with two changes:
+         * adb client, removing the security module, repairing selinux_state and putting the
+         * debug properties back are one *phase* -- 「提权环境恢复」.
          *
-         *  * the manager install moved **after** `rmmod oplus_security_guard`: the guard fights
-         *    both module loading and property writes, so everything privileged happens after it
-         *    is gone;
-         *  * the manager install no longer precedes the guard (it used to sit right after the
-         *    adb connect).
+         * The manager install is NOT part of it any more: it moved to its own part-1 step
+         * ([ChainStep.MANAGER_INSTALL], before W1), because it needs neither root nor
+         * permissive SELinux and part 2 may have no uid-2000 channel at all.
          *
-         * A throw inside aborts the whole step (and with it the chain) -- the sub-phases that may
-         * legitimately fail (manager install, selinux repair, property restore) only log loudly.
+         * Every privileged command goes through [privileged]: the root adbd when the gate
+         * opened, the uid-0 command plane otherwise. A throw inside aborts the whole step
+         * (and with it the chain) -- the sub-phases that may legitimately fail (selinux
+         * repair, property restore) only log loudly.
          */
-        ok = step(ChainStep.PRIV_ENV, "adb 门 → 5555 → rmmod → 管理端 → selinux 修复 → 属性恢复") {
+        ok = step(ChainStep.PRIV_ENV, "adb 门 → 5555 → rmmod → selinux 修复 → 属性恢复（adb 或 uid-0 命令面）") {
             // (1) open the adb gate (domain borrows; permissive only) -------------
             /*
              * The adbd gate, and why it is a *command* rather than an in-process call
@@ -1020,49 +1232,46 @@ class RootChain(
                 )
             }
 
-            // (2) the app becomes an adb client ----------------------------------
-            adb.connect()
-            val identity = adb.exec(ChainSpec.READ_IDENTITY).output
-            val caps = adb.exec(ChainSpec.READ_CAPS).output
-            onLog("[*] adb identity: ${identity.trim()}")
-            val capLine = caps.lineSequence().firstOrNull { it.startsWith("CapEff:") }?.trim() ?: ""
-            onLog("[*] adb $capLine")
-            if (!identity.contains("uid=0")) throw IllegalStateException("adb shell is not root")
-            if (!capLine.contains("000001ffffffffff")) {
-                throw IllegalStateException("adb shell has no full capabilities: $capLine")
+            // (2) the app becomes an adb client -- or the plane takes over ---------
+            /* TOLERANT ON PURPOSE, and this is where ④b lives: the root adbd is a
+             * *convenience*. What the rest of the phase needs is that something privileged
+             * is reachable, and [privileged] decides that per command. So a refused gate, an
+             * adbd that comes up without the full capability set, or a transport that is not
+             * there at all only downgrades this log line -- it no longer stops part 2. */
+            var capLine: String? = null
+            try {
+                adb.connect()
+                val identity = adb.exec(ChainSpec.READ_IDENTITY).output
+                val caps = adb.exec(ChainSpec.READ_CAPS).output
+                onLog("[*] adb identity: ${identity.trim()}")
+                val line = caps.lineSequence().firstOrNull { it.startsWith("CapEff:") }?.trim() ?: ""
+                onLog("[*] adb $line")
+                if (!identity.contains("uid=0")) error("adb shell is not root：${identity.trim()}")
+                if (!line.contains(ChainSpec.FULL_CAPS)) error("adb shell has no full capabilities: $line")
+                capLine = line
+            } catch (error: Exception) {
+                onLog(
+                    "[!] root adbd 不可用（${error.message}）⇒ 本阶段剩余命令全部走 uid-0 命令面，" +
+                        "part 2 不依赖 adb 通道",
+                )
+            }
+            adbRoot = capLine != null
+            if (adbRoot) {
+                onLog("[+] 提权通道：root adbd（${ChainSpec.ADB_ENDPOINT}，$capLine）")
             }
 
             // (3) the goal, part one: drop the security module -------------------
-            val rmmod = adb.exec(ChainSpec.RMMOD_GUARD).output
-            if (rmmod.isNotBlank()) onLog("[*] rmmod: ${rmmod.trim()}")
-            val modules = adb.exec(ChainSpec.READ_MODULES).output
-            if (modules.contains("oplus_security_guard")) {
+            val rmmod = privileged(ChainSpec.RMMOD_GUARD)
+            if (rmmod.output.isNotBlank()) {
+                onLog("[*] rmmod（${transport()}）-> exit=${rmmod.exitCode}: ${rmmod.output.trim()}")
+            }
+            val modules = privileged(ChainSpec.READ_MODULES)
+            if (modules.output.contains("oplus_security_guard")) {
                 throw IllegalStateException("oplus_security_guard is still loaded")
             }
             onLog("[+] oplus_security_guard 已卸载")
 
-            // (4) the manager, now that the guard is gone ------------------------
-            /* The APK is the app's own copy of the latest SukiSU-Ultra release (pushed next to
-             * the engine by DeviceSync), so a device that never saw GitHub still ends up with a
-             * manager for `su` prompts and modules. Non-fatal: `pm install -r` on an installed
-             * manager is a no-op and nothing later depends on it. */
-            run {
-                val result = adb.exec("pm install -r ${ChainSpec.KSU_MANAGER_APK}", timeoutMs = 180_000)
-                val output = result.output.trim()
-                if (output.isNotEmpty()) {
-                    output.lineSequence().filter { it.isNotBlank() }.take(8).forEach { onLog("    $it") }
-                }
-                if (result.exitCode == 0) {
-                    onLog("[+] 管理端已安装：${ChainSpec.KSU_MANAGER_PACKAGE}（$output）")
-                } else {
-                    onLog(
-                        "[!] pm install 退出码 ${result.exitCode} —— 管理端可能已经装过或没装成功，" +
-                            "不阻断后面的步骤",
-                    )
-                }
-            }
-
-            // (5) repair selinux_state (kread_min + fix-selinux.sh + rmmod) ------
+            // (4) repair selinux_state (kread_min + fix-selinux.sh + rmmod) ------
             /* Order inside is the script's: load the module that provides /proc/kwrite, run the
              * repair (it only writes bytes +1..+10, enforcing is untouched), then unload the
              * module again -- nothing stays behind. */
@@ -1070,9 +1279,9 @@ class RootChain(
                 val commands = ChainSpec.selinuxRepairCommands()
                 val failures = mutableListOf<String>()
                 for (command in commands) {
-                    val result = adb.exec(command)
+                    val result = privileged(command)
                     val output = result.output.trim()
-                    onLog("[*] $command -> exit=${result.exitCode}")
+                    onLog("[*] $command（${transport()}）-> exit=${result.exitCode}")
                     if (output.isNotEmpty()) {
                         output.lineSequence().filter { it.isNotBlank() }.take(12)
                             .forEach { onLog("    $it") }
@@ -1089,15 +1298,15 @@ class RootChain(
                 }
             }
 
-            // (6) restore the debug properties -----------------------------------
+            // (5) restore the debug properties -----------------------------------
             /* `resetprop` is usable here and not before: the guard is gone and `ksud late-load`
              * has not reloaded the policy yet. See [ChainSpec.hardenCommands] for the order. */
             run {
                 val commands = ChainSpec.hardenCommands(ksud)
                 val failures = mutableListOf<String>()
-                onLog("[*] 属性恢复用 $ksud（内置 ksud，busybox 式调用 ksud resetprop）")
+                onLog("[*] 属性恢复用 $ksud（busybox 式调用 ksud resetprop；${transport()}）")
                 for (command in commands) {
-                    val result = adb.exec(command)
+                    val result = privileged(command)
                     val output = result.output.trim()
                     if (output.isNotEmpty()) {
                         output.lineSequence().filter { it.isNotBlank() }.take(4)
@@ -1119,7 +1328,7 @@ class RootChain(
                 }
             }
 
-            "提权环境就绪（adbd 开门 / uid=0 满 cap / guard 已卸 / 管理端已装 / selinux 已修 / 属性已恢复）"
+            "提权环境就绪（adbd 开门 / guard 已卸 / selinux 已修 / 属性已恢复；${transport()}）"
         } != null
         if (!ok) return false
 
@@ -1128,10 +1337,13 @@ class RootChain(
         /* load ok == exit 0 is the whole verdict. `ksud late-load` reloads the SELinux policy
          * and **restarts adbd** on the way out, so anything that would read the module list
          * afterwards reads through a transport that no longer exists -- which is exactly the
-         * check that used to turn a successful late-load into a failed step. */
+         * check that used to turn a successful late-load into a failed step.
+         *
+         * Through [privileged] on purpose: this is the step the whole chain exists for, and
+         * it must run on the uid-0 command plane when the root adbd never came up. */
         ok = step(ChainStep.KSU_LATE_LOAD, ChainSpec.KSUD_LATE_LOAD) {
-            val out = adb.exec(ChainSpec.KSUD_LATE_LOAD, timeoutMs = 120_000)
-            if (out.output.isNotBlank()) onLog("[*] ksud: ${out.output.trim()}")
+            val out = privileged(ChainSpec.KSUD_LATE_LOAD, timeoutMs = 120_000)
+            if (out.output.isNotBlank()) onLog("[*] ksud（${transport()}）: ${out.output.trim()}")
             if (out.exitCode != 0) {
                 throw IllegalStateException("ksud late-load 退出码 ${out.exitCode}（只看返回码判断成败）")
             }

@@ -252,7 +252,7 @@
     <string name="wireless_endpoint_label">端点</string>
     <string name="root_chain_step_am_hang">重启 framework（am hang）</string>
     <string name="root_chain_part1">Part 1</string>
-    <string name="root_chain_part2">Part 2</string>
+    <string name="root_chain_part2">Part 2 已就绪</string>
     <string name="root_chain_step_harden_props">恢复属性：ro.secure / ro.debuggable / suid_dumpable</string>
     <string name="root_chain_step_selinux_repair">修复 selinux_state（kread_min + fix-selinux.sh）</string>
     <string name="root_chain_step_install_manager">安装管理端：SukiSU-Ultra</string>

@@ -679,6 +679,7 @@ class GhostlockViewModel(
 
     private fun chainStepLabelRes(step: ChainStep): Int = when (step) {
         ChainStep.PREFLIGHT -> R.string.root_chain_step_preflight
+        ChainStep.MANAGER_INSTALL -> R.string.root_chain_step_install_manager
         ChainStep.W1 -> R.string.root_chain_step_w1
         ChainStep.AM_HANG -> R.string.root_chain_step_am_hang
         ChainStep.MAGICA_ROOT -> R.string.root_chain_step_magica_root

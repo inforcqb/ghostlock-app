@@ -9,9 +9,15 @@ import com.ghostlock.app.wireless.AdbCommand
 import com.ghostlock.app.wireless.WIRELESS_TAG
 import com.ghostlock.app.chain.ChainProgress
 import com.ghostlock.app.chain.ChainSpec
+import com.ghostlock.app.chain.ChainStateStore
+import com.ghostlock.app.chain.ChainStep
 import com.ghostlock.app.chain.RootChain
+import com.ghostlock.app.chain.RootExec
+import com.ghostlock.app.chain.ShellResult
+import com.ghostlock.app.chain.StepState
 import com.ghostlock.app.root.IsolatedRootShell
 import com.ghostlock.app.root.RootChannel
+import com.ghostlock.app.root.RootCommand
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
@@ -47,6 +53,7 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -82,6 +89,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val NativeLogFileName = ".ghostlock_native.log"
         const val LastRunFileName = ".ghostlock_last_run"
         const val W3SeccompFailureMarker = "W3 seccomp clear failed"
+
+        /* The uid-0 command plane's staging contract (see `prepareCommandPlane` and
+         * `RootShellService`'s COMMAND_SERVER_* constants). */
+        const val CommandPlaneTokenName = "token"
+        const val CommandPlanePortName = "port"
     }
 
     private val appContext = context.applicationContext
@@ -167,10 +179,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      *  * it reads both facts in **one** command ([ChainSpec.READ_PHASE]) and at most once per
      *    [PHASE_REFRESH_MS];
      *  * a failed read (or no pairing at all) keeps [lastChainPhase]: the facts only change on
-     *    a reboot or when W1 lands, and on a reboot this process is gone anyway.
+     *    a reboot or when W1 lands, and on a reboot this process is gone anyway -- except for
+     *    the part-2 case, which [rememberedPart2Phase] recovers from the chain's own record.
      */
     private suspend fun chainPhase(): ChainPhase {
-        if (!WirelessPairingController.state.paired) return lastChainPhase
+        if (!WirelessPairingController.state.paired) return rememberedPart2Phase()
         if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) return lastChainPhase
         return phaseGate.withLock {
             if (SystemClock.elapsedRealtime() - lastPhaseReadAt < PHASE_REFRESH_MS) {
@@ -184,7 +197,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     timeoutMs = 10_000,
                     onLog = {},
                 )
-            }.getOrNull()?.takeIf { !it.transportFailure } ?: return@withLock lastChainPhase
+            }.getOrNull()?.takeIf { !it.transportFailure } ?: return@withLock rememberedPart2Phase()
             val lines = read.output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
             val enforce = lines.firstOrNull().orEmpty()
             val seccomp = lines.firstOrNull { it.startsWith("Seccomp:") }
@@ -205,6 +218,23 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             phase
         }
     }
+
+    /**
+     * The phase when the device cannot be asked: the chain's own record of this boot's run.
+     *
+     * After `am hang --allow-restart` the framework restarts this app, so the wireless channel
+     * can be gone exactly when the UI has to say which half it is showing -- and the default
+     * ([ChainPhase.PART1]) would then hide every part-2 step, including the 「Part 2 已就绪」
+     * prompt, on a device that is in part 2. [ChainStateStore] is written before each step and
+     * survived that restart, and [resumedPart2] is exactly the question "is that record a
+     * part-2 run of this boot?".
+     *
+     * Only a positive part-2 answer is taken from the record: anything else keeps
+     * [lastChainPhase], so a stale record can never turn a fresh boot into part 2 here. The
+     * chain's own entry check re-reads the live facts and does not trust this at all.
+     */
+    private fun rememberedPart2Phase(): ChainPhase =
+        if (resumedPart2()) ChainPhase.PART2 else lastChainPhase
 
     /**
      * The access channel, as the UI shows it: the wireless-debugging shell the chain runs
@@ -528,8 +558,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         /* The chain's uid-2000 steps run over the wireless-debugging channel now. Pairing is
          * the standing authorization, so the connection may simply not exist yet when the
          * user taps one-click root: make sure the channel is up before the first step, and
-         * stop with a clear message instead of failing inside step 1. */
-        if (!WirelessPairingController.ensureChannel(appContext, onLog)) {
+         * stop with a clear message instead of failing inside step 1.
+         *
+         * UNLESS THIS IS A PART-2 RESUME (see [resumedPart2]): the relaunch after
+         * `am hang --allow-restart` restarted the framework, and the half of the chain that
+         * is left -- Magica's uid-0 channel, the security module, `ksud late-load` -- does not
+         * need the wireless channel at all. Refusing to start there would strand a device
+         * whose adbd never came back as a root adbd. */
+        val part2Resume = resumedPart2()
+        if (part2Resume) {
+            onLog(
+                "[*] 续跑 PART 2（上一次记录：${ChainStateStore.load()?.summary() ?: "无"}）—— " +
+                    "不要求 uid-2000 通道；本阶段的命令由 uid-0 命令面执行",
+            )
+        } else if (!WirelessPairingController.ensureChannel(appContext, onLog)) {
             onLog("error: 无线调试通道不可用 —— 请先在「无线调试」里完成配对与连接")
             return false
         }
@@ -548,11 +590,18 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             onLog("[*] 用设备上的 ${ChainSpec.KSUD_FALLBACK}（内置 ksud 没能推送）")
             ChainSpec.KSUD_FALLBACK
         }
-        /* The uid-0 command plane is the binder to the isolated root service -- the same binder
-         * that starts it. No socket, no token, no directory to prepare: `/data/local/tmp/gl-w1`
+        /* The uid-0 channel is the binder to the isolated root service -- the same binder that
+         * starts it. It carries four fixed intents (`identity` / gate / adbd restart /
+         * listeners) and no command string, which is why the command plane below is a
+         * separate transport. The old socket server (`/data/local/tmp/gl-w1` + `rshell.sock`)
          * needed hand-creation and the app-data-dir variant needed two chmods plus permissive
          * SELinux, and neither worked on every device (the user's report). */
         val channel = RootChannel { isolatedRootShell.serviceOrNull() }
+        /* The *other* uid-0 plane: the command server (`gl_server`, 127.0.0.1:5038) that the
+         * isolated process starts in [IsolatedRootShell.launch], and the transport part 2
+         * falls back to when the root adbd is not there. Staged before the launch, because the
+         * server reads its token while it starts. */
+        prepareCommandPlane(onLog)
         /* Steps 7-9 run on the bundled adb CLI against the root adbd: the app has no adb
          * client of its own any more (libadb, and with it the whole adb public-key story,
          * is gone -- the wireless pairing already authorized our key). */
@@ -576,6 +625,22 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             rootShell = { isolatedRootShell.launch(onLog) },
             channel = channel,
             adb = adb,
+            /* The uid-0 command plane: one line in, output and an exit code out (see
+             * `root/RootCommand.kt` and `jni/gl_server.cpp`). It is what lets part 2 finish
+             * without a root adbd, and `RootCommand.exec` never throws for a command that
+             * ran -- a *failure to run* is the IllegalStateException the chain relies on to
+             * fall over from the adb transport. */
+            root = RootExec { command, timeoutMs, domain ->
+                val result = RootCommand.exec(
+                    command = command,
+                    timeoutMs = timeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    domain = domain,
+                )
+                result.failed?.let {
+                    throw IllegalStateException("uid-0 命令面执行失败（命令没有运行）：$it")
+                }
+                ShellResult(result.exitCode, result.output)
+            },
             ksud = ksud,
             onLog = onLog,
             onProgress = onProgress,
@@ -586,6 +651,73 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             channel.close()
         }
     }
+
+    /**
+     * Stage the uid-0 command plane's token, and hand `RootCommand` the port.
+     *
+     * Two copies of one secret on purpose: `<filesDir>/token` for [RootCommand] in this
+     * process, and [ChainSpec.COMMAND_PLANE_TOKEN] on the device for the server inside the
+     * isolated process (which has no business reading the app's private directory on an
+     * enforcing boot). Without this the server falls back to an empty token, i.e. no
+     * authentication at all on 127.0.0.1:5038.
+     *
+     * Every step is failure-tolerant: the chain must never break over staging, and an empty
+     * token file simply means "no auth" as before.
+     */
+    private suspend fun prepareCommandPlane(onLog: (String) -> Unit): Int {
+        RootCommand.attach(filesDir)
+        val port = ChainSpec.COMMAND_PLANE_PORT
+        val token = runCatching {
+            val existing = File(filesDir, CommandPlaneTokenName).readText().trim()
+            /* Reuse a good token: the *server* may still be running from an earlier part of the
+             * run and holding the old one. */
+            if (existing.length >= 32) existing else newToken()
+        }.getOrElse { newToken() }
+        val local = runCatching {
+            File(filesDir, CommandPlaneTokenName).writeText(token, StandardCharsets.UTF_8)
+            File(filesDir, CommandPlanePortName).writeText("$port\n", StandardCharsets.UTF_8)
+            true
+        }.getOrDefault(false)
+        val pushed = runCatching {
+            DeviceSync.pushText(appContext, ChainSpec.COMMAND_PLANE_TOKEN, "$token\n", "644", onLog)
+        }.getOrDefault(false)
+        onLog(
+            "[*] uid-0 命令面暂存：port=$port token=${token.take(6)}…（本机文件 ${if (local) "ok" else "失败"}，" +
+                "设备侧 ${if (pushed) "已推送" else "没推送（服务端会用空 token = 无鉴权）"}）",
+        )
+        return port
+    }
+
+    private fun newToken(): String {
+        val bytes = ByteArray(24)
+        SecureRandom().nextBytes(bytes)
+        return bytes.joinToString("") { byte -> byte.toUByte().toString(16).padStart(2, '0') }
+    }
+
+    /**
+     * Is this run the second half of a chain that `am hang --allow-restart` interrupted?
+     *
+     * The framework restart takes this app with it, so the only witness that survives is the
+     * app's own record ([ChainStateStore]): a run from **this boot**, not finished, whose last
+     * step is at or past [ChainStep.AM_HANG] means part 1 is done and the device is permissive
+     * with a parked engine. That is the one case where the chain must not require the
+     * uid-2000 channel before it starts.
+     *
+     * Pure file I/O on purpose: this runs before anything is connected, and it must not touch
+     * the device (the wireless read that would confirm it needs the very channel we are
+     * trying to make optional).
+     */
+    private fun resumedPart2(): Boolean = runCatching {
+        val state = ChainStateStore.load() ?: return@runCatching false
+        if (state.finished || !ChainStateStore.belongsToThisBoot(state)) return@runCatching false
+        if (state.state == StepState.FAILED.name) return@runCatching false
+        val step = runCatching { ChainStep.valueOf(state.step) }.getOrNull()
+            ?: return@runCatching false
+        /* The restart happens *while* AM_HANG runs, so the record it leaves behind is
+         * `AM_HANG / RUNNING` -- that, and every part-2 step, means part 1 is behind us.
+         * PREFLIGHT / MANAGER_INSTALL / W1 are part 1. */
+        step == ChainStep.AM_HANG || step.phase == ChainPhase.PART2
+    }.getOrDefault(false)
 
     private suspend fun recordLastRun(code: Int) = withContext(Dispatchers.IO) {
         runCatching {

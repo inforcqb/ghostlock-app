@@ -85,6 +85,32 @@ object DeviceSync {
         return all
     }
 
+    /**
+     * Put literal [content] at [remote] -- the uid-0 command plane's token, at the path the
+     * isolated process reads ([ChainSpec.COMMAND_PLANE_TOKEN]).
+     *
+     * Staged in the cache and pushed like every other file: `adb push` is the only transport
+     * the app has, and uid 2000 cannot write into the app's private directory.
+     */
+    suspend fun pushText(
+        context: Context,
+        remote: String,
+        content: String,
+        mode: String,
+        onLog: (String) -> Unit,
+    ): Boolean {
+        val staged = File(context.cacheDir, remote.substringAfterLast('/'))
+        val wrote = runCatching {
+            staged.writeText(content)
+            staged.isFile && staged.length() > 0L
+        }.getOrElse { error ->
+            onLog("[!] 暂存 $remote 失败：${error.message}")
+            false
+        }
+        if (!wrote) return false
+        return pushIfChanged(staged, remote, mode, onLog)
+    }
+
     /** Stage `assets/<assetPath>` in the cache and push it to [remote] (see [pushIfChanged]). */
     suspend fun pushAsset(
         context: Context,
