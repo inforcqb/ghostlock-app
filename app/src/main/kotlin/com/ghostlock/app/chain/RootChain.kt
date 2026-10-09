@@ -403,8 +403,9 @@ object ChainSpec {
 }
 
 /**
- * One step of the chain. [phase] is null for the step that is not part of the split
- * ([PREFLIGHT]): it runs in both halves and is always shown.
+ * One step of the chain. [phase] is null for the step that is outside the split
+ * ([PREFLIGHT]): it is always *shown*, but part 2 skips it -- the `su` probe needs the
+ * uid-2000 channel, which part 2 does not have by design (see `RootChain.run`).
  *
  * The APK install is its own step in **part 1** ([MANAGER_INSTALL], before [W1]): `pm
  * install` needs neither root nor permissive SELinux, and the uid-2000 channel it runs on
@@ -417,7 +418,7 @@ object ChainSpec {
  * and six rows of the same phase told the user nothing extra.
  */
 enum class ChainStep(val label: String, val phase: ChainPhase?) {
-    PREFLIGHT("预检：通道与文件", null),
+    PREFLIGHT("预检：su 探针（part 1）", null),
     MANAGER_INSTALL("安装管理端（part 1）", ChainPhase.PART1),
     W1("W1：SELinux 转宽容", ChainPhase.PART1),
     AM_HANG("重启 framework（am hang）", ChainPhase.PART1),
@@ -992,28 +993,69 @@ class RootChain(
     }
 
     suspend fun run(): Boolean {
-        // step 0 ------------------------------------------------------------------
-        /* The fool-proof check comes first: if the device already hands out root through
-         * `su`, this chain must not run at all. Every step of it forges kernel state, hangs
-         * system_server and reboots adbd -- all of it pointless, and not harmless, when the
-         * goal (root) is already there. */
+        // the phase, decided once, before any step runs ---------------------------
+        /* Live facts decide whether W1 has to run at all -- see [readBootFacts]:
+         *  - `enforce == 0` AND `Seccomp: 0` together mean this boot already ran W1 (a
+         *    framework restart does NOT restore enforcing; only a reboot does), and the
+         *    parked engine that holds the forged PI state is still alive. Running W1
+         *    again would forge a second waiter on top of it, so skip it -- and skip the
+         *    `am hang` right after it as well, unconditionally, without consulting the
+         *    marker file (the hang kills this app, so that file may legitimately be
+         *    absent or invisible in the next launch).
+         *  - otherwise this is a fresh boot: clear the step markers, they describe the
+         *    previous boot.
+         * If neither can be established, [readBootFacts] throws rather than guessing.
+         *
+         * This runs **before the preflight** (user's call, 2026-10-09: 直接把 part 2 的预检删了):
+         * the preflight exists to ask "is this device already rooted?", it can only be asked over
+         * the uid-2000 channel, and part 2 has no such channel *by design*. Deciding the phase
+         * first is what lets part 2 skip that step outright instead of running a step that could
+         * not answer anyway.
+         */
+        val boot = readBootFacts()
+        val w1AlreadyDone = boot.w1Landed
+        if (w1AlreadyDone) {
+            onLog(
+                "[*] 阶段判定：**PART 2**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
+                    "本次开机已做过 W1）—— 第一件事就是 MAGICA_ROOT；管理端安装 / W1 / am hang 全部跳过",
+            )
+        } else {
+            /* A stale marker from an earlier boot must not survive into this one: it is only
+             * ever written *after* W1 landed, and a reboot restores enforcing, so on this
+             * branch it describes a run that no longer exists. */
+            runCatching { sh("rm -f ${ChainSpec.MARKER_HANG}") }
+            onLog(
+                "[*] 阶段判定：**PART 1**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
+                    "本次开机未做过 W1）—— 管理端安装 → W1 → am hang → Magica；已清掉旧步骤标记",
+            )
+        }
+
+        /* step 0 -- part 1 only ----------------------------------------------------
+         * The fool-proof check: if the device already hands out root through `su`, this chain must
+         * not run at all. Every step of it forges kernel state, hangs system_server and reboots
+         * adbd -- all of it pointless, and not harmless, when the goal is already there.
+         *
+         * **Part 2 does not run this step at all** (user's call, 2026-10-09: 直接把 part 2 的预检
+         * 删了). The question can only be asked over the uid-2000 channel, part 2 has none by
+         * design, and a part-2 start means the chain is already half-done -- so there is nothing
+         * to ask and nothing to fall back to. The step shows up in the list as skipped, the way
+         * the other part-1-only steps do. */
         var alreadyRooted = false
-        var ok = step(ChainStep.PREFLIGHT, "live facts + su") {
+        var ok = step(
+            ChainStep.PREFLIGHT,
+            if (w1AlreadyDone) "part 2：预检跳过" else "su 探针（uid-2000 通道）",
+        ) {
+            if (w1AlreadyDone) return@step "PART 2：预检跳过（不需要 uid-2000 通道，也不看 su）"
             /* The command plane is a binder to the isolated root service, so there is nothing to
              * list from the shell side -- the client object answers for itself. */
             onLog("[*] uid-0 通道：${channel.describe()}")
-            /* The `su` probe answers one question -- "is this device already rooted, so the chain
-             * must not run at all?" -- and it can only be asked over the uid-2000 channel.
-             *
-             * Part 2 does not have that channel **by design** (user's call, 2026-10-09: the
-             * preflight must not require a shell that part 2 does not need), so where the channel
-             * is not there the probe is skipped instead of being attempted and reported as a
-             * failure. Nothing is lost: a part-2 start means the chain is already half-done, and
-             * "already rooted" cannot be decided from a channel that does not exist. */
             alreadyRooted = if (shellReady()) {
                 suGrantsRoot()
             } else {
-                onLog("[*] 预检：没有 uid-2000 通道（part 2 不需要它）⇒ 跳过 su 探针")
+                /* Part 1 with no usable channel: [runRootChain] refuses to start in that state, so
+                 * this is only reachable if the channel died between its check and here -- and the
+                 * probe cannot be answered from anywhere else. */
+                onLog("[*] 预检：uid-2000 通道不可用 ⇒ 跳过 su 探针")
                 false
             }
             if (alreadyRooted) {
@@ -1038,42 +1080,6 @@ class RootChain(
             )
             onLog("[+] root 可用（su -c id 返回 uid=0）—— 利用链已跳过，没有伪造任何内核状态。")
             return true
-        }
-
-        // the phase, decided once, before any step runs ---------------------------
-        /* Live facts decide whether W1 has to run at all -- see [readBootFacts]:
-         *  - `enforce == 0` AND `Seccomp: 0` together mean this boot already ran W1 (a
-         *    framework restart does NOT restore enforcing; only a reboot does), and the
-         *    parked engine that holds the forged PI state is still alive. Running W1
-         *    again would forge a second waiter on top of it, so skip it -- and skip the
-         *    `am hang` right after it as well, unconditionally, without consulting the
-         *    marker file (the hang kills this app, so that file may legitimately be
-         *    absent or invisible in the next launch).
-         *  - otherwise this is a fresh boot: clear the step markers, they describe the
-         *    previous boot.
-         * If neither can be established, [readBootFacts] throws rather than guessing.
-         *
-         * This runs at the *entry*, before the first part-1 step is even entered, and the
-         * verdict is printed as such: the user's requirement is that a part-2 resume (the
-         * relaunch after `am hang` restarted the framework) starts with MAGICA_ROOT and
-         * nothing else -- see [ChainStep.MANAGER_INSTALL] and [ChainStep.W1] for the two
-         * steps that skip themselves on this verdict. */
-        val boot = readBootFacts()
-        val w1AlreadyDone = boot.w1Landed
-        if (w1AlreadyDone) {
-            onLog(
-                "[*] 阶段判定：**PART 2**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
-                    "本次开机已做过 W1）—— 第一件事就是 MAGICA_ROOT；管理端安装 / W1 / am hang 全部跳过",
-            )
-        } else {
-            /* A stale marker from an earlier boot must not survive into this one: it is only
-             * ever written *after* W1 landed, and a reboot restores enforcing, so on this
-             * branch it describes a run that no longer exists. */
-            runCatching { sh("rm -f ${ChainSpec.MARKER_HANG}") }
-            onLog(
-                "[*] 阶段判定：**PART 1**（enforce=${boot.enforce} + Seccomp=${boot.seccomp} ⇒ " +
-                    "本次开机未做过 W1）—— 管理端安装 → W1 → am hang → Magica；已清掉旧步骤标记",
-            )
         }
 
         // step 1: the manager, before W1 and before the framework restart ----------
