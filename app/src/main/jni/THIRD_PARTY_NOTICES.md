@@ -29,25 +29,29 @@ Keep-this-in-mind facts about the vendored copies:
   (read the ELF, find the `.rela.plt` entry for `capset`, mprotect the page
   writable, store the replacement address, flush the instruction cache).
 
-## Also shipped in the APK: KernelSU's `ksud` and its manager app
+## Also shipped in the APK: SukiSU-Ultra's `ksud` and its manager app
 
 Neither is compiled here. The build step `Stage the pinned ksud + manager` copies two files out of
-`prebuilt/kernelsu-3.3.0-69-gdf03912f/` (their sha256 is asserted there, and the provenance is in
+`prebuilt/sukisu-ultra-4c15fca1/` (their sha256 is asserted in the workflow, and the provenance is in
 that directory's README) into the APK:
 
 * `lib/arm64-v8a/libksud.so` — the standalone `ksud`; the chain invokes it as `ksud resetprop …`
-  (busybox style), by absolute path, from the app's copy at `/data/local/tmp/gl-w1/ksud`.
-  Pinned: `tiann/KernelSU` CI run `37882323514`, HEAD `df03912f70d9` (`git describe`
-  `v3.3.0-69-gdf03912f`, 2026-10-09), artifact `ksud-aarch64-linux-android`, sha256
-  `a14b5980d4b857542c920a3a22625cbba34edd6ea4741230bb1d25d93516c4ce`, 6310288 bytes.
-* `assets/device/sukisu-manager.apk` — KernelSU's manager APK from the same run
-  (`KernelSU_v3.3.0-69-gdf03912f_32670-release.apk`, sha256
-  `9acd811cd611b7f4d95fdfcd06d0bb228c2807606fd66d24915a08b5cc6dcde3`), so a device that cannot reach
-  GitHub still gets a manager: the chain pushes it and runs `pm install -r` with root. Its package
-  is `me.weishu.kernelsu`, which is what `ChainSpec.KSU_MANAGER_PACKAGE` names.
+  (busybox style), by absolute path, from the app's own copy (the private staged directory, and
+  `98ca011` additionally installs it to `/data/adb/ksud` before `late-load`).
+  Pinned: `SukiSU-Ultra/SukiSU-Ultra` CI run `37934517573`, branch `main`, HEAD `4c15fca1`
+  (2026-10-09), artifact `ksud-aarch64-linux-android`, sha256
+  `a27b0842d31ae34028dff556308c194ac8fb4eaf7732696fbf9bcf8507d49c71`, 6965184 bytes. The kernel
+  module is packed **inside** it (`pack_lkm`), which is why no separate `.ko` is shipped.
+* `assets/device/sukisu-manager.apk` — the manager APK from the same run
+  (`SukiSU_v4.2.0_40965-release.apk`, sha256
+  `d3b07d2638745e79faa765c9bfe9281269414399e0550a13cc186a88e645fbb4`), so a device that cannot reach
+  GitHub still gets a manager: the chain pushes it and runs `pm install -r` with root. Its package is
+  `com.sukisu.ultra`, which is what `ChainSpec.KSU_MANAGER_PACKAGE` names.
 
-Earlier builds fetched the *latest* SukiSU-Ultra release instead; that is no longer possible for this
-pair (KernelSU publishes no release for that commit, and its manager bundles no `ksud`).
+The pin before this one was a KernelSU `v3.3.0-69-gdf03912f` pair (see
+`prebuilt/kernelsu-3.3.0-69-gdf03912f/README.md` in git history) — committed rather than fetched
+for the same reason: another repository's CI artifacts need a token this workflow does not have,
+and a pinned pair with asserted sha256s makes the build reproducible.
 
 **Licence: GPL-3.0** (KernelSU family) for both. GPL-3.0 is copyleft, so redistributing an APK that
 carries these binaries obliges the distributor to the GPL's terms (source offer and licence text).

@@ -23,18 +23,18 @@
 `app/build.gradle.kts` 里对 `**/libksud.so` 设了 `keepDebugSymbols`（别让 llvm-strip 动它）。
 
 * **来源（钉死，不再跟"最新 release"走）**：CI 的 `Stage the pinned ksud + manager` 步骤把
-  `prebuilt/kernelsu-3.3.0-69-gdf03912f/ksud` 复制到这里，并**校验 sha256**
-  （`a14b5980d4b857542c920a3a22625cbba34edd6ea4741230bb1d25d93516c4ce`，6310288 B）。
-  这份 `ksud` 来自 **tiann/KernelSU** 的 CI（run `37882323514`，HEAD `df03912f70d9`，
-  `git describe` = `v3.3.0-69-gdf03912f`，2026-10-09）的 `ksud-aarch64-linux-android` 产物 ——
-  上游管理端 APK 里**没有** `lib/arm64-v8a/libksud.so`（只有 `libkernelsu.so`/`libadbroot.so`），
-  所以这里用的是独立产物，而不是像以前那样从 APK 里解出来。
-  换版本的方法写在 `prebuilt/kernelsu-3.3.0-69-gdf03912f/README.md`。
+  `prebuilt/sukisu-ultra-4c15fca1/ksud` 复制到这里，并**校验 sha256**
+  （`a27b0842d31ae34028dff556308c194ac8fb4eaf7732696fbf9bcf8507d49c71`，6965184 B）。
+  这份 `ksud` 来自 **SukiSU-Ultra/SukiSU-Ultra** 的 CI（run `37934517573`，分支 `main`，
+  HEAD `4c15fca1`，2026-10-09）的 `ksud-aarch64-linux-android` 产物；**内核模块就打包在它里面**
+  （`pack_lkm`），所以不需要单独下载 `.ko`。
+  换版本的方法写在 `prebuilt/sukisu-ultra-4c15fca1/README.md`（上一版是 KernelSU 的
+  `v3.3.0-69-gdf03912f`，见 git 历史）。
 * 该文件**不提交进仓库**（`.gitignore` 已忽略，提交的是 `prebuilt/` 里那两份原件）；本地手工构建：
 
   ```sh
   mkdir -p app/src/main/jniLibs/arm64-v8a
-  cp prebuilt/kernelsu-3.3.0-69-gdf03912f/ksud app/src/main/jniLibs/arm64-v8a/libksud.so
+  cp prebuilt/sukisu-ultra-4c15fca1/ksud app/src/main/jniLibs/arm64-v8a/libksud.so
   ```
 * 为什么打进 APK：链的第 8b 步要把 `ro.secure` / `ro.debuggable` 写回去，而**裸 `resetprop`
   不在 `adb shell` 的 PATH 里**（真机实测：设备上只有管理端安装目录里那个符号链接
@@ -52,12 +52,14 @@
 
 ## `assets/device/sukisu-manager.apk` —— 管理端（同一个钉住版本）
 
-CI 的同一步把 `prebuilt/kernelsu-3.3.0-69-gdf03912f/kernelsu-manager.apk` 复制到
+CI 的同一步把 `prebuilt/sukisu-ultra-4c15fca1/sukisu-manager.apk` 复制到
 `app/src/main/assets/device/sukisu-manager.apk`（也不提交进仓库，sha256
-`9acd811cd611b7f4d95fdfcd06d0bb228c2807606fd66d24915a08b5cc6dcde3`，3769389 B）；
+`d3b07d2638745e79faa765c9bfe9281269414399e0550a13cc186a88e645fbb4`，16718549 B；
+来自 `SukiSU_v4.2.0_40965-release.apk`）；
 文件名保持 `sukisu-manager.apk` 是为了不动链里的 `ChainSpec.KSU_MANAGER_APK`。
 链的第 7b 步把它推到 `/data/local/tmp/gl-w1/sukisu-manager.apk` 并用 root `pm install -r` 装上，
 这样设备侧不需要访问 GitHub 就能拿到管理端（`su` 授权、模块管理）。
-装上的包名因此是 **`me.weishu.kernelsu`**（`ChainSpec.KSU_MANAGER_PACKAGE` 已随之更新）。
+装上的包名因此是 **`com.sukisu.ultra`**，与 `ChainSpec.KSU_MANAGER_PACKAGE` 一致
+（上一版钉的是 KernelSU 的管理端，包名是 `me.weishu.kernelsu`）。
 
 

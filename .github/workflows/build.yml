@@ -94,31 +94,31 @@ jobs:
           make ghostlock
           "${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all ghostlock || true
 
-      # Both artifacts are now the **pinned** KernelSU build `v3.3.0-69-gdf03912f` (tiann/KernelSU,
-      # CI run 37882323514, 2026-10-09), committed under `prebuilt/kernelsu-3.3.0-69-gdf03912f/`:
+      # Both artifacts are the **pinned** SukiSU-Ultra build `main@4c15fca1` (SukiSU-Ultra/SukiSU-Ultra,
+      # CI run 37934517573, 2026-10-09), committed under `prebuilt/sukisu-ultra-4c15fca1/`:
       #
-      #  * `ksud` (the standalone aarch64 artifact; upstream's manager APK does *not* bundle one, so
-      #    there is nothing to unzip) -> jniLibs/arm64-v8a/libksud.so. The chain calls it as
-      #    `ksud resetprop …` (busybox style) from the app's own copy in /data/local/tmp/gl-w1.
+      #  * `ksud` (the standalone aarch64 artifact; the kernel module is packed *inside* it, so there
+      #    is no separate .ko) -> jniLibs/arm64-v8a/libksud.so. The chain calls it as
+      #    `ksud resetprop …` (busybox style), and `98ca011` installs this same copy to
+      #    /data/adb/ksud before `late-load`.
       #  * the manager APK itself -> `assets/device/sukisu-manager.apk`. It is bundled because the
       #    device must not have to reach GitHub (国内网络到 GitHub 不稳): the app pushes it and the
       #    chain installs it with root (`pm install -r`).
       #
-      # A pinned copy instead of "latest release", because KernelSU publishes no release for that
-      # commit (CI artifacts only, and another repository's artifacts need a token this job does not
-      # have). The sha256 below is what makes the pin real: a silent swap fails the build.
-      - name: Stage the pinned ksud + manager (KernelSU v3.3.0-69-gdf03912f)
+      # Pinned copies instead of a fetch, because another repository's CI artifacts need a token this
+      # job does not have. The sha256 below is what makes the pin real: a silent swap fails the build.
+      - name: Stage the pinned ksud + manager (SukiSU-Ultra main@4c15fca1)
         env:
-          KSUD_SHA256: a14b5980d4b857542c920a3a22625cbba34edd6ea4741230bb1d25d93516c4ce
-          MANAGER_SHA256: 9acd811cd611b7f4d95fdfcd06d0bb228c2807606fd66d24915a08b5cc6dcde3
+          KSUD_SHA256: a27b0842d31ae34028dff556308c194ac8fb4eaf7732696fbf9bcf8507d49c71
+          MANAGER_SHA256: d3b07d2638745e79faa765c9bfe9281269414399e0550a13cc186a88e645fbb4
         run: |
           set -euo pipefail
-          SRC=prebuilt/kernelsu-3.3.0-69-gdf03912f
+          SRC=prebuilt/sukisu-ultra-4c15fca1
           test -s "$SRC/ksud"
-          test -s "$SRC/kernelsu-manager.apk"
+          test -s "$SRC/sukisu-manager.apk"
           mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/device
           cp "$SRC/ksud" app/src/main/jniLibs/arm64-v8a/libksud.so
-          cp "$SRC/kernelsu-manager.apk" app/src/main/assets/device/sukisu-manager.apk
+          cp "$SRC/sukisu-manager.apk" app/src/main/assets/device/sukisu-manager.apk
           echo "$KSUD_SHA256  app/src/main/jniLibs/arm64-v8a/libksud.so" | sha256sum -c -
           echo "$MANAGER_SHA256  app/src/main/assets/device/sukisu-manager.apk" | sha256sum -c -
           # libksud.so is an executable, not a shared library: it has to be an ELF aarch64 file the
