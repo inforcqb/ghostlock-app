@@ -1164,10 +1164,26 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun firstValidProperty(vararg keys: String): String? =
         keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
+    /**
+     * Puts a `ksud` into [workDir] and returns it.
+     *
+     * The copy bundled in this APK comes **first**: it is the one this chain was built against, the
+     * one the manager the chain installs (upstream KernelSU) goes with, and the one step 9 writes
+     * to `/data/adb/ksud` before `late-load`. An installed manager is only a fallback for the case
+     * where the APK carries no `libksud.so` at all -- a manager's bundled ksud belongs to whatever
+     * KSU the device already had, which is exactly what this chain must not depend on.
+     */
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
+        val bundled = File(appContext.applicationInfo.nativeLibraryDir, ChainSpec.KSUD_LIB)
+        if (bundled.isFile) {
+            copyKsud(bundled, workDir, onLog, "bundled copy")?.let { return it }
+        } else {
+            onLog("the APK carries no ${ChainSpec.KSUD_LIB} -- falling back to an installed manager")
+        }
+
         val packages = listOf(
-            /* com.sukisu.ultra is the manager the chain installs from the app's bundled copy of
-             * the latest SukiSU-Ultra release; the rest are managers a user may already have. */
+            /* The manager the chain installs from the app's bundled copy first, then managers a
+             * user may already have. */
             ChainSpec.KSU_MANAGER_PACKAGE,
             "me.weishu.kernelsu.pr",
             "me.weishu.kernelsu",
@@ -1180,15 +1196,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             installed = true
             val source = File(appInfo.nativeLibraryDir, "libksud.so")
             if (!source.isFile) continue
-            val output = File(workDir, "ksud")
-            runCatching {
-                source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
-                runCatching { Os.chmod(output.absolutePath, 448) }
-                return output
-            }.onFailure { onLog("copy ksud failed: ${it.message}") }
+            copyKsud(source, workDir, onLog, "from $packageName (fallback)")?.let { return it }
         }
         if (!installed) onLog("KernelSU/ReSukiSU/KowSU app not installed")
         return null
+    }
+
+    private fun copyKsud(source: File, workDir: File, onLog: (String) -> Unit, from: String): File? {
+        val output = File(workDir, "ksud")
+        return runCatching {
+            source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
+            runCatching { Os.chmod(output.absolutePath, 448) }
+            onLog("ksud $from")
+            output
+        }.onFailure { onLog("copy ksud failed: ${it.message}") }.getOrNull()
     }
 
     private suspend fun runProcess(

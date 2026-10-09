@@ -25,3 +25,6 @@ target/
 # Fetched from the SukiSU-Ultra latest release by CI (never committed):
 app/src/main/jniLibs/arm64-v8a/libksud.so
 app/src/main/assets/device/sukisu-manager.apk
+
+# local scratch: downloaded CI artifacts and their extracted contents
+dist/
