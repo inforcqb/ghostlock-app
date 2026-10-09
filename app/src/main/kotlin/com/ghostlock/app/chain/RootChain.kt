@@ -26,9 +26,10 @@ import kotlinx.coroutines.withTimeout
  *  * any step reordering or merging (for example dropping `am hang`).
  *
  * One deliberate exception, asked for by the user on 2026-10-01: step 8b **closes** the gate
- * with `resetprop service.adb.tcp.port ""` (see [ChainSpec.hardenCommands]). Opening it still
- * goes through the adbd domain in step 5 -- only the closing direction uses resetprop, and only
- * inside the window where resetprop was verified usable.
+ * with `resetprop --delete service.adb.tcp.port` (see [ChainSpec.hardenCommands]; it was an
+ * empty-string write until 2026-10-09, which is a value, not the absence of one). Opening it
+ * still goes through the adbd domain in step 5 -- only the closing direction uses resetprop, and
+ * only inside the window where resetprop was verified usable.
  *
  * The domain borrows in steps 5/6 work only while SELinux is permissive (W1 landed
  * and `ksud late-load` has not run yet), which is why the order is what it is.
@@ -299,7 +300,13 @@ object ChainSpec {
      *  2. the two `ro.*` writes;
      *  3. `suid_dumpable` back to 0;
      *  4. `resetprop -c` with no name, i.e. rebuild **every** property area -- the cleanup;
-     *  5. `resetprop service.adb.tcp.port ""` -- clears the port this chain opened in step 5/6.
+     *  5. `resetprop --delete service.adb.tcp.port` -- **removes** the port this chain opened in
+     *     step 5/6 (user's call, 2026-10-09: 把 resetprop 的修改 tcp 端口改成 del). Deleting is
+     *     what the property wants: an empty string is itself a value, so `service.adb.tcp.port=""`
+     *     is not the same state as "never set" -- it leaves the key with an empty value for
+     *     anything that reads it (and for the next `getprop`). The pinned `ksud` does this with
+     *     `--delete` and says so (`resetprop: deleted service.adb.tcp.port`), which is where the
+     *     flag was read from rather than guessed.
      *     It goes **last** so the area rebuild above cannot be the thing that rewrites it, and
      *     the running 5555 listener is unaffected until adbd is restarted (`ksud late-load` does
      *     that a moment later), which is exactly when the gate is supposed to close.
@@ -320,7 +327,7 @@ object ChainSpec {
         "$ksud resetprop ro.debuggable 0",
         "echo 0 > /proc/sys/fs/suid_dumpable",
         "$ksud resetprop -c",
-        "$ksud resetprop $ADB_TCP_PORT_PROP \"\"",
+        "$ksud resetprop --delete $ADB_TCP_PORT_PROP",
     )
 
     /** The property step 5/6 sets to open the root adbd gate -- step 8b clears it again. */
