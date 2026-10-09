@@ -1,7 +1,10 @@
 package com.ghostlock.app.chain
 
 import android.content.Context
+import android.system.Os
 import com.ghostlock.app.wireless.AdbCommand
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.security.MessageDigest
 
@@ -22,59 +25,31 @@ import java.security.MessageDigest
  */
 object DeviceSync {
 
-    /** The files the chain used to expect on the device, bundled in `assets/device/`. */
+    /**
+     * The files the chain still expects in the **shared** directory (`/data/local/tmp/gl-w1`).
+     *
+     * Only the manager APK is left here: `pm install -r` runs in part 1 over the uid-2000 shell,
+     * which cannot read the app's private directory -- and the SELinux repair kit that used to be
+     * pushed here moved into it (see [stagePrivate], user's call 2026-10-09).
+     */
     val BUNDLED = listOf(
-        Bundled("device/kread_min.ko", ChainSpec.KREAD_KO, "644"),
-        Bundled("device/fix-selinux.sh", ChainSpec.FIX_SELINUX, "755"),
         /* The SukiSU-Ultra manager: CI drops the latest upstream release in here on every build,
          * so the app can still install a manager on a device that cannot reach GitHub. */
         Bundled("device/sukisu-manager.apk", ChainSpec.KSU_MANAGER_APK, "644"),
     )
 
+    /** Where [stagePrivate] puts the part-2 tooling, inside the app's own `files/`. */
+    const val PRIVATE_SUBDIR = "dev"
+
     /** One `assets/<assetPath>` file and where it belongs on the device. */
     data class Bundled(val assetPath: String, val remotePath: String, val mode: String)
 
     /**
-     * Push the bundled `ksud` (`jniLibs/arm64-v8a/libksud.so`, i.e. [ChainSpec.KSUD_LIB]) to
-     * [ChainSpec.KSUD].
-     *
-     * The chain's property step calls it by absolute path as `ksud resetprop …` -- `ksud`
-     * carries `resetprop` the way busybox carries its applets -- so the app does not depend on
-     * a `resetprop` being on the shell's PATH (measured 2026-10-01: a bare `resetprop` is not
-     * resolvable in a plain `adb shell`, and the device only has it as a symlink inside the
-     * KernelSU installation). Returns false when the push did not work, so the caller can fall
-     * back to the device's own [ChainSpec.KSUD_FALLBACK].
-     */
-    suspend fun pushKsud(context: Context, onLog: (String) -> Unit): Boolean =
-        pushNative(context, ChainSpec.KSUD_LIB, ChainSpec.KSUD, "755", onLog)
-
-    /**
-     * Push one of the app's own binaries (`nativeLibraryDir/<libName>`) to [remote].
-     *
-     * `nativeLibraryDir` is where the APK's `jniLibs` end up; `adb push` is the transport,
-     * because uid 2000 cannot read `/data/app/<pkg>/lib` (see the class note).
-     */
-    suspend fun pushNative(
-        context: Context,
-        libName: String,
-        remote: String,
-        mode: String,
-        onLog: (String) -> Unit,
-    ): Boolean {
-        val source = File(context.applicationInfo.nativeLibraryDir, libName)
-        if (!source.isFile) {
-            onLog("[!] 内置二进制缺失：${source.absolutePath}")
-            return false
-        }
-        return pushIfChanged(source, remote, mode, onLog)
-    }
-
-    /**
      * Push every [BUNDLED] file that the device does not already have.
      *
-     * Deliberately non-fatal for the chain: these files are tools for the later cleanup /
-     * SELinux repair steps, and a missing one must not stop W1 -> Magica -> adbd gate ->
-     * ksud. The result is logged either way.
+     * Deliberately non-fatal for the chain: the manager APK is the one file that still needs the
+     * shared directory, and a missing one must not stop W1 -> Magica -> adbd gate -> ksud. The
+     * result is logged either way.
      */
     suspend fun pushBundled(context: Context, onLog: (String) -> Unit): Boolean {
         var all = true
@@ -83,6 +58,101 @@ object DeviceSync {
             if (!ok) all = false
         }
         return all
+    }
+
+    /**
+     * Stage the **part-2 tooling** in the app's own directory -- no `adb push`, no
+     * `/data/local/tmp`.
+     *
+     * The files are already in this APK (`assets/device/…` and `jniLibs/arm64-v8a/libksud.so`), so
+     * the app writes them itself; that is the only staging that works on a device that was never
+     * paired, and it leaves nothing behind on the device (user's call, 2026-10-09).
+     *
+     * The chmods are what the executors need: part 2 runs its commands as **root** -- a root adbd
+     * (which has `CAP_DAC_OVERRIDE` and needs none of this) or the uid-0 command plane, which is
+     * uid 0 *without* capabilities and therefore needs ordinary DAC: traverse (`x`) on the app
+     * data dir, on `files/` and on the staging dir, and read (`r`) on the files. The app owns all
+     * three and can grant exactly that; nothing else in its private tree is exposed by it (listing
+     * stays owner-only, and the inner directories are 0700).
+     *
+     * Returns false when something could not be staged; the caller logs and carries on, because
+     * the repair kit is only used by the later cleanup steps.
+     */
+    suspend fun stagePrivate(context: Context, onLog: (String) -> Unit): Boolean =
+        withContext(Dispatchers.IO) {
+            val dir = File(context.filesDir, PRIVATE_SUBDIR)
+            if (!dir.isDirectory && !dir.mkdirs()) {
+                onLog("[!] 私有目录建不出来：${dir.absolutePath}")
+                return@withContext false
+            }
+            var all = true
+            all = copyAsset(context, "device/kread_min.ko", File(dir, "kread_min.ko"), "644", onLog) && all
+            all = copyAsset(context, "device/fix-selinux.sh", File(dir, "fix-selinux.sh"), "755", onLog) && all
+            all = copyNative(context, ChainSpec.KSUD_LIB, File(dir, "ksud"), "755", onLog) && all
+            /* Directories last, so a partially copied set is never reachable. */
+            all = chmod(context.dataDir.path, "711", onLog) && all
+            all = chmod(context.filesDir.path, "711", onLog) && all
+            all = chmod(dir.path, "711", onLog) && all
+            ChainSpec.usePrivateDir(dir.absolutePath)
+            onLog(
+                "[*] part 2 工具目录（app 私有，不经 adb）：${dir.absolutePath} —— " +
+                    if (all) "就绪" else "有不全的项（后面的修复步骤可能落空）",
+            )
+            all
+        }
+
+    /** `chmod` by `android.system.Os`, so the mode is the same one the shell would set. */
+    private fun chmod(path: String, mode: String, onLog: (String) -> Unit): Boolean = runCatching {
+        Os.chmod(path, mode.toInt(8))
+        true
+    }.getOrElse { error ->
+        onLog("[!] chmod $mode $path 失败：${error.message}")
+        false
+    }
+
+    /** Copy `assets/<assetPath>` into [target] (a private-directory file) and chmod it. */
+    private fun copyAsset(
+        context: Context,
+        assetPath: String,
+        target: File,
+        mode: String,
+        onLog: (String) -> Unit,
+    ): Boolean = runCatching {
+        context.assets.open(assetPath).use { input ->
+            target.outputStream().use { output -> input.copyTo(output) }
+        }
+        target.isFile && target.length() > 0L
+    }.getOrElse { error ->
+        onLog("[!] 读取内置文件 $assetPath 失败：${error.message}")
+        false
+    }.also { ok ->
+        if (!ok) onLog("[!] 内置文件缺失：assets/$assetPath")
+        else chmod(target.path, mode, onLog)
+    }
+
+    /** Copy `nativeLibraryDir/<libName>` into [target] and chmod it. */
+    private fun copyNative(
+        context: Context,
+        libName: String,
+        target: File,
+        mode: String,
+        onLog: (String) -> Unit,
+    ): Boolean {
+        val source = File(context.applicationInfo.nativeLibraryDir, libName)
+        if (!source.isFile) {
+            onLog("[!] 内置二进制缺失：${source.absolutePath}")
+            return false
+        }
+        val ok = runCatching {
+            source.inputStream().use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            target.isFile && target.length() > 0L
+        }.getOrElse { error ->
+            onLog("[!] 复制 $libName 失败：${error.message}")
+            false
+        }
+        return ok && chmod(target.path, mode, onLog)
     }
 
     /**

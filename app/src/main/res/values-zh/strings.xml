@@ -195,7 +195,7 @@
     <string name="action_root_chain">一键 root</string>
     <string name="action_root_chain_running">一键 root 执行中…</string>
     <string name="root_chain_steps_title">root 链路</string>
-    <string name="root_chain_step_preflight">预检：通道与文件</string>
+    <string name="root_chain_step_preflight">预检：现场事实</string>
     <string name="root_chain_step_w1">W1：SELinux 转宽容</string>
     <string name="root_chain_step_magica_root">Magica：uid-0 通道</string>
     <string name="root_chain_step_open_adb_gate">打开 adbd 门</string>

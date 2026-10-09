@@ -15,6 +15,7 @@ import com.ghostlock.app.chain.RootChain
 import com.ghostlock.app.chain.RootExec
 import com.ghostlock.app.chain.ShellResult
 import com.ghostlock.app.chain.StepState
+import com.ghostlock.app.chain.LocalFacts
 import com.ghostlock.app.root.IsolatedRootShell
 import com.ghostlock.app.root.RootChannel
 import com.ghostlock.app.root.RootCommand
@@ -227,28 +228,18 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     /**
-     * The phase when this app cannot ask anybody: the two facts read **locally**.
+     * The phase when this app cannot ask anybody: the two facts read **locally** ([LocalFacts]).
      *
-     * `Seccomp:` comes out of our own `/proc/self/status` (an app may always read that), and
-     * `enforce` out of `/sys/fs/selinux/enforce`. Both reads succeed in the state that matters
-     * here: part 2 is *defined* as permissive + Seccomp 0, and while the device is permissive a
-     * MAC denial cannot stop a read anyway.
-     *
-     * An unreadable fact is never guessed at -- the answer falls back to the chain's own record
-     * ([rememberedPart2Phase]) and then to [lastChainPhase]. That is the safe direction: a wrong
-     * PART2 would offer a root button to a device that still needs the wireless channel for W1.
+     * Shared with the chain's preflight on purpose -- one definition of "what this process can
+     * see", two callers that both must not need a channel. An unreadable fact is never guessed
+     * at: the answer falls back to the chain's own record ([rememberedPart2Phase]) and then to
+     * [lastChainPhase]. That is the safe direction: a wrong PART2 would offer a root button to a
+     * device that still needs the wireless channel for W1.
      */
     private fun localChainPhase(): ChainPhase {
-        val status = runCatching { File("/proc/self/status").readText() }.getOrNull()
-            ?: return rememberedPart2Phase()
-        val seccomp = status.lineSequence()
-            .firstOrNull { it.startsWith("Seccomp:") }
-            ?.substringAfter(':')
-            ?.trim()
-            .orEmpty()
-        val enforce = runCatching {
-            File("/sys/fs/selinux/enforce").readText().trim()
-        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: return rememberedPart2Phase()
+        val enforce = LocalFacts.enforce()
+        val seccomp = LocalFacts.seccomp()
+        if (enforce == null || seccomp == null) return rememberedPart2Phase()
         val phase = ChainPhaseRule.of(enforce, seccomp)
         if (phase != lastChainPhase) {
             Log.i(
@@ -664,19 +655,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             onLog("error: 无线调试通道不可用 —— 请先在「无线调试」里完成配对与连接")
             return false
         }
-        /* Device tooling the chain and the cleanup steps expect in ${ChainSpec.DEVICE_DIR}:
-         * `kread_min.ko` and `fix-selinux.sh` used to be copied there by hand. Pushed from
-         * `assets/device/` now (sha256-compared, so repeat runs are silent). Non-fatal: a
+        /* Device tooling, in the two places that make sense for the two halves of the chain.
+         *
+         * **Part 1** (the uid-2000 shell, SELinux still enforcing) can only read a shared path:
+         * the manager APK stays in ${ChainSpec.DEVICE_DIR} for `pm install -r`, pushed from
+         * `assets/device/` (sha256-compared, so repeat runs are silent).
+         *
+         * **Part 2** needs no adb at all, so its tooling -- the SELinux repair kit and the bundled
+         * `ksud` -- is written into the app's own private directory instead: the files come out of
+         * this APK, so nothing has to be pushed, nothing is left in /data/local/tmp, and it works
+         * on a device that was never paired (user's call, 2026-10-09). The two are non-fatal: a
          * missing tool must not stop W1 -> Magica -> adbd gate -> ksud. */
         DeviceSync.pushBundled(appContext, onLog)
-        /* The app's own `ksud` (GPL-3.0, from the installed KernelSU/ReSukiSU/KowSU) goes to
-         * the device next to the engine: step 8b calls it by absolute path as
-         * `ksud resetprop …`, so nothing depends on the shell's PATH. When the push fails the
-         * chain falls back to the device's own installation. */
-        val ksud = if (DeviceSync.pushKsud(appContext, onLog)) {
+        val privateStaged = DeviceSync.stagePrivate(appContext, onLog)
+        /* The app's own `ksud` (GPL-3.0, from the installed KernelSU/ReSukiSU/KowSU) lives in that
+         * private directory: step 8b calls it by absolute path as `ksud resetprop …`, so nothing
+         * depends on the shell's PATH. When the staging failed the chain falls back to the
+         * device's own installation. */
+        val ksud = if (privateStaged) {
             ChainSpec.KSUD
         } else {
-            onLog("[*] 用设备上的 ${ChainSpec.KSUD_FALLBACK}（内置 ksud 没能推送）")
+            onLog("[*] 用设备上的 ${ChainSpec.KSUD_FALLBACK}（内置 ksud 没能落到私有目录）")
             ChainSpec.KSUD_FALLBACK
         }
         /* The uid-0 channel is the binder to the isolated root service -- the same binder that
@@ -731,6 +730,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 ShellResult(result.exitCode, result.output)
             },
             ksud = ksud,
+            /* The preflight asks this before it tries the `su` probe: part 2 has no uid-2000
+             * channel by design, and its preflight must not look broken because of that. */
+            shellReady = { WirelessPairingController.state.shellReady },
             onLog = onLog,
             onProgress = onProgress,
         )

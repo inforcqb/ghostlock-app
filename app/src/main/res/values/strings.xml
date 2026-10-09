@@ -195,7 +195,7 @@
     <string name="action_root_chain">One-click root</string>
     <string name="action_root_chain_running">Rooting…</string>
     <string name="root_chain_steps_title">Root chain</string>
-    <string name="root_chain_step_preflight">Preflight: channel and files</string>
+    <string name="root_chain_step_preflight">Preflight: live facts</string>
     <string name="root_chain_step_w1">W1: SELinux to permissive</string>
     <string name="root_chain_step_magica_root">Magica: uid-0 channel</string>
     <string name="root_chain_step_open_adb_gate">Open the adbd gate</string>

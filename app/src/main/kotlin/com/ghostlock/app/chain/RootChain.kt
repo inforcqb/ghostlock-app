@@ -135,17 +135,50 @@ object ChainSpec {
     const val W1_PROFILE = "$DEVICE_DIR/gl-profile.bin"
     const val W1_LOG = "$DEVICE_DIR/gl-w1.log"
 
-    /** Bundled device tooling, pushed from `assets/device/` (see DeviceSync.BUNDLED). */
-    const val KREAD_KO = "$DEVICE_DIR/kread_min.ko"
-    const val FIX_SELINUX = "$DEVICE_DIR/fix-selinux.sh"
+    /**
+     * The **part-2 tooling** -- the SELinux repair kit and the bundled `ksud` -- lives in the
+     * app's own private directory, not in `/data/local/tmp`.
+     *
+     * Why (user's call, 2026-10-09): part 2 needs no adb, so nothing it uses has to be pushable
+     * by an adb shell -- and `/data/local/tmp/gl-w1` is shared, world-traversable scratch space
+     * that the run had been leaving a kernel module and a manager APK in. These files come
+     * straight out of the APK (assets + `jniLibs`), so the app writes them itself: no push, no
+     * adb, and nothing left behind on the device.
+     *
+     * The executors in part 2 are root -- a root adbd (which has `CAP_DAC_OVERRIDE`) or the
+     * uid-0 command plane (which is capless) -- so [usePrivateDir] is paired with a chmod that
+     * makes the directory traversable and the files readable (see `DeviceSync.stagePrivate`).
+     *
+     * Empty until the repository stages it; the getters then fall back to the old shared path so
+     * a host that did not wire the staging keeps working.
+     */
+    @Volatile
+    private var privateDir: String = ""
+
+    /** The staged private directory, as the *device* sees it; empty when not staged. */
+    val PRIVATE_DIR: String get() = privateDir
+
+    /** Called by the repository before the chain runs; see [PRIVATE_DIR]. */
+    fun usePrivateDir(path: String) {
+        privateDir = path
+    }
+
+    private fun staged(name: String): String =
+        if (privateDir.isEmpty()) "$DEVICE_DIR/$name" else "$privateDir/$name"
+
+    /** The SELinux repair kit (see [selinuxRepairCommands]), in the app's private directory. */
+    val KREAD_KO: String get() = staged("kread_min.ko")
+
+    val FIX_SELINUX: String get() = staged("fix-selinux.sh")
 
     /**
      * The SukiSU-Ultra manager APK the app carries and installs.
      *
      * Bundled on purpose: the device must not have to reach GitHub (国内网络到 GitHub 不稳).
      * CI copies the **latest** upstream release into `assets/device/sukisu-manager.apk` on every
-     * build, so the copy in the APK is never hardcoded to a version. The chain pushes it here
-     * (see DeviceSync) and installs it with root.
+     * build, so the copy in the APK is never hardcoded to a version. It stays in the shared
+     * directory: `pm install -r` runs in **part 1**, over the uid-2000 shell, which cannot read
+     * the app's private directory (and SELinux is still enforcing at that point).
      */
     const val KSU_MANAGER_APK = "$DEVICE_DIR/sukisu-manager.apk"
 
@@ -227,17 +260,18 @@ object ChainSpec {
     const val RMMOD_GUARD = "rmmod oplus_security_guard"
 
     /**
-     * The bundled `ksud` the chain calls for the property work -- pushed to the device first
-     * (`assets`-style push from `jniLibs`, see DeviceSync), and always by **absolute path**:
-     * a bare `resetprop` depends on the shell's PATH, which is exactly what broke the first
-     * version of step 8b.
+     * The bundled `ksud` the chain calls for the property work -- staged in the app's private
+     * directory by `DeviceSync.stagePrivate` (it is a `jniLibs` file, so no `adb push` is needed
+     * and nothing lands in `/data/local/tmp`), and always called by **absolute path**: a bare
+     * `resetprop` depends on the shell's PATH, which is exactly what broke the first version of
+     * step 8b.
      *
      * `ksud` carries `resetprop` the way busybox carries its applets, so the invocation is
      * `ksud resetprop …` (verified on the PJA110 2026-10-01, from a copy in /data/local/tmp:
      * `…/ksud resetprop ro.secure` -> `1`, `su -c '… -Z ro.secure'` ->
      * `u:object_r:userdebug_or_eng_prop:s0`).
      */
-    const val KSUD = "$DEVICE_DIR/ksud"
+    val KSUD: String get() = staged("ksud")
 
     /** The device's own installation, used when the bundled copy could not be pushed. */
     const val KSUD_FALLBACK = "/data/adb/ksud"
@@ -500,6 +534,15 @@ class RootChain(
      * [ChainSpec.KSUD] when it was pushed, else the device's [ChainSpec.KSUD_FALLBACK].
      */
     private val ksud: String,
+    /**
+     * Is the uid-2000 (wireless-debugging) channel usable right now?
+     *
+     * The chain asks this **once**, in the preflight, to decide whether the `su` probe can be
+     * asked at all -- part 2 has no such channel by design and must not look broken because of it
+     * (user's call, 2026-10-09). Defaults to "yes" so a host that does not wire it keeps the old
+     * behaviour.
+     */
+    private val shellReady: () -> Boolean = { true },
     private val onLog: (String) -> Unit,
     private val onProgress: (ChainProgress) -> Unit,
 ) {
@@ -788,15 +831,16 @@ class RootChain(
     /**
      * Live facts that decide whether this boot already went through W1.
      *
-     * `enforce` comes from `/sys/fs/selinux/enforce`, `seccomp` from `Seccomp:` in
-     * `/proc/self/status` (the Shizuku user service, uid 2000). W1 counts as landed only
-     * when BOTH say so: SELinux permissive alone could in principle be the vendor's own
-     * doing, while the shell context having no seccomp filter is the state the exploit
-     * needs to still be able to run at all.
+     * `enforce` comes from `/sys/fs/selinux/enforce`, `seccomp` from `Seccomp:` in the caller's
+     * `/proc/self/status`. W1 counts as landed only when BOTH say so: SELinux permissive alone
+     * could in principle be the vendor's own doing, while the caller having no seccomp filter is
+     * the state the exploit needs to still be able to run at all.
      *
-     * Both reads go through [readFact], so a part-2 resume whose uid-2000 channel is gone
-     * still gets its facts -- from the uid-0 command plane (`/proc/1/status` for the
-     * boot-wide Seccomp).
+     * Three sources, tried cheapest first (2026-10-09): **this process** ([LocalFacts], no
+     * channel at all -- and after the framework restart that part 2 follows, this process really
+     * does report `Seccomp: 0`), then the channel reads through [readFact] (the uid-2000 shell
+     * *or*, when that is gone, the uid-0 command plane with `/proc/1/status`). A part-2 start with
+     * no adb is therefore answered without asking anybody.
      */
     private data class BootFacts(val enforce: String, val seccomp: String, val w1Landed: Boolean)
 
@@ -821,6 +865,16 @@ class RootChain(
         var lastError: String? = null
         while ((enforce == null || seccomp == null) && attempts < ChainSpec.BOOT_FACTS_ATTEMPTS) {
             attempts++
+            /* This process's own facts first: no channel, no adb, and they are exactly the facts
+             * the phase is about -- part 2 *is* permissive + Seccomp 0, and after the restart that
+             * defines it every process reports 0 (measured: 14 of them).  In part 1 these reads
+             * are denied/meaningless and the channel reads below answer instead. */
+            if (enforce == null) {
+                enforce = LocalFacts.enforce()
+            }
+            if (seccomp == null) {
+                seccomp = LocalFacts.seccomp()
+            }
             if (enforce == null) {
                 enforce = runCatching {
                     lastLineOf(readFact(ChainSpec.READ_ENFORCE).output).takeIf { it.isNotEmpty() }
@@ -944,11 +998,24 @@ class RootChain(
          * system_server and reboots adbd -- all of it pointless, and not harmless, when the
          * goal (root) is already there. */
         var alreadyRooted = false
-        var ok = step(ChainStep.PREFLIGHT, "channel + su") {
+        var ok = step(ChainStep.PREFLIGHT, "live facts + su") {
             /* The command plane is a binder to the isolated root service, so there is nothing to
              * list from the shell side -- the client object answers for itself. */
             onLog("[*] uid-0 通道：${channel.describe()}")
-            alreadyRooted = suGrantsRoot()
+            /* The `su` probe answers one question -- "is this device already rooted, so the chain
+             * must not run at all?" -- and it can only be asked over the uid-2000 channel.
+             *
+             * Part 2 does not have that channel **by design** (user's call, 2026-10-09: the
+             * preflight must not require a shell that part 2 does not need), so where the channel
+             * is not there the probe is skipped instead of being attempted and reported as a
+             * failure. Nothing is lost: a part-2 start means the chain is already half-done, and
+             * "already rooted" cannot be decided from a channel that does not exist. */
+            alreadyRooted = if (shellReady()) {
+                suGrantsRoot()
+            } else {
+                onLog("[*] 预检：没有 uid-2000 通道（part 2 不需要它）⇒ 跳过 su 探针")
+                false
+            }
             if (alreadyRooted) {
                 onLog("[+] 预检：`${ChainSpec.SU_PROBE}` 拿到了 uid=0 ⇒ 本机已有 root，不必执行利用链")
             } else {
