@@ -1167,14 +1167,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /**
      * Puts a `ksud` into [workDir] and returns it.
      *
-     * An installed manager is the first choice: the SukiSU-Ultra family bundles `ksud` as
-     * `libksud.so` inside the APK, and using the copy that goes with the kernel side already on the
-     * device is the safest pick. Upstream KernelSU's manager bundles none (its `lib/arm64-v8a/`
-     * holds `libkernelsu.so` and `libadbroot.so`), which is why the second half of this function
-     * falls back to the `ksud` this app carries in its own `libksud.so` -- that copy is pinned at
-     * build time (`prebuilt/kernelsu-3.3.0-69-gdf03912f`, sha256 asserted in the workflow).
+     * The copy bundled in this APK comes **first**: it is the one this chain was built against, the
+     * one the manager the chain installs (upstream KernelSU) goes with, and the one step 9 writes
+     * to `/data/adb/ksud` before `late-load`. An installed manager is only a fallback for the case
+     * where the APK carries no `libksud.so` at all -- a manager's bundled ksud belongs to whatever
+     * KSU the device already had, which is exactly what this chain must not depend on.
      */
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
+        val bundled = File(appContext.applicationInfo.nativeLibraryDir, ChainSpec.KSUD_LIB)
+        if (bundled.isFile) {
+            copyKsud(bundled, workDir, onLog, "bundled copy")?.let { return it }
+        } else {
+            onLog("the APK carries no ${ChainSpec.KSUD_LIB} -- falling back to an installed manager")
+        }
+
         val packages = listOf(
             /* The manager the chain installs from the app's bundled copy first, then managers a
              * user may already have. */
@@ -1190,17 +1196,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             installed = true
             val source = File(appInfo.nativeLibraryDir, "libksud.so")
             if (!source.isFile) continue
-            copyKsud(source, workDir, onLog, "from $packageName")?.let { return it }
+            copyKsud(source, workDir, onLog, "from $packageName (fallback)")?.let { return it }
         }
-
-        val bundled = File(appContext.applicationInfo.nativeLibraryDir, ChainSpec.KSUD_LIB)
-        if (bundled.isFile) {
-            copyKsud(bundled, workDir, onLog, "bundled copy")?.let { return it }
-        } else if (!installed) {
-            onLog("KernelSU/ReSukiSU/KowSU app not installed, and the bundled ksud is missing")
-        } else {
-            onLog("the installed manager ships no libksud.so, and the bundled copy is missing")
-        }
+        if (!installed) onLog("KernelSU/ReSukiSU/KowSU app not installed")
         return null
     }
 

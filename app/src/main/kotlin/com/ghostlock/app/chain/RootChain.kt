@@ -330,11 +330,33 @@ object ChainSpec {
     const val HARDEN_CONTEXT = "u:object_r:userdebug_or_eng_prop:s0"
 
     /**
-     * step 9: the second one -- KernelSU late-load gives the persistent root
+     * step 9: put **this app's** ksud where `late-load` resolves it.
      *
-     * Deliberately the **device's** ksud and not the bundled one: `late-load` has to find the
-     * module payload of the KernelSU installation that is actually there, while `resetprop`
-     * (step 8b) is version-independent and is what the bundled copy is for.
+     * `/data/adb/ksud` is the path `ksud late-load` (the next step) and the manager installed in
+     * part 1 both call. A device that never had KernelSU has nothing there at all -- the step would
+     * fail on a missing file -- and one that carries another KSU fork would hand `late-load` that
+     * fork's ksud, i.e. a binary that does not match the manager and the payload this chain brings.
+     * Ours goes in first, so the step that gives persistent root runs the same ksud the chain used
+     * for `resetprop`.
+     *
+     * `mkdir -p` because a fresh device has no `/data/adb` yet; `cp -f` because whatever is there
+     * has to be replaced; the `ls` is the log line, and the sentinel is what the step checks.
+     */
+    fun installKsudCommand(ksud: String): String =
+        "mkdir -p /data/adb && cp -f $ksud $KSUD_FALLBACK && chmod 755 $KSUD_FALLBACK && " +
+            "ls -l $KSUD_FALLBACK && echo $KSUD_INSTALLED_SENTINEL"
+
+    /** Printed by [installKsudCommand] on success; its absence fails the step. */
+    const val KSUD_INSTALLED_SENTINEL = "ghostlock-ksud-installed"
+
+    /** Read back what `late-load` will actually execute (one command, so one round trip). */
+    const val KSUD_INSTALLED_CHECK = "test -x $KSUD_FALLBACK && echo $KSUD_INSTALLED_SENTINEL"
+
+    /**
+     * step 10: the second one -- KernelSU late-load gives the persistent root
+     *
+     * Runs `/data/adb/ksud`, which step 9 has just replaced with the copy this app carries, so the
+     * step does not depend on which KSU (if any) the device happened to have before.
      */
     const val KSUD_LATE_LOAD = "$KSUD_FALLBACK late-load"
 
@@ -430,6 +452,7 @@ enum class ChainStep(val label: String, val phase: ChainPhase?) {
     AM_HANG("重启 framework（am hang）", ChainPhase.PART1),
     MAGICA_ROOT("Magica：uid-0 通道", ChainPhase.PART2),
     PRIV_ENV("提权环境恢复", ChainPhase.PART2),
+    KSUD_INSTALL("安装自带 ksud（覆盖 /data/adb/ksud）", ChainPhase.PART2),
     KSU_LATE_LOAD("ksud late-load", ChainPhase.PART2),
 }
 
@@ -1503,7 +1526,32 @@ class RootChain(
         if (!ok) return false
 
 
-        // step 9: the goal, part two ---------------------------------------------
+        // step 9: our own ksud, at the path late-load resolves --------------------
+        /* Before this, `late-load` depended on whatever ksud the device happened to have (or on
+         * nothing at all, on a device that never had KernelSU). The copy this app carries is the
+         * one the whole chain was built against, so it is put in place first and read back: the
+         * sentinel has to come from `test -x`, i.e. from the path `late-load` will exec.
+         *
+         * Through [privileged] like the rest of part 2: `/data/adb` is root-owned, and on a device
+         * without the root adbd this is the only plane that can write there. */
+        ok = step(ChainStep.KSUD_INSTALL, ChainSpec.installKsudCommand(ksud)) {
+            val install = privileged(ChainSpec.installKsudCommand(ksud), timeoutMs = 60_000)
+            if (install.output.isNotBlank()) onLog("[*] ksud 安装（${transport()}）: ${install.output.trim()}")
+            if (!install.output.contains(ChainSpec.KSUD_INSTALLED_SENTINEL)) {
+                throw IllegalStateException(
+                    "自带 ksud 没能装到 ${ChainSpec.KSUD_FALLBACK}（exit=${install.exitCode}）" +
+                        "——late-load 没有可执行的东西，停下来比让它瞎跑好"
+                )
+            }
+            val check = privileged(ChainSpec.KSUD_INSTALLED_CHECK, timeoutMs = 30_000)
+            if (!check.output.contains(ChainSpec.KSUD_INSTALLED_SENTINEL)) {
+                throw IllegalStateException("${ChainSpec.KSUD_FALLBACK} 装上后不可执行（exit=${check.exitCode}）")
+            }
+            "自带 ksud 已就位 ⇒ ${ChainSpec.KSUD_FALLBACK}"
+        } != null
+        if (!ok) return false
+
+        // step 10: the goal, part two --------------------------------------------
         /* load ok == exit 0 is the whole verdict. `ksud late-load` reloads the SELinux policy
          * and **restarts adbd** on the way out, so anything that would read the module list
          * afterwards reads through a transport that no longer exists -- which is exactly the

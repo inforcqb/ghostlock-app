@@ -41,10 +41,13 @@
   `/data/adb/ksu/bin/resetprop -> /data/adb/ksud`）；`ksud resetprop` 是绝对路径可寻址、
   且与版本无关的写法。实测：`…/ksud resetprop ro.secure` → `1`，
   `su -c '… -Z ro.secure'` → `u:object_r:userdebug_or_eng_prop:s0`。
-* `prepareKsud()` 的选择顺序：先看**已安装的管理端**里有没有 `libksud.so`（SukiSU 系带，
-  与设备上的内核侧配套最稳），没有再退回**本 APK 自带**这一份（上游 KernelSU 管理端就是这种情况）。
-* `ksud late-load` **不用**这份副本，仍走设备自己的 `/data/adb/ksud`：late-load 要找到真正安装在
-  那台机器上的模块负载。推送失败（或缺失）时链会退回 `/data/adb/ksud` 并在日志里说明。
+* `prepareKsud()` 的选择顺序：**先本 APK 自带**这一份（链与"链装的那些"都是按它做的），只有 APK 里
+  根本没有 `libksud.so` 时才退回已安装管理端里的那份——那份属于设备上原来那套 KSU，正是这条链不该依赖的东西。
+* `ksud late-load`（步骤 10）用的也是**这一份**：步骤 9「安装自带 ksud」会先把它覆盖到
+  `/data/adb/ksud`（`mkdir -p /data/adb && cp -f … && chmod 755`，并 `test -x` 读回确认），因为
+  `late-load` 与 part 1 装上的管理端都认这个路径，而**从没装过 KernelSU 的设备上它根本不存在**、
+  装着别的 KSU 分支的设备上它又是另一套 ksud。装不上且路径上也没有可执行文件时，链会在这一步停下并说明。
+  链里的 `resetprop`（步骤 8b）本来就用自带副本，不走这个路径。
 * 许可证：**GPL-3.0**（KernelSU 家族），见 `app/src/main/jni/THIRD_PARTY_NOTICES.md`。
 
 ## `assets/device/sukisu-manager.apk` —— 管理端（同一个钉住版本）
