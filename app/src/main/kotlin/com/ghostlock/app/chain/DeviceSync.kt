@@ -33,8 +33,9 @@ object DeviceSync {
      * pushed here moved into it (see [stagePrivate], user's call 2026-10-09).
      */
     val BUNDLED = listOf(
-        /* The SukiSU-Ultra manager: CI drops the latest upstream release in here on every build,
-         * so the app can still install a manager on a device that cannot reach GitHub. */
+        /* The KernelSU manager: CI copies a pinned build into this asset on every build (see
+         * `prebuilt/`), so the app can still install a manager on a device that cannot reach
+         * GitHub. */
         Bundled("device/sukisu-manager.apk", ChainSpec.KSU_MANAGER_APK, "644"),
     )
 

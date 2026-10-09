@@ -172,18 +172,25 @@ object ChainSpec {
     val FIX_SELINUX: String get() = staged("fix-selinux.sh")
 
     /**
-     * The SukiSU-Ultra manager APK the app carries and installs.
+     * The KernelSU manager APK the app carries and installs.
      *
      * Bundled on purpose: the device must not have to reach GitHub (国内网络到 GitHub 不稳).
-     * CI copies the **latest** upstream release into `assets/device/sukisu-manager.apk` on every
-     * build, so the copy in the APK is never hardcoded to a version. It stays in the shared
-     * directory: `pm install -r` runs in **part 1**, over the uid-2000 shell, which cannot read
-     * the app's private directory (and SELinux is still enforcing at that point).
+     * CI copies a **pinned** KernelSU build (`v3.3.0-69-gdf03912f`, see `prebuilt/`) into
+     * `assets/device/sukisu-manager.apk` on every build, so what ships is the version this tree
+     * names rather than whatever upstream released last, and the workflow asserts its sha256. It
+     * stays in the shared directory: `pm install -r` runs in **part 1**, over the uid-2000 shell,
+     * which cannot read the app's private directory (and SELinux is still enforcing at that point).
      */
     const val KSU_MANAGER_APK = "$DEVICE_DIR/sukisu-manager.apk"
 
-    /** Package id of that manager, used for the log line (and by `prepareKsud`). */
-    const val KSU_MANAGER_PACKAGE = "com.sukisu.ultra"
+    /**
+     * Package id of that manager, used for the log line (and by `prepareKsud`).
+     *
+     * This is upstream KernelSU's manager, i.e. the APK in `assets/device/sukisu-manager.apk`. It
+     * bundles no `ksud` of its own, so `prepareKsud` ends up using the copy this app carries; the
+     * other ids it tries are managers a user may already have installed.
+     */
+    const val KSU_MANAGER_PACKAGE = "me.weishu.kernelsu"
 
     /** Module name the kernel knows `kread_min.ko` by (`insmod` / `rmmod`). */
     const val KREAD_MODULE = "kread_min"

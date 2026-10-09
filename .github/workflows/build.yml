@@ -94,30 +94,39 @@ jobs:
           make ghostlock
           "${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all ghostlock || true
 
-      # Both SukiSU-Ultra artifacts are taken from the project's **latest** release, resolved at
-      # build time -- nothing is pinned in the tree, so every build carries the current upstream
-      # version (the user's call: 每次编译的时候拿，这样每次都是最新的):
+      # Both artifacts are now the **pinned** KernelSU build `v3.3.0-69-gdf03912f` (tiann/KernelSU,
+      # CI run 37882323514, 2026-10-09), committed under `prebuilt/kernelsu-3.3.0-69-gdf03912f/`:
       #
-      #  * `lib/arm64-v8a/libksud.so` out of the manager APK -> jniLibs. The chain calls it as
+      #  * `ksud` (the standalone aarch64 artifact; upstream's manager APK does *not* bundle one, so
+      #    there is nothing to unzip) -> jniLibs/arm64-v8a/libksud.so. The chain calls it as
       #    `ksud resetprop …` (busybox style) from the app's own copy in /data/local/tmp/gl-w1.
       #  * the manager APK itself -> `assets/device/sukisu-manager.apk`. It is bundled because the
       #    device must not have to reach GitHub (国内网络到 GitHub 不稳): the app pushes it and the
       #    chain installs it with root (`pm install -r`).
-      - name: Fetch ksud + the SukiSU-Ultra manager from the latest release
+      #
+      # A pinned copy instead of "latest release", because KernelSU publishes no release for that
+      # commit (CI artifacts only, and another repository's artifacts need a token this job does not
+      # have). The sha256 below is what makes the pin real: a silent swap fails the build.
+      - name: Stage the pinned ksud + manager (KernelSU v3.3.0-69-gdf03912f)
         env:
-          KSUD_REPO: SukiSU-Ultra/SukiSU-Ultra
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KSUD_SHA256: a14b5980d4b857542c920a3a22625cbba34edd6ea4741230bb1d25d93516c4ce
+          MANAGER_SHA256: 9acd811cd611b7f4d95fdfcd06d0bb228c2807606fd66d24915a08b5cc6dcde3
         run: |
           set -euo pipefail
-          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/device /tmp/sukisu
-          gh release download --repo "$KSUD_REPO" --pattern '*.apk' --dir /tmp/sukisu --clobber
-          MANAGER=$(find /tmp/sukisu -maxdepth 1 -name '*.apk' | head -n1)
-          test -n "$MANAGER"
-          # unzip fails loudly if the APK has no libksud.so for our ABI.
-          unzip -p "$MANAGER" 'lib/arm64-v8a/libksud.so' > app/src/main/jniLibs/arm64-v8a/libksud.so
+          SRC=prebuilt/kernelsu-3.3.0-69-gdf03912f
+          test -s "$SRC/ksud"
+          test -s "$SRC/kernelsu-manager.apk"
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/device
+          cp "$SRC/ksud" app/src/main/jniLibs/arm64-v8a/libksud.so
+          cp "$SRC/kernelsu-manager.apk" app/src/main/assets/device/sukisu-manager.apk
+          echo "$KSUD_SHA256  app/src/main/jniLibs/arm64-v8a/libksud.so" | sha256sum -c -
+          echo "$MANAGER_SHA256  app/src/main/assets/device/sukisu-manager.apk" | sha256sum -c -
+          # libksud.so is an executable, not a shared library: it has to be an ELF aarch64 file the
+          # device can run, and `keepDebugSymbols` in app/build.gradle.kts keeps the NDK's strip off
+          # it. A shared object here would fail much later, on the device.
           head -c 4 app/src/main/jniLibs/arm64-v8a/libksud.so | od -An -tx1 | grep -q '7f 45 4c 46'
-          cp "$MANAGER" app/src/main/assets/device/sukisu-manager.apk
-          echo "SukiSU-Ultra latest: $(gh release view --repo "$KSUD_REPO" --json tagName --jq .tagName) ($(basename "$MANAGER"))"
+          file app/src/main/jniLibs/arm64-v8a/libksud.so
+          readelf -h app/src/main/jniLibs/arm64-v8a/libksud.so | grep -E 'Class|Type|Machine'
           sha256sum app/src/main/jniLibs/arm64-v8a/libksud.so app/src/main/assets/device/sukisu-manager.apk
           ls -l app/src/main/jniLibs/arm64-v8a/libksud.so app/src/main/assets/device/sukisu-manager.apk
 
